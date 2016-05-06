@@ -1,10 +1,15 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
+
 import Control.Monad
+import Data.String
 import Language.C
+import Language.C.Interpret
+import Language.C.Interpret.Class
 import Language.C.Data.Ident
 import Language.C.System.GCC
 import System.Environment
-
-data Signed = Signed | Unsigned
 
 data RustType
     = VoidType
@@ -33,38 +38,58 @@ rustTypeOf = foldr go (IntType Signed (Just 32))
     go (CTypeSpec (CBoolType _)) _ = BoolType
     go spec _ = error ("rustTypeOf: unsupported declaration specifier " ++ show spec)
 
-rustBinOpOf :: CBinaryOp -> String
-rustBinOpOf CMulOp = "*"
-rustBinOpOf CDivOp = "/"
-rustBinOpOf CRmdOp = "%"
-rustBinOpOf CAddOp = "+"
-rustBinOpOf CSubOp = "-"
-rustBinOpOf CShlOp = "<<"
-rustBinOpOf CShrOp = ">>"
-rustBinOpOf CLeOp = "<"
-rustBinOpOf CGrOp = ">"
-rustBinOpOf CLeqOp = "<="
-rustBinOpOf CGeqOp = ">="
-rustBinOpOf CEqOp = "=="
-rustBinOpOf CNeqOp = "!="
-rustBinOpOf CAndOp = "&"
-rustBinOpOf CXorOp = "^"
-rustBinOpOf COrOp = "|"
-rustBinOpOf CLndOp = "&&"
-rustBinOpOf CLorOp = "||"
+newtype Source = Source String
+    deriving (Monoid, IsString)
 
-translateExpression :: Show a => CExpression a -> String
-translateExpression (CBinary op lhs rhs _) = translateExpression lhs ++ " " ++ rustBinOpOf op ++ " " ++ translateExpression rhs
-translateExpression (CConst (CIntConst (CInteger i _repr _flags) _)) = show i
-translateExpression (CVar (Ident n _ _) _) = n
-translateExpression expr = show expr
+instance Num Source where
+    (+) a b = a `mappend` " + " `mappend` b
+    (-) a b = a `mappend` " - " `mappend` b
+    (*) a b = a `mappend` " * " `mappend` b
+    negate a = "-" `mappend` a
+    fromInteger i = Source (show i)
+
+instance Fractional Source where
+    (/) a b = a `mappend` " / " `mappend` b
+    recip a = "1 / " `mappend` a
+    fromRational r = Source (show (fromRational r :: Double))
+
+instance Read Source where
+    readsPrec p s = [ (Source (show (v :: Double)), r) | (v, r) <- readsPrec p s ]
+
+instance OrdInterpretation Source Source where
+    (.<) a b = a `mappend` " < " `mappend` b
+    (.>) a b = a `mappend` " > " `mappend` b
+    (.<=) a b = a `mappend` " <= " `mappend` b
+    (.>=) a b = a `mappend` " >= " `mappend` b
+    (.==) a b = a `mappend` " == " `mappend` b
+    (./=) a b = a `mappend` " != " `mappend` b
+
+instance IntInterpretation Source where
+    (./) a b = a `mappend` " / " `mappend` b
+    (.%) a b = a `mappend` " % " `mappend` b
+    (.<<) a b = a `mappend` " << " `mappend` b
+    (.>>) a b = a `mappend` " >> " `mappend` b
+    (.&) a b = a `mappend` " & " `mappend` b
+    (.|) a b = a `mappend` " | " `mappend` b
+    (.^) a b = a `mappend` " ^ " `mappend` b
+    (.~) a = "~" `mappend` a
+    (.!) a = "!" `mappend` a
+    (.&&) a b = a `mappend` " && " `mappend` b
+    (.||) a b = a `mappend` " || " `mappend` b
+
+instance Interpretation Source Source where
+    intToFloat i = i `mappend` " as f64"
+
+extractSource :: Value Source Source -> String
+extractSource (IntValue (Source s) _ _) = s
+extractSource (FloatValue (Source s) _) = s
 
 translateStatement :: Show a => CStatement a -> IO ()
 translateStatement (CCompound [] items _) = forM_ items $ \ item -> case item of
     CBlockStmt stmt -> translateStatement stmt
     _ -> print item
 translateStatement (CReturn Nothing _) = putStrLn ("    return;")
-translateStatement (CReturn (Just expr) _) = putStrLn ("    return " ++ translateExpression expr ++ ";")
+translateStatement (CReturn (Just expr) _) = putStrLn ("    return " ++ extractSource (interpretExpr expr) ++ ";")
 translateStatement stmt = print stmt
 
 translateFunction :: Show a => CFunctionDef a -> IO ()
