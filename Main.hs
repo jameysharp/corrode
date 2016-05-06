@@ -3,6 +3,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 import Control.Monad
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State.Lazy
+import Control.Monad.Trans.Writer.Lazy
 import Data.String
 import Language.C
 import Language.C.Interpret
@@ -80,25 +83,39 @@ instance IntInterpretation Source where
 instance Interpretation Source Source where
     intToFloat i = i `mappend` " as f64"
 
-extractSource :: Value Source Source -> String
-extractSource (IntValue (Source s) _ _) = s
-extractSource (FloatValue (Source s) _) = s
+extractSource :: Value Source Source -> Source
+extractSource (IntValue s _ _) = s
+extractSource (FloatValue s _) = s
 
-translateStatement :: Show a => CStatement a -> IO ()
-translateStatement (CCompound [] items _) = forM_ items $ \ item -> case item of
-    CBlockStmt stmt -> translateStatement stmt
-    _ -> print item
-translateStatement (CReturn Nothing _) = putStrLn ("    return;")
-translateStatement (CReturn (Just expr) _) = putStrLn ("    return " ++ extractSource (interpretExpr expr) ++ ";")
-translateStatement stmt = print stmt
+translateStatement :: Show a => CStatement a -> WriterT Source (EnvMonad Source Source) ()
+translateStatement (CCompound [] items _) = do
+    -- Push a new declaration scope for this block.
+    lift $ modify ([] :)
+    forM_ items $ \ item -> case item of
+        CBlockStmt stmt -> translateStatement stmt
+        _ -> error ("translateStatement: unsupported statement " ++ show item)
+    -- Pop this block's declaration scope.
+    lift $ modify tail
+translateStatement (CReturn Nothing _) = tell "    return;\n"
+translateStatement (CReturn (Just expr) _) = do
+    expr' <- lift $ interpretExpr expr
+    tell ("    return " `mappend` extractSource expr' `mappend` ";\n")
+translateStatement stmt = error ("translateStatement: unsupported statement " ++ show stmt)
 
 translateFunction :: Show a => CFunctionDef a -> IO ()
 translateFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) = do
     putStrLn ("fn " ++ name ++ "(")
-    forM_ args $ \ (CDecl argspecs [(Just (CDeclr (Just (Ident argname _ _)) [] _ _ _), Nothing, Nothing)] _) ->
-        putStrLn (argname ++ " : " ++ show (rustTypeOf argspecs))
+    args' <- forM args $ \ (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) -> do
+        let ty = rustTypeOf argspecs
+        let nm = identToString argname
+        putStrLn (nm ++ " : " ++ show ty)
+        return $ (,) argname $ case ty of
+            IntType s w -> IntValue (Source nm) s w
+            FloatType w -> FloatValue (Source nm) w
+            _ -> error ("translateFunction: unsupported argument type " ++ show ty)
     putStrLn (") -> " ++ show (rustTypeOf specs) ++ " {")
-    translateStatement body
+    let ((), Source body') = evalState (runWriterT (translateStatement body)) [args']
+    putStr body'
     putStrLn "}"
 
 main :: IO ()

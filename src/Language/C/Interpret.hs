@@ -1,5 +1,7 @@
 module Language.C.Interpret where
 
+import Control.Monad
+import Control.Monad.Trans.State.Lazy
 import Language.C
 import Language.C.Interpret.Class
 
@@ -9,6 +11,9 @@ data Signed = Signed | Unsigned
 data Value int float
     = IntValue int Signed (Maybe Int)
     | FloatValue float Int
+
+type Environment int float = [[(Ident, Value int float)]]
+type EnvMonad int float = State (Environment int float)
 
 toFloat :: Interpretation int float => Value int float -> Value int float
 toFloat (IntValue v _s _w) = FloatValue (intToFloat v) 64
@@ -44,46 +49,53 @@ promoteBoolean :: Interpretation int float
     -> Value int float
 promoteBoolean i f a b = IntValue (promote (\ _ _ -> i) (\ _ -> f) a b) Signed (Just 32)
 
-interpretExpr :: Interpretation int float => CExpression n -> Value int float
-interpretExpr (CBinary op lhs rhs _) =
-    let lhs' = interpretExpr lhs
-        rhs' = interpretExpr rhs
-        noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
-    in case op of
-    CMulOp -> promoteArithmetic (*) (*) lhs' rhs'
-    CDivOp -> promoteArithmetic (./) (/) lhs' rhs'
-    CRmdOp -> promoteArithmetic (.%) noFloat lhs' rhs'
-    CAddOp -> promoteArithmetic (+) (+) lhs' rhs'
-    CSubOp -> promoteArithmetic (-) (-) lhs' rhs'
-    CShlOp -> promoteArithmetic (.<<) noFloat lhs' rhs'
-    CShrOp -> promoteArithmetic (.>>) noFloat lhs' rhs'
-    CLeOp -> promoteBoolean (.<) (.<) lhs' rhs'
-    CGrOp -> promoteBoolean (.>) (.>) lhs' rhs'
-    CLeqOp -> promoteBoolean (.<=) (.<=) lhs' rhs'
-    CGeqOp -> promoteBoolean (.>=) (.>=) lhs' rhs'
-    CEqOp -> promoteBoolean (.==) (.==) lhs' rhs'
-    CNeqOp -> promoteBoolean (./=) (./=) lhs' rhs'
-    CAndOp -> promoteArithmetic (.&) noFloat lhs' rhs'
-    CXorOp -> promoteArithmetic (.^) noFloat lhs' rhs'
-    COrOp -> promoteArithmetic (.|) noFloat lhs' rhs'
-    CLndOp -> promoteBoolean (.&&) noFloat lhs' rhs'
-    CLorOp -> promoteBoolean (.||) noFloat lhs' rhs'
-interpretExpr (CUnary op expr _) =
-    let expr' = interpretExpr expr
-        noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
-    in case op of
-    CPlusOp -> expr'
-    CMinOp -> case expr' of
-        IntValue v s w -> IntValue (negate v) s w
-        FloatValue v w -> FloatValue (negate v) w
-    CCompOp -> case expr' of
-        IntValue v s w -> IntValue ((.~) v) s w
-        FloatValue _ _ -> noFloat
-    CNegOp -> case expr' of
-        IntValue v _ _ -> IntValue ((.!) v) Signed (Just 32)
-        FloatValue _ _ -> noFloat
-    _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
-interpretExpr (CConst c) = case c of
+interpretExpr :: Interpretation int float => CExpression n -> EnvMonad int float (Value int float)
+interpretExpr (CBinary op lhs rhs _) = do
+    lhs' <- interpretExpr lhs
+    rhs' <- interpretExpr rhs
+    let noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
+    return $ case op of
+        CMulOp -> promoteArithmetic (*) (*) lhs' rhs'
+        CDivOp -> promoteArithmetic (./) (/) lhs' rhs'
+        CRmdOp -> promoteArithmetic (.%) noFloat lhs' rhs'
+        CAddOp -> promoteArithmetic (+) (+) lhs' rhs'
+        CSubOp -> promoteArithmetic (-) (-) lhs' rhs'
+        CShlOp -> promoteArithmetic (.<<) noFloat lhs' rhs'
+        CShrOp -> promoteArithmetic (.>>) noFloat lhs' rhs'
+        CLeOp -> promoteBoolean (.<) (.<) lhs' rhs'
+        CGrOp -> promoteBoolean (.>) (.>) lhs' rhs'
+        CLeqOp -> promoteBoolean (.<=) (.<=) lhs' rhs'
+        CGeqOp -> promoteBoolean (.>=) (.>=) lhs' rhs'
+        CEqOp -> promoteBoolean (.==) (.==) lhs' rhs'
+        CNeqOp -> promoteBoolean (./=) (./=) lhs' rhs'
+        CAndOp -> promoteArithmetic (.&) noFloat lhs' rhs'
+        CXorOp -> promoteArithmetic (.^) noFloat lhs' rhs'
+        COrOp -> promoteArithmetic (.|) noFloat lhs' rhs'
+        -- TODO: short-circuit when rhs is unnecessary
+        CLndOp -> promoteBoolean (.&&) noFloat lhs' rhs'
+        CLorOp -> promoteBoolean (.||) noFloat lhs' rhs'
+interpretExpr (CUnary op expr _) = do
+    expr' <- interpretExpr expr
+    let noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
+    return $ case op of
+        CPlusOp -> expr'
+        CMinOp -> case expr' of
+            IntValue v s w -> IntValue (negate v) s w
+            FloatValue v w -> FloatValue (negate v) w
+        CCompOp -> case expr' of
+            IntValue v s w -> IntValue ((.~) v) s w
+            FloatValue _ _ -> noFloat
+        CNegOp -> case expr' of
+            IntValue v _ _ -> IntValue ((.!) v) Signed (Just 32)
+            FloatValue _ _ -> noFloat
+        _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
+interpretExpr (CVar ident _) = do
+    env <- get
+    -- Take the definition from the first scope where it's found.
+    case msum (map (lookup ident) env) of
+        Just v -> return v
+        Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
+interpretExpr (CConst c) = return $ case c of
     CIntConst (CInteger v _repr _flags) _ -> IntValue (fromInteger v) Signed (Just 32)
     CFloatConst (CFloat str) _ -> case reads str of
         -- TODO: handle hex float literals
