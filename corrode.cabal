@@ -14,11 +14,13 @@ library
                        Language.C.Interpret.Class
   ghc-options:         -Wall
   default-language:    Haskell2010
-  build-depends:       base >=4.8 && <4.9, language-c >=0.4 && <0.5
+  build-depends:       base >=4.8 && <4.9,
+                       language-c >=0.4 && <0.5
 
 executable corrode
-  hs-source-dirs:      src
   main-is:             Main.hs
   ghc-options:         -Wall
   default-language:    Haskell2010
-  build-depends:       base >=4.8 && <4.9, language-c >=0.4 && <0.5
+  build-depends:       base >=4.8 && <4.9,
+                       corrode,
+                       language-c >=0.4 && <0.5
