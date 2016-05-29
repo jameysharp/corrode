@@ -3,8 +3,11 @@ module Language.Rust.AST where
 import Text.PrettyPrint.HughesPJClass
 
 newtype Type = TypeName String
+    deriving Eq
 newtype Lit = LitRep String
+    deriving Eq
 newtype Var = VarName String
+    deriving Eq
 
 instance Pretty Type where
     pPrint (TypeName s) = text s
@@ -48,7 +51,7 @@ instance Pretty Item where
         [ text "pub fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [text "mut", pPrint v, text ":", pPrint t] | (v, t) <- args ]
-        , text ") ->" <+> pPrint ret
+        , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
         , pPrint body
         ]
 

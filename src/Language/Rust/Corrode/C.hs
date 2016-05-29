@@ -15,6 +15,7 @@ data IntWidth = BitWidth Int | WordWidth
 data CType
     = IsInt Signed IntWidth
     | IsFloat Int
+    | IsVoid
     deriving (Eq, Ord)
 
 cTypeOf :: Show a => [CDeclarationSpecifier a] -> CType
@@ -28,11 +29,13 @@ cTypeOf = foldr go (IsInt Signed (BitWidth 32))
     go (CTypeSpec (CLongType _)) (IsInt s _) = IsInt s WordWidth
     go (CTypeSpec (CFloatType _)) _ = IsFloat 32
     go (CTypeSpec (CDoubleType _)) _ = IsFloat 64
+    go (CTypeSpec (CVoidType _)) _ = IsVoid
     go spec _ = error ("cTypeOf: unsupported declaration specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
+toRustType IsVoid = Rust.TypeName "()"
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
