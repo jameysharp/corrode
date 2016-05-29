@@ -11,11 +11,14 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Language.C.Interpret,
-                       Language.C.Interpret.Class
+                       Language.C.Interpret.Class,
+                       Language.Rust,
+                       Language.Rust.AST
   ghc-options:         -Wall
   default-language:    Haskell2010
   build-depends:       base >=4.8 && <4.9,
                        language-c >=0.4 && <0.5,
+                       pretty,
                        transformers
 
 executable corrode
@@ -25,4 +28,5 @@ executable corrode
   build-depends:       base >=4.8 && <4.9,
                        corrode,
                        language-c >=0.4 && <0.5,
+                       pretty,
                        transformers >=0.2

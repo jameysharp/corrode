@@ -6,13 +6,14 @@ import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State.Lazy
 import Control.Monad.Trans.Writer.Lazy
-import Data.String
 import Language.C
 import Language.C.Interpret
 import Language.C.Interpret.Class
 import Language.C.Data.Ident
 import Language.C.System.GCC
+import qualified Language.Rust as Rust
 import System.Environment
+import Text.PrettyPrint.HughesPJClass
 
 data RustType
     = VoidType
@@ -41,53 +42,38 @@ rustTypeOf = foldr go (IntType Signed (Just 32))
     go (CTypeSpec (CBoolType _)) _ = BoolType
     go spec _ = error ("rustTypeOf: unsupported declaration specifier " ++ show spec)
 
-newtype Source = Source String
-    deriving (Monoid, IsString)
+instance Read Rust.Expr where
+    readsPrec p s = [ (realToFrac (v :: Double), r) | (v, r) <- readsPrec p s ]
 
-instance Num Source where
-    (+) a b = a `mappend` " + " `mappend` b
-    (-) a b = a `mappend` " - " `mappend` b
-    (*) a b = a `mappend` " * " `mappend` b
-    negate a = "-" `mappend` a
-    fromInteger i = Source (show i)
+instance OrdInterpretation Rust.Expr Rust.Expr where
+    (.<) = Rust.CmpLT
+    (.>) = Rust.CmpGT
+    (.<=) = Rust.CmpLE
+    (.>=) = Rust.CmpGE
+    (.==) = Rust.CmpEQ
+    (./=) = Rust.CmpNE
 
-instance Fractional Source where
-    (/) a b = a `mappend` " / " `mappend` b
-    recip a = "1 / " `mappend` a
-    fromRational r = Source (show (fromRational r :: Double))
+instance IntInterpretation Rust.Expr where
+    (./) = Rust.Div
+    (.%) = Rust.Mod
+    (.<<) = Rust.ShiftL
+    (.>>) = Rust.ShiftR
+    (.&) = Rust.And
+    (.|) = Rust.Or
+    (.^) = Rust.Xor
+    (.~) = Rust.Not
+    (.!) = Rust.Not
+    (.&&) = Rust.LAnd
+    (.||) = Rust.LOr
 
-instance Read Source where
-    readsPrec p s = [ (Source (show (v :: Double)), r) | (v, r) <- readsPrec p s ]
+instance Interpretation Rust.Expr Rust.Expr where
+    intToFloat i = Rust.Cast i (Rust.TypeName "f64")
 
-instance OrdInterpretation Source Source where
-    (.<) a b = a `mappend` " < " `mappend` b
-    (.>) a b = a `mappend` " > " `mappend` b
-    (.<=) a b = a `mappend` " <= " `mappend` b
-    (.>=) a b = a `mappend` " >= " `mappend` b
-    (.==) a b = a `mappend` " == " `mappend` b
-    (./=) a b = a `mappend` " != " `mappend` b
-
-instance IntInterpretation Source where
-    (./) a b = a `mappend` " / " `mappend` b
-    (.%) a b = a `mappend` " % " `mappend` b
-    (.<<) a b = a `mappend` " << " `mappend` b
-    (.>>) a b = a `mappend` " >> " `mappend` b
-    (.&) a b = a `mappend` " & " `mappend` b
-    (.|) a b = a `mappend` " | " `mappend` b
-    (.^) a b = a `mappend` " ^ " `mappend` b
-    (.~) a = "~" `mappend` a
-    (.!) a = "!" `mappend` a
-    (.&&) a b = a `mappend` " && " `mappend` b
-    (.||) a b = a `mappend` " || " `mappend` b
-
-instance Interpretation Source Source where
-    intToFloat i = i `mappend` " as f64"
-
-extractSource :: Value Source Source -> Source
+extractSource :: Value Rust.Expr Rust.Expr -> Rust.Expr
 extractSource (IntValue s _ _) = s
 extractSource (FloatValue s _) = s
 
-translateStatement :: Show a => CStatement a -> WriterT Source (EnvMonad Source Source) ()
+translateStatement :: Show a => CStatement a -> WriterT String (EnvMonad Rust.Expr Rust.Expr) ()
 translateStatement (CCompound [] items _) = do
     -- Push a new declaration scope for this block.
     lift $ modify ([] :)
@@ -99,7 +85,7 @@ translateStatement (CCompound [] items _) = do
 translateStatement (CReturn Nothing _) = tell "    return;\n"
 translateStatement (CReturn (Just expr) _) = do
     expr' <- lift $ interpretExpr expr
-    tell ("    return " `mappend` extractSource expr' `mappend` ";\n")
+    tell ("    return " `mappend` prettyShow (extractSource expr') `mappend` ";\n")
 translateStatement stmt = error ("translateStatement: unsupported statement " ++ show stmt)
 
 translateFunction :: Show a => CFunctionDef a -> IO ()
@@ -110,11 +96,11 @@ translateFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
         let nm = identToString argname
         putStrLn (nm ++ " : " ++ show ty)
         return $ (,) argname $ case ty of
-            IntType s w -> IntValue (Source nm) s w
-            FloatType w -> FloatValue (Source nm) w
+            IntType s w -> IntValue (Rust.Var (Rust.VarName nm)) s w
+            FloatType w -> FloatValue (Rust.Var (Rust.VarName nm)) w
             _ -> error ("translateFunction: unsupported argument type " ++ show ty)
     putStrLn (") -> " ++ show (rustTypeOf specs) ++ " {")
-    let ((), Source body') = evalState (runWriterT (translateStatement body)) [args']
+    let ((), body') = evalState (runWriterT (translateStatement body)) [args']
     putStr body'
     putStrLn "}"
 
