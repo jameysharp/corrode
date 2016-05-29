@@ -80,6 +80,11 @@ type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
 
 interpretExpr :: CExpression n -> EnvMonad Result
+interpretExpr (CComma exprs _) = do
+    exprs' <- mapM interpretExpr exprs
+    let effects = map (Rust.Stmt . snd) (init exprs')
+    let (ty, final) = last exprs'
+    return (ty, Rust.Block effects (Just final))
 interpretExpr (CAssign CAssignOp lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
