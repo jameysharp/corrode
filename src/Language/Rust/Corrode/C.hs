@@ -82,15 +82,15 @@ toBool (_, v) = (IsInt Signed (BitWidth 32),
 type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
 
-interpretExpr :: Show n => CExpression n -> EnvMonad Result
-interpretExpr (CComma exprs _) = do
-    exprs' <- mapM interpretExpr exprs
-    let effects = map (Rust.Stmt . snd) (init exprs')
-    let (ty, final) = last exprs'
-    return (ty, Rust.BlockExpr (Rust.Block effects (Just final)))
-interpretExpr (CAssign op lhs rhs _) = do
-    lhs' <- interpretExpr lhs
-    rhs' <- interpretExpr rhs
+interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
+interpretExpr demand (CComma exprs _) = do
+    let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
+    effects' <- mapM (fmap (Rust.Stmt . snd) . interpretExpr False) effects
+    mfinal' <- mapM (interpretExpr True) mfinal
+    return (maybe IsVoid fst mfinal', Rust.BlockExpr (Rust.Block effects' (fmap snd mfinal')))
+interpretExpr demand (CAssign op lhs rhs _) = do
+    lhs' <- interpretExpr True lhs
+    rhs' <- interpretExpr True rhs
     let op' = case op of
             CAssignOp -> (Rust.:=)
             CMulAssOp -> (Rust.:*=)
@@ -105,19 +105,20 @@ interpretExpr (CAssign op lhs rhs _) = do
             COrAssOp  -> (Rust.:|=)
         tmp = Rust.VarName "_tmp"
         dereftmp = Rust.Deref (Rust.Var tmp)
-        b = Rust.Block
+    return $ if demand
+        then (fst lhs', Rust.BlockExpr (Rust.Block
             [ Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow (snd lhs')))
             , Rust.Stmt (Rust.Assign dereftmp op' (snd rhs'))
-            ] (Just dereftmp)
-    return (fst lhs', Rust.BlockExpr b)
-interpretExpr (CCond c (Just t) f _) = do
-    c' <- interpretExpr c
-    t' <- interpretExpr t
-    f' <- interpretExpr f
+            ] (Just dereftmp)))
+        else (IsVoid, Rust.Assign (snd lhs') op' (snd rhs'))
+interpretExpr demand (CCond c (Just t) f _) = do
+    c' <- interpretExpr True c
+    t' <- interpretExpr demand t
+    f' <- interpretExpr demand f
     return (promote (\ t'' f'' -> Rust.IfThenElse (snd (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
-interpretExpr (CBinary op lhs rhs _) = do
-    lhs' <- interpretExpr lhs
-    rhs' <- interpretExpr rhs
+interpretExpr _ (CBinary op lhs rhs _) = do
+    lhs' <- interpretExpr True lhs
+    rhs' <- interpretExpr True rhs
     return $ case op of
         CMulOp -> promote Rust.Mul lhs' rhs'
         CDivOp -> promote Rust.Div lhs' rhs'
@@ -137,41 +138,41 @@ interpretExpr (CBinary op lhs rhs _) = do
         COrOp -> promote Rust.Or lhs' rhs'
         CLndOp -> fromBool $ promote Rust.LAnd (toBool lhs') (toBool rhs')
         CLorOp -> fromBool $ promote Rust.LOr (toBool lhs') (toBool rhs')
-interpretExpr (CCast (CDecl spec [] _) expr _) = do
+interpretExpr _ (CCast (CDecl spec [] _) expr _) = do
     let ty = cTypeOf spec
-    (_, expr') <- interpretExpr expr
+    (_, expr') <- interpretExpr True expr
     return (ty, Rust.Cast expr' (toRustType ty))
-interpretExpr (CUnary op expr n) = case op of
-    CPreIncOp -> interpretExpr (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
-    CPreDecOp -> interpretExpr (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
-    CPlusOp -> interpretExpr expr
+interpretExpr demand (CUnary op expr n) = case op of
+    CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+    CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+    CPlusOp -> interpretExpr demand expr
     CMinOp -> simple (fmap Rust.Neg)
     CCompOp -> simple (fmap Rust.Not)
     CNegOp -> simple (fromBool . fmap Rust.Not . toBool)
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
-    simple f = fmap f (interpretExpr expr)
-interpretExpr (CVar ident _) = do
+    simple f = fmap f (interpretExpr True expr)
+interpretExpr _ (CVar ident _) = do
     env <- get
     -- Take the definition from the first scope where it's found.
     case msum (map (lookup ident) env) of
         Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
-interpretExpr (CConst c) = return $ case c of
+interpretExpr _ (CConst c) = return $ case c of
     CIntConst (CInteger v _repr _flags) _ -> (IsInt Signed (BitWidth 32), fromInteger v)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
         (v, "") -> (IsFloat 64, Rust.Lit (Rust.LitRep v))
         (v, [_]) -> (IsFloat 32, Rust.Lit (Rust.LitRep (v ++ "f32")))
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
-interpretExpr _ = error "interpretExpr: unsupported expression"
+interpretExpr _ _ = error "interpretExpr: unsupported expression"
 
 toBlock :: Rust.Expr -> Rust.Block
 toBlock (Rust.BlockExpr b) = b
 toBlock e = Rust.Block [] (Just e)
 
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
-interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr expr)
+interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
 interpretStatement (CCompound [] items _) = do
     -- Push a new declaration scope for this block.
     modify ([] :)
@@ -180,7 +181,7 @@ interpretStatement (CCompound [] items _) = do
         CBlockDecl (CDecl spec decls _) -> do
             let ty = cTypeOf spec
             forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
-                mexpr <- mapM (fmap snd . interpretExpr . (\ (CInitExpr initial _) -> initial)) minit
+                mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
                 modify (\ (scope : env) -> ((ident, ty) : scope) : env)
                 return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
@@ -188,16 +189,16 @@ interpretStatement (CCompound [] items _) = do
     modify tail
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement (CIf c t mf _) = do
-    (_, c') <- fmap toBool (interpretExpr c)
+    (_, c') <- fmap toBool (interpretExpr True c)
     t' <- fmap toBlock (interpretStatement t)
     f' <- maybe (return (Rust.Block [] Nothing)) (fmap toBlock . interpretStatement) mf
     return (Rust.IfThenElse c' t' f')
 interpretStatement (CWhile c b False _) = do
-    (_, c') <- fmap toBool (interpretExpr c)
+    (_, c') <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement b)
     return (Rust.While c' b')
 interpretStatement (CReturn expr _) = do
-    expr' <- mapM (fmap snd . interpretExpr) expr
+    expr' <- mapM (fmap snd . interpretExpr True) expr
     return (Rust.Return expr')
 interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
