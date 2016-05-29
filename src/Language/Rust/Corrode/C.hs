@@ -84,6 +84,11 @@ interpretExpr (CAssign CAssignOp lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
     return (fst lhs', Rust.Assign (snd lhs') (snd rhs'))
+interpretExpr (CCond c (Just t) f _) = do
+    c' <- interpretExpr c
+    t' <- interpretExpr t
+    f' <- interpretExpr f
+    return (promote (Rust.IfThenElse (snd (toBool c'))) t' f')
 interpretExpr (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
