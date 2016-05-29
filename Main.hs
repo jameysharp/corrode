@@ -7,11 +7,10 @@ import Control.Monad.Trans.Class
 import Control.Monad.Trans.State.Lazy
 import Control.Monad.Trans.Writer.Lazy
 import Language.C
-import Language.C.Interpret
-import Language.C.Interpret.Class
 import Language.C.Data.Ident
 import Language.C.System.GCC
 import qualified Language.Rust as Rust
+import Language.Rust.Corrode.C
 import System.Environment
 import Text.PrettyPrint.HughesPJClass
 
@@ -42,38 +41,11 @@ rustTypeOf = foldr go (IntType Signed (Just 32))
     go (CTypeSpec (CBoolType _)) _ = BoolType
     go spec _ = error ("rustTypeOf: unsupported declaration specifier " ++ show spec)
 
-instance Read Rust.Expr where
-    readsPrec p s = [ (realToFrac (v :: Double), r) | (v, r) <- readsPrec p s ]
-
-instance OrdInterpretation Rust.Expr Rust.Expr where
-    (.<) = Rust.CmpLT
-    (.>) = Rust.CmpGT
-    (.<=) = Rust.CmpLE
-    (.>=) = Rust.CmpGE
-    (.==) = Rust.CmpEQ
-    (./=) = Rust.CmpNE
-
-instance IntInterpretation Rust.Expr where
-    (./) = Rust.Div
-    (.%) = Rust.Mod
-    (.<<) = Rust.ShiftL
-    (.>>) = Rust.ShiftR
-    (.&) = Rust.And
-    (.|) = Rust.Or
-    (.^) = Rust.Xor
-    (.~) = Rust.Not
-    (.!) = Rust.Not
-    (.&&) = Rust.LAnd
-    (.||) = Rust.LOr
-
-instance Interpretation Rust.Expr Rust.Expr where
-    intToFloat i = Rust.Cast i (Rust.TypeName "f64")
-
-extractSource :: Value Rust.Expr Rust.Expr -> Rust.Expr
+extractSource :: Value -> Rust.Expr
 extractSource (IntValue s _ _) = s
 extractSource (FloatValue s _) = s
 
-translateStatement :: Show a => CStatement a -> WriterT String (EnvMonad Rust.Expr Rust.Expr) ()
+translateStatement :: Show a => CStatement a -> WriterT String EnvMonad ()
 translateStatement (CCompound [] items _) = do
     -- Push a new declaration scope for this block.
     lift $ modify ([] :)
