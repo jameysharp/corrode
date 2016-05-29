@@ -161,6 +161,10 @@ interpretExpr (CConst c) = return $ case c of
     _ -> error "interpretExpr: non-integer literals not implemented yet"
 interpretExpr _ = error "interpretExpr: unsupported expression"
 
+toBlock :: Rust.Expr -> Rust.Block
+toBlock (Rust.BlockExpr b) = b
+toBlock e = Rust.Block [] (Just e)
+
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
 interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr expr)
 interpretStatement (CCompound [] items _) = do
@@ -180,6 +184,11 @@ interpretStatement (CCompound [] items _) = do
     -- Pop this block's declaration scope.
     modify tail
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
+interpretStatement (CIf c t mf _) = do
+    (_, c') <- fmap toBool (interpretExpr c)
+    t' <- fmap toBlock (interpretStatement t)
+    f' <- maybe (return (Rust.Block [] Nothing)) (fmap toBlock . interpretStatement) mf
+    return (Rust.IfThenElse c' t' f')
 interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
 interpretStatement (CReturn (Just expr) _) = do
     (_, expr') <- interpretExpr expr
@@ -194,5 +203,5 @@ interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
             , let ty = cTypeOf argspecs
             , let nm = identToString argname
             ]
-        Rust.BlockExpr body' = evalState (interpretStatement body) [env]
-    in Rust.Function name formals (toRustType (cTypeOf specs)) body'
+        body' = evalState (interpretStatement body) [env]
+    in Rust.Function name formals (toRustType (cTypeOf specs)) (toBlock body')
