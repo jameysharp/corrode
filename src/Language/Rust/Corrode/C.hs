@@ -80,6 +80,10 @@ type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
 
 interpretExpr :: CExpression n -> EnvMonad Result
+interpretExpr (CAssign CAssignOp lhs rhs _) = do
+    lhs' <- interpretExpr lhs
+    rhs' <- interpretExpr rhs
+    return (fst lhs', Rust.Assign (snd lhs') (snd rhs'))
 interpretExpr (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
@@ -126,6 +130,7 @@ interpretExpr (CConst c) = return $ case c of
 interpretExpr _ = error "interpretExpr: unsupported expression"
 
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
+interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr expr)
 interpretStatement (CCompound [] items _) = do
     -- Push a new declaration scope for this block.
     modify ([] :)
