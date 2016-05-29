@@ -34,9 +34,9 @@ data Item = Function String [(Var, Type)] Type Expr
 
 instance Pretty Item where
     pPrint (Function nm args ret body) = cat
-        [ text "fn" <+> text nm <> text "("
+        [ text "pub fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
-            [ pPrint v <+> text ":" <+> pPrint t | (v, t) <- args ]
+            [ sep [text "mut", pPrint v, text ":", pPrint t] | (v, t) <- args ]
         , text ") ->" <+> pPrint ret
         , pPrint body
         ]
@@ -85,8 +85,21 @@ data Expr
     -- precedence 2
     | LOr Expr Expr
     -- precedence 1
-    | Assign Expr Expr
     | Range Expr Expr
+    | Assign Expr AssignOp Expr
+
+data AssignOp
+    = (:=)
+    | (:+=)
+    | (:-=)
+    | (:*=)
+    | (:/=)
+    | (:%=)
+    | (:&=)
+    | (:|=)
+    | (:^=)
+    | (:<<=)
+    | (:>>=)
 
 instance Pretty Expr where
     pPrintPrec l d e' = case e' of
@@ -127,13 +140,25 @@ instance Pretty Expr where
         CmpNE  a b -> binary  4 a "!=" b
         LAnd   a b -> binary  3 a "&&" b
         LOr    a b -> binary  2 a "||" b
-        Assign a b -> binary  1 a "=" b
         Range  a b -> binary  1 a ".." b
+        Assign a op b -> binary 1 a (assignOp op ++ "=") b
         where
         unary n op e = maybeParens (d > n) (text op <> pPrintPrec l n e)
         -- If a same-precedence operator appears nested on the right,
         -- then it needs parens, so increase the precedence there.
         binary n a op b = maybeParens (d > n) (pPrintPrec l n a <+> text op <+> pPrintPrec l (n + 1) b)
+
+        assignOp (:=) = ""
+        assignOp (:+=) = "+"
+        assignOp (:-=) = "-"
+        assignOp (:*=) = "*"
+        assignOp (:/=) = "/"
+        assignOp (:%=) = "%"
+        assignOp (:&=) = "&"
+        assignOp (:|=) = "|"
+        assignOp (:^=) = "^"
+        assignOp (:<<=) = "<<"
+        assignOp (:>>=) = ">>"
 
 -- These instances are mostly convenient for typing expressions in GHCi.
 

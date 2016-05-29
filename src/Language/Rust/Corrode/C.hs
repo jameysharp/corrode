@@ -85,10 +85,22 @@ interpretExpr (CComma exprs _) = do
     let effects = map (Rust.Stmt . snd) (init exprs')
     let (ty, final) = last exprs'
     return (ty, Rust.Block effects (Just final))
-interpretExpr (CAssign CAssignOp lhs rhs _) = do
+interpretExpr (CAssign op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
-    return (fst lhs', Rust.Assign (snd lhs') (snd rhs'))
+    let op' = case op of
+            CAssignOp -> (Rust.:=)
+            CMulAssOp -> (Rust.:*=)
+            CDivAssOp -> (Rust.:/=)
+            CRmdAssOp -> (Rust.:%=)
+            CAddAssOp -> (Rust.:+=)
+            CSubAssOp -> (Rust.:-=)
+            CShlAssOp -> (Rust.:<<=)
+            CShrAssOp -> (Rust.:>>=)
+            CAndAssOp -> (Rust.:&=)
+            CXorAssOp -> (Rust.:^=)
+            COrAssOp  -> (Rust.:|=)
+    return (fst lhs', Rust.Assign (snd lhs') op' (snd rhs'))
 interpretExpr (CCond c (Just t) f _) = do
     c' <- interpretExpr c
     t' <- interpretExpr t
@@ -123,11 +135,17 @@ interpretExpr (CCast (CDecl spec [] _) expr _) = do
 interpretExpr (CUnary op expr _) = do
     expr' <- interpretExpr expr
     return $ case op of
+        CPreIncOp -> preop (Rust.:+=) expr'
+        CPreDecOp -> preop (Rust.:-=) expr'
         CPlusOp -> expr'
         CMinOp -> fmap Rust.Neg expr'
         CCompOp -> fmap Rust.Not expr'
         CNegOp -> fromBool $ fmap Rust.Not $ toBool expr'
         _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
+    where
+    tmp = Rust.VarName "_tmp"
+    dereftmp = Rust.Deref (Rust.Var tmp)
+    preop op' (ty, lvalue) = (ty, Rust.Block [Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow lvalue)), Rust.Stmt (Rust.Assign dereftmp op' 1)] (Just dereftmp))
 interpretExpr (CVar ident _) = do
     env <- get
     -- Take the definition from the first scope where it's found.
