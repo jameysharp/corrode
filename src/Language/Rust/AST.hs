@@ -19,6 +19,17 @@ instance Pretty Var where
 instance Pretty Stmt where
     pPrint (Stmt e) = pPrint e <> text ";"
 
+data Item = Function String [(Var, Type)] Type Expr
+
+instance Pretty Item where
+    pPrint (Function nm args ret body) = cat
+        [ text "fn" <+> text nm <> text "("
+        , nest 4 $ sep $ punctuate (text ",")
+            [ pPrint v <+> text ":" <+> pPrint t | (v, t) <- args ]
+        , text ") ->" <+> pPrint ret
+        , pPrint body
+        ]
+
 data Expr
     = Lit Lit
     | Var Var

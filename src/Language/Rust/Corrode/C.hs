@@ -3,6 +3,7 @@ module Language.Rust.Corrode.C where
 import Control.Monad
 import Control.Monad.Trans.State.Lazy
 import Language.C
+import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
 
 data Signed = Signed | Unsigned
@@ -15,6 +16,19 @@ data CType
     = IsInt Signed IntWidth
     | IsFloat Int
     deriving (Eq, Ord)
+
+cTypeOf :: Show a => [CDeclarationSpecifier a] -> CType
+cTypeOf = foldr go (IsInt Signed (BitWidth 32))
+    where
+    go (CTypeSpec (CSignedType _)) (IsInt _ width) = IsInt Signed width
+    go (CTypeSpec (CUnsigType _)) (IsInt _ width) = IsInt Unsigned width
+    go (CTypeSpec (CCharType _)) (IsInt s _) = IsInt s (BitWidth 8)
+    go (CTypeSpec (CShortType _)) (IsInt s _) = IsInt s (BitWidth 16)
+    go (CTypeSpec (CIntType _)) (IsInt s _) = IsInt s (BitWidth 32)
+    go (CTypeSpec (CLongType _)) (IsInt s _) = IsInt s WordWidth
+    go (CTypeSpec (CFloatType _)) _ = IsFloat 32
+    go (CTypeSpec (CDoubleType _)) _ = IsFloat 64
+    go spec _ = error ("cTypeOf: unsupported declaration specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
@@ -126,3 +140,14 @@ interpretStatement (CReturn (Just expr) _) = do
     (_, expr') <- interpretExpr expr
     return (Rust.Return (Just expr'))
 interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
+
+interpretFunction :: Show a => CFunctionDef a -> Rust.Item
+interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) =
+    let (formals, env) = unzip
+            [ ((Rust.VarName nm, toRustType ty), (argname, ty))
+            | (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) <- args
+            , let ty = cTypeOf argspecs
+            , let nm = identToString argname
+            ]
+        body' = evalState (interpretStatement body) [env]
+    in Rust.Function name formals (toRustType (cTypeOf specs)) body'
