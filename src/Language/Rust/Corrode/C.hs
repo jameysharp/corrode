@@ -103,7 +103,13 @@ interpretExpr (CAssign op lhs rhs _) = do
             CAndAssOp -> (Rust.:&=)
             CXorAssOp -> (Rust.:^=)
             COrAssOp  -> (Rust.:|=)
-    return (fst lhs', Rust.Assign (snd lhs') op' (snd rhs'))
+        tmp = Rust.VarName "_tmp"
+        dereftmp = Rust.Deref (Rust.Var tmp)
+        b = Rust.Block
+            [ Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow (snd lhs')))
+            , Rust.Stmt (Rust.Assign dereftmp op' (snd rhs'))
+            ] (Just dereftmp)
+    return (fst lhs', Rust.BlockExpr b)
 interpretExpr (CCond c (Just t) f _) = do
     c' <- interpretExpr c
     t' <- interpretExpr t
