@@ -6,95 +6,103 @@ import Language.C
 import qualified Language.Rust.AST as Rust
 
 data Signed = Signed | Unsigned
-    deriving Eq
+    deriving (Eq, Ord)
 
-data Value
-    = IntValue Rust.Expr Signed (Maybe Int)
-    | FloatValue Rust.Expr Int
+data IntWidth = BitWidth Int | WordWidth
+    deriving (Eq, Ord)
 
-type Environment = [[(Ident, Value)]]
+data CType
+    = IsInt Signed IntWidth
+    | IsFloat Int
+    deriving (Eq, Ord)
+
+toRustType :: CType -> Rust.Type
+toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
+toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
+
+-- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
+intPromote :: CType -> CType
+-- "If an int can represent all values of the original type, the value is
+-- converted to an int,"
+intPromote (IsInt _ (BitWidth w)) | w < 32 = IsInt Signed (BitWidth 32)
+-- "otherwise, it is converted to an unsigned int. ... All other types are
+-- unchanged by the integer promotions."
+intPromote x = x
+
+-- * The "usual arithmetic conversions" (C99 section 6.3.1.8)
+usual :: CType -> CType -> CType
+usual a@(IsFloat _) b = max a b
+usual a b@(IsFloat _) = max a b
+usual a b
+    | a' == b' = a'
+    | as == bs = IsInt as (max aw bw)
+    | as == Unsigned = if aw >= bw then a' else b'
+    | otherwise      = if bw >= aw then b' else a'
+    where
+    a'@(IsInt as aw) = intPromote a
+    b'@(IsInt bs bw) = intPromote b
+
+type Result = (CType, Rust.Expr)
+
+promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
+promote op (at, av) (bt, bv) = (rt, rv)
+    where
+    rt = usual at bt
+    to t v | t == rt = v
+    to _ v = Rust.Cast v (toRustType rt)
+    rv = op (to at av) (to bt bv)
+
+fromBool :: Result -> Result
+fromBool (_, v) = (IsInt Signed (BitWidth 32), Rust.IfThenElse v 1 0)
+
+toBool :: Result -> Result
+toBool (_, v) = (IsInt Signed (BitWidth 32), Rust.CmpNE v 0)
+
+type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
 
-toFloat :: Value -> Value
-toFloat (IntValue v _s _w) = FloatValue (Rust.Cast v (Rust.TypeName "f64")) 64
-toFloat (FloatValue v w) = FloatValue v w
-
-promote
-    :: (Signed -> Maybe Int -> Rust.Expr -> Rust.Expr -> r)
-    -> (Int -> Rust.Expr -> Rust.Expr -> r)
-    -> Value
-    -> Value
-    -> r
--- TODO: fix sign and width of the representation of the integers
-promote i _ (IntValue av as aw) (IntValue bv bs bw) = i s w av bv
-    where
-    s = if (as, bs) == (Unsigned, Unsigned) then Unsigned else Signed
-    w = max 32 <$> (max <$> aw <*> bw)
-promote _ f (FloatValue av aw) b = let FloatValue bv bw = toFloat b in f (max aw bw) av bv
-promote _ f a (FloatValue bv bw) = let FloatValue av aw = toFloat a in f (max aw bw) av bv
-
-promoteArithmetic
-    :: (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> Value -> Value -> Value
-promoteArithmetic i f = promote (\ s w a b -> IntValue (i a b) s w) (\ w a b -> FloatValue (f a b) w)
-
-promoteBoolean
-    :: (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> Value -> Value -> Value
-promoteBoolean i f a b = IntValue (promote (\ _ _ -> i) (\ _ -> f) a b) Signed (Just 32)
-
-interpretExpr :: CExpression n -> EnvMonad Value
+interpretExpr :: CExpression n -> EnvMonad Result
 interpretExpr (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
-    let noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
     return $ case op of
-        CMulOp -> promoteArithmetic Rust.Mul Rust.Mul lhs' rhs'
-        CDivOp -> promoteArithmetic Rust.Div Rust.Div lhs' rhs'
-        CRmdOp -> promoteArithmetic Rust.Mod noFloat lhs' rhs'
-        CAddOp -> promoteArithmetic Rust.Add Rust.Add lhs' rhs'
-        CSubOp -> promoteArithmetic Rust.Sub Rust.Sub lhs' rhs'
-        CShlOp -> promoteArithmetic Rust.ShiftL noFloat lhs' rhs'
-        CShrOp -> promoteArithmetic Rust.ShiftR noFloat lhs' rhs'
-        CLeOp -> promoteBoolean Rust.CmpLT Rust.CmpLT lhs' rhs'
-        CGrOp -> promoteBoolean Rust.CmpGT Rust.CmpGT lhs' rhs'
-        CLeqOp -> promoteBoolean Rust.CmpLE Rust.CmpLE lhs' rhs'
-        CGeqOp -> promoteBoolean Rust.CmpGE Rust.CmpGE lhs' rhs'
-        CEqOp -> promoteBoolean Rust.CmpEQ Rust.CmpEQ lhs' rhs'
-        CNeqOp -> promoteBoolean Rust.CmpNE Rust.CmpNE lhs' rhs'
-        CAndOp -> promoteArithmetic Rust.And noFloat lhs' rhs'
-        CXorOp -> promoteArithmetic Rust.Xor noFloat lhs' rhs'
-        COrOp -> promoteArithmetic Rust.Or noFloat lhs' rhs'
-        CLndOp -> promoteBoolean Rust.LAnd noFloat lhs' rhs'
-        CLorOp -> promoteBoolean Rust.LOr noFloat lhs' rhs'
+        CMulOp -> promote Rust.Mul lhs' rhs'
+        CDivOp -> promote Rust.Div lhs' rhs'
+        CRmdOp -> promote Rust.Mod lhs' rhs'
+        CAddOp -> promote Rust.Add lhs' rhs'
+        CSubOp -> promote Rust.Sub lhs' rhs'
+        CShlOp -> promote Rust.ShiftL lhs' rhs'
+        CShrOp -> promote Rust.ShiftR lhs' rhs'
+        CLeOp -> fromBool $ promote Rust.CmpLT lhs' rhs'
+        CGrOp -> fromBool $ promote Rust.CmpGT lhs' rhs'
+        CLeqOp -> fromBool $ promote Rust.CmpLE lhs' rhs'
+        CGeqOp -> fromBool $ promote Rust.CmpGE lhs' rhs'
+        CEqOp -> fromBool $ promote Rust.CmpEQ lhs' rhs'
+        CNeqOp -> fromBool $ promote Rust.CmpNE lhs' rhs'
+        CAndOp -> promote Rust.And lhs' rhs'
+        CXorOp -> promote Rust.Xor lhs' rhs'
+        COrOp -> promote Rust.Or lhs' rhs'
+        CLndOp -> fromBool $ promote Rust.LAnd (toBool lhs') (toBool rhs')
+        CLorOp -> fromBool $ promote Rust.LOr (toBool lhs') (toBool rhs')
 interpretExpr (CUnary op expr _) = do
     expr' <- interpretExpr expr
-    let noFloat = error ("interpretExpr: no floating-point definition for operator " ++ show op)
     return $ case op of
         CPlusOp -> expr'
-        CMinOp -> case expr' of
-            IntValue v s w -> IntValue (Rust.Neg v) s w
-            FloatValue v w -> FloatValue (Rust.Neg v) w
-        CCompOp -> case expr' of
-            IntValue v s w -> IntValue (Rust.Not v) s w
-            FloatValue _ _ -> noFloat
-        CNegOp -> case expr' of
-            IntValue v _ _ -> IntValue (Rust.Not v) Signed (Just 32)
-            FloatValue _ _ -> noFloat
+        CMinOp -> fmap Rust.Neg expr'
+        CCompOp -> fmap Rust.Not expr'
+        CNegOp -> fromBool $ fmap Rust.Not $ toBool expr'
         _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
 interpretExpr (CVar ident _) = do
     env <- get
     -- Take the definition from the first scope where it's found.
     case msum (map (lookup ident) env) of
-        Just v -> return v
+        Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
 interpretExpr (CConst c) = return $ case c of
-    CIntConst (CInteger v _repr _flags) _ -> IntValue (fromInteger v) Signed (Just 32)
+    CIntConst (CInteger v _repr _flags) _ -> (IsInt Signed (BitWidth 32), fromInteger v)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> FloatValue (Rust.Lit (Rust.LitRep v)) 64
-        (v, [_]) -> FloatValue (Rust.Lit (Rust.LitRep (v ++ "f32"))) 32
+        (v, "") -> (IsFloat 64, Rust.Lit (Rust.LitRep v))
+        (v, [_]) -> (IsFloat 32, Rust.Lit (Rust.LitRep (v ++ "f32")))
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
 interpretExpr _ = error "interpretExpr: unsupported expression"

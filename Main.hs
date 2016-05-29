@@ -9,7 +9,6 @@ import Control.Monad.Trans.Writer.Lazy
 import Language.C
 import Language.C.Data.Ident
 import Language.C.System.GCC
-import qualified Language.Rust as Rust
 import Language.Rust.Corrode.C
 import System.Environment
 import Text.PrettyPrint.HughesPJClass
@@ -17,33 +16,29 @@ import Text.PrettyPrint.HughesPJClass
 data RustType
     = VoidType
     | BoolType
-    | IntType Signed (Maybe Int)
+    | IntType Signed IntWidth
     | FloatType Int
 
 instance Show RustType where
     show VoidType = "()"
     show BoolType = "bool"
-    show (IntType s width) = (case s of Signed -> 'i'; Unsigned -> 'u') : maybe "size" show width
-    show (FloatType width) = 'f' : show width
+    show (IntType s w) = (case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size")
+    show (FloatType w) = 'f' : show w
 
 rustTypeOf :: Show a => [CDeclarationSpecifier a] -> RustType
-rustTypeOf = foldr go (IntType Signed (Just 32))
+rustTypeOf = foldr go (IntType Signed (BitWidth 32))
     where
     go (CTypeSpec (CSignedType _)) (IntType _ width) = IntType Signed width
     go (CTypeSpec (CUnsigType _)) (IntType _ width) = IntType Unsigned width
-    go (CTypeSpec (CCharType _)) (IntType s _) = IntType s (Just 8)
-    go (CTypeSpec (CShortType _)) (IntType s _) = IntType s (Just 16)
-    go (CTypeSpec (CIntType _)) (IntType s _) = IntType s (Just 32)
-    go (CTypeSpec (CLongType _)) (IntType s _) = IntType s Nothing
+    go (CTypeSpec (CCharType _)) (IntType s _) = IntType s (BitWidth 8)
+    go (CTypeSpec (CShortType _)) (IntType s _) = IntType s (BitWidth 16)
+    go (CTypeSpec (CIntType _)) (IntType s _) = IntType s (BitWidth 32)
+    go (CTypeSpec (CLongType _)) (IntType s _) = IntType s WordWidth
     go (CTypeSpec (CFloatType _)) _ = FloatType 32
     go (CTypeSpec (CDoubleType _)) _ = FloatType 64
     go (CTypeSpec (CVoidType _)) _ = VoidType
     go (CTypeSpec (CBoolType _)) _ = BoolType
     go spec _ = error ("rustTypeOf: unsupported declaration specifier " ++ show spec)
-
-extractSource :: Value -> Rust.Expr
-extractSource (IntValue s _ _) = s
-extractSource (FloatValue s _) = s
 
 translateStatement :: Show a => CStatement a -> WriterT String EnvMonad ()
 translateStatement (CCompound [] items _) = do
@@ -56,8 +51,8 @@ translateStatement (CCompound [] items _) = do
     lift $ modify tail
 translateStatement (CReturn Nothing _) = tell "    return;\n"
 translateStatement (CReturn (Just expr) _) = do
-    expr' <- lift $ interpretExpr expr
-    tell ("    return " `mappend` prettyShow (extractSource expr') `mappend` ";\n")
+    (_, expr') <- lift $ interpretExpr expr
+    tell ("    return " `mappend` prettyShow expr' `mappend` ";\n")
 translateStatement stmt = error ("translateStatement: unsupported statement " ++ show stmt)
 
 translateFunction :: Show a => CFunctionDef a -> IO ()
@@ -68,8 +63,8 @@ translateFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
         let nm = identToString argname
         putStrLn (nm ++ " : " ++ show ty)
         return $ (,) argname $ case ty of
-            IntType s w -> IntValue (Rust.Var (Rust.VarName nm)) s w
-            FloatType w -> FloatValue (Rust.Var (Rust.VarName nm)) w
+            IntType s w -> IsInt s w
+            FloatType w -> IsFloat w
             _ -> error ("translateFunction: unsupported argument type " ++ show ty)
     putStrLn (") -> " ++ show (rustTypeOf specs) ++ " {")
     let ((), body') = evalState (runWriterT (translateStatement body)) [args']

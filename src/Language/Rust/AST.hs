@@ -18,6 +18,7 @@ instance Pretty Var where
 data Expr
     = Lit Lit
     | Var Var
+    | IfThenElse Expr Expr Expr
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
     | Neg Expr
@@ -61,8 +62,16 @@ data Expr
 
 instance Pretty Expr where
     pPrintPrec l d e' = case e' of
-        Lit       x -> pPrint x
-        Var       x -> pPrint x
+        Lit x -> pPrint x
+        Var x -> pPrint x
+        IfThenElse c t f -> sep
+            [ text "if" <+> pPrint c <+> text "{"
+            , nest 4 (pPrint t)
+            , text "} else {"
+            , nest 4 (pPrint f)
+            , text "}"
+            ]
+        -- operators:
         Neg       e -> unary 12 "-" e
         Deref     e -> unary 12 "*" e
         Not       e -> unary 12 "!" e
