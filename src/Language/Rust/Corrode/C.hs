@@ -56,7 +56,11 @@ fromBool :: Result -> Result
 fromBool (_, v) = (IsInt Signed (BitWidth 32), Rust.IfThenElse v 1 0)
 
 toBool :: Result -> Result
-toBool (_, v) = (IsInt Signed (BitWidth 32), Rust.CmpNE v 0)
+toBool (_, v) = (IsInt Signed (BitWidth 32),
+    case v of
+        Rust.IfThenElse v' (Rust.Lit (Rust.LitRep "1")) (Rust.Lit (Rust.LitRep "0")) -> v'
+        _ -> Rust.CmpNE v 0
+    )
 
 type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
