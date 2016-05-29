@@ -141,20 +141,16 @@ interpretExpr (CCast (CDecl spec [] _) expr _) = do
     let ty = cTypeOf spec
     (_, expr') <- interpretExpr expr
     return (ty, Rust.Cast expr' (toRustType ty))
-interpretExpr (CUnary op expr _) = do
-    expr' <- interpretExpr expr
-    return $ case op of
-        CPreIncOp -> preop (Rust.:+=) expr'
-        CPreDecOp -> preop (Rust.:-=) expr'
-        CPlusOp -> expr'
-        CMinOp -> fmap Rust.Neg expr'
-        CCompOp -> fmap Rust.Not expr'
-        CNegOp -> fromBool $ fmap Rust.Not $ toBool expr'
-        _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
+interpretExpr (CUnary op expr n) = case op of
+    CPreIncOp -> interpretExpr (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+    CPreDecOp -> interpretExpr (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+    CPlusOp -> interpretExpr expr
+    CMinOp -> simple (fmap Rust.Neg)
+    CCompOp -> simple (fmap Rust.Not)
+    CNegOp -> simple (fromBool . fmap Rust.Not . toBool)
+    _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
-    tmp = Rust.VarName "_tmp"
-    dereftmp = Rust.Deref (Rust.Var tmp)
-    preop op' (ty, lvalue) = (ty, Rust.BlockExpr (Rust.Block [Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow lvalue)), Rust.Stmt (Rust.Assign dereftmp op' 1)] (Just dereftmp)))
+    simple f = fmap f (interpretExpr expr)
 interpretExpr (CVar ident _) = do
     env <- get
     -- Take the definition from the first scope where it's found.
