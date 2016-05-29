@@ -130,11 +130,19 @@ interpretStatement (CCompound [] items _) = do
     -- Push a new declaration scope for this block.
     modify ([] :)
     stmts <- forM items $ \ item -> case item of
-        CBlockStmt stmt -> fmap Rust.Stmt (interpretStatement stmt)
+        CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement stmt)
+        CBlockDecl (CDecl spec decls _) -> do
+            let ty = cTypeOf spec
+            forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
+                mexpr <- case minit of
+                    Just (CInitExpr initial _) -> fmap (Just . snd) (interpretExpr initial)
+                    Nothing -> return Nothing
+                modify (\ (scope : env) -> ((ident, ty) : scope) : env)
+                return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     -- Pop this block's declaration scope.
     modify tail
-    return (Rust.Block stmts Nothing)
+    return (Rust.Block (concat stmts) Nothing)
 interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
 interpretStatement (CReturn (Just expr) _) = do
     (_, expr') <- interpretExpr expr

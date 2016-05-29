@@ -5,7 +5,6 @@ import Text.PrettyPrint.HughesPJClass
 newtype Type = TypeName String
 newtype Lit = LitRep String
 newtype Var = VarName String
-newtype Stmt = Stmt Expr
 
 instance Pretty Type where
     pPrint (TypeName s) = text s
@@ -16,8 +15,20 @@ instance Pretty Lit where
 instance Pretty Var where
     pPrint (VarName s) = text s
 
+data Mutable = Immutable | Mutable
+    deriving Eq
+
+data Stmt
+    = Stmt Expr
+    | Let Mutable Var (Maybe Type) (Maybe Expr)
+
 instance Pretty Stmt where
     pPrint (Stmt e) = pPrint e <> text ";"
+    pPrint (Let mut var mty minit) = sep
+        [ hsep [text "let", if mut == Mutable then text "mut" else empty, pPrint var]
+        , nest 4 $ maybe empty (\ ty -> text ":" <+> pPrint ty) mty
+        , nest 4 $ maybe empty (\ initial -> text "=" <+> pPrint initial) minit
+        ] <> text ";"
 
 data Item = Function String [(Var, Type)] Type Expr
 
