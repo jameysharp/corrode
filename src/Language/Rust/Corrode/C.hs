@@ -175,9 +175,7 @@ interpretStatement (CCompound [] items _) = do
         CBlockDecl (CDecl spec decls _) -> do
             let ty = cTypeOf spec
             forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
-                mexpr <- case minit of
-                    Just (CInitExpr initial _) -> fmap (Just . snd) (interpretExpr initial)
-                    Nothing -> return Nothing
+                mexpr <- mapM (fmap snd . interpretExpr . (\ (CInitExpr initial _) -> initial)) minit
                 modify (\ (scope : env) -> ((ident, ty) : scope) : env)
                 return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
@@ -193,10 +191,9 @@ interpretStatement (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr c)
     b' <- fmap toBlock (interpretStatement b)
     return (Rust.While c' b')
-interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
-interpretStatement (CReturn (Just expr) _) = do
-    (_, expr') <- interpretExpr expr
-    return (Rust.Return (Just expr'))
+interpretStatement (CReturn expr _) = do
+    expr' <- mapM (fmap snd . interpretExpr) expr
+    return (Rust.Return expr')
 interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
 interpretFunction :: Show a => CFunctionDef a -> Rust.Item
