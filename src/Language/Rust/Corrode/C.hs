@@ -189,6 +189,10 @@ interpretStatement (CIf c t mf _) = do
     t' <- fmap toBlock (interpretStatement t)
     f' <- maybe (return (Rust.Block [] Nothing)) (fmap toBlock . interpretStatement) mf
     return (Rust.IfThenElse c' t' f')
+interpretStatement (CWhile c b False _) = do
+    (_, c') <- fmap toBool (interpretExpr c)
+    b' <- fmap toBlock (interpretStatement b)
+    return (Rust.While c' b')
 interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
 interpretStatement (CReturn (Just expr) _) = do
     (_, expr') <- interpretExpr expr

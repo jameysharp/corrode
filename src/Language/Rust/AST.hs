@@ -51,6 +51,7 @@ data Expr
     | Var Var
     | BlockExpr Block
     | IfThenElse Expr Block Block
+    | While Expr Block
     | Return (Maybe Expr)
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
@@ -115,6 +116,7 @@ instance Pretty Expr where
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
             _ -> text "else" <+> pPrint f
+        While c b -> text "while" <+> pPrint c <+> pPrint b
         Return Nothing -> text "return"
         Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
