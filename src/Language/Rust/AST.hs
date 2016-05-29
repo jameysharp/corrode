@@ -111,7 +111,10 @@ instance Pretty Expr where
         Lit x -> pPrint x
         Var x -> pPrint x
         BlockExpr x -> pPrint x
-        IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> text "else" <+> pPrint f
+        IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> case f of
+            Block [] Nothing -> empty
+            Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
+            _ -> text "else" <+> pPrint f
         Return Nothing -> text "return"
         Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
