@@ -79,7 +79,7 @@ toBool (_, v) = (IsInt Signed (BitWidth 32),
 type Environment = [[(Ident, CType)]]
 type EnvMonad = State Environment
 
-interpretExpr :: CExpression n -> EnvMonad Result
+interpretExpr :: Show n => CExpression n -> EnvMonad Result
 interpretExpr (CComma exprs _) = do
     exprs' <- mapM interpretExpr exprs
     let effects = map (Rust.Stmt . snd) (init exprs')
@@ -116,6 +116,10 @@ interpretExpr (CBinary op lhs rhs _) = do
         COrOp -> promote Rust.Or lhs' rhs'
         CLndOp -> fromBool $ promote Rust.LAnd (toBool lhs') (toBool rhs')
         CLorOp -> fromBool $ promote Rust.LOr (toBool lhs') (toBool rhs')
+interpretExpr (CCast (CDecl spec [] _) expr _) = do
+    let ty = cTypeOf spec
+    (_, expr') <- interpretExpr expr
+    return (ty, Rust.Cast expr' (toRustType ty))
 interpretExpr (CUnary op expr _) = do
     expr' <- interpretExpr expr
     return $ case op of
