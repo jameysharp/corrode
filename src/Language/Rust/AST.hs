@@ -23,6 +23,12 @@ data Stmt
     | Let Mutable Var (Maybe Type) (Maybe Expr)
 
 instance Pretty Stmt where
+    -- Any statement consisting of an expression whose syntax ends with
+    -- a block does not need to be followed by a semicolon, and
+    -- including one anyway is poor style.
+    pPrint (Stmt (BlockExpr b)) = pPrint b -- no parens, no semicolon
+    pPrint (Stmt e@(IfThenElse{})) = pPrint e -- no semicolon
+    pPrint (Stmt e@(While{})) = pPrint e -- no semicolon
     pPrint (Stmt e) = pPrint e <> text ";"
     pPrint (Let mut var mty minit) = sep
         [ hsep [text "let", if mut == Mutable then text "mut" else empty, pPrint var]
@@ -111,7 +117,10 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
-        BlockExpr x -> pPrint x
+        -- If a block is at the beginning of a statement, Rust parses it
+        -- as if it were followed by a semicolon. Parenthesizing all
+        -- block expressions is excessive but correct.
+        BlockExpr x -> text "(" <> pPrint x <> text ")"
         IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> case f of
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
