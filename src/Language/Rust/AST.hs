@@ -5,6 +5,7 @@ import Text.PrettyPrint.HughesPJClass
 newtype Type = TypeName String
 newtype Lit = LitRep String
 newtype Var = VarName String
+newtype Stmt = Stmt Expr
 
 instance Pretty Type where
     pPrint (TypeName s) = text s
@@ -15,10 +16,15 @@ instance Pretty Lit where
 instance Pretty Var where
     pPrint (VarName s) = text s
 
+instance Pretty Stmt where
+    pPrint (Stmt e) = pPrint e <> text ";"
+
 data Expr
     = Lit Lit
     | Var Var
+    | Block [Stmt] (Maybe Expr)
     | IfThenElse Expr Expr Expr
+    | Return (Maybe Expr)
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
     | Neg Expr
@@ -64,6 +70,7 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
+        Block ss e -> sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
         IfThenElse c t f -> sep
             [ text "if" <+> pPrint c <+> text "{"
             , nest 4 (pPrint t)
@@ -71,6 +78,8 @@ instance Pretty Expr where
             , nest 4 (pPrint f)
             , text "}"
             ]
+        Return Nothing -> text "return"
+        Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
         Neg       e -> unary 12 "-" e
         Deref     e -> unary 12 "*" e

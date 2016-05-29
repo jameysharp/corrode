@@ -110,3 +110,19 @@ interpretExpr (CConst c) = return $ case c of
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
 interpretExpr _ = error "interpretExpr: unsupported expression"
+
+interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
+interpretStatement (CCompound [] items _) = do
+    -- Push a new declaration scope for this block.
+    modify ([] :)
+    stmts <- forM items $ \ item -> case item of
+        CBlockStmt stmt -> fmap Rust.Stmt (interpretStatement stmt)
+        _ -> error ("interpretStatement: unsupported statement " ++ show item)
+    -- Pop this block's declaration scope.
+    modify tail
+    return (Rust.Block stmts Nothing)
+interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
+interpretStatement (CReturn (Just expr) _) = do
+    (_, expr') <- interpretExpr expr
+    return (Rust.Return (Just expr'))
+interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)

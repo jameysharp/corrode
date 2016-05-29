@@ -5,7 +5,6 @@
 import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State.Lazy
-import Control.Monad.Trans.Writer.Lazy
 import Language.C
 import Language.C.Data.Ident
 import Language.C.System.GCC
@@ -40,21 +39,6 @@ rustTypeOf = foldr go (IntType Signed (BitWidth 32))
     go (CTypeSpec (CBoolType _)) _ = BoolType
     go spec _ = error ("rustTypeOf: unsupported declaration specifier " ++ show spec)
 
-translateStatement :: Show a => CStatement a -> WriterT String EnvMonad ()
-translateStatement (CCompound [] items _) = do
-    -- Push a new declaration scope for this block.
-    lift $ modify ([] :)
-    forM_ items $ \ item -> case item of
-        CBlockStmt stmt -> translateStatement stmt
-        _ -> error ("translateStatement: unsupported statement " ++ show item)
-    -- Pop this block's declaration scope.
-    lift $ modify tail
-translateStatement (CReturn Nothing _) = tell "    return;\n"
-translateStatement (CReturn (Just expr) _) = do
-    (_, expr') <- lift $ interpretExpr expr
-    tell ("    return " `mappend` prettyShow expr' `mappend` ";\n")
-translateStatement stmt = error ("translateStatement: unsupported statement " ++ show stmt)
-
 translateFunction :: Show a => CFunctionDef a -> IO ()
 translateFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) = do
     putStrLn ("fn " ++ name ++ "(")
@@ -66,10 +50,9 @@ translateFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
             IntType s w -> IsInt s w
             FloatType w -> IsFloat w
             _ -> error ("translateFunction: unsupported argument type " ++ show ty)
-    putStrLn (") -> " ++ show (rustTypeOf specs) ++ " {")
-    let ((), body') = evalState (runWriterT (translateStatement body)) [args']
-    putStr body'
-    putStrLn "}"
+    let body' = evalState (interpretStatement body) [args']
+    putStrLn (") -> " ++ show (rustTypeOf specs))
+    putStrLn (prettyShow body')
 
 main :: IO ()
 main = do
