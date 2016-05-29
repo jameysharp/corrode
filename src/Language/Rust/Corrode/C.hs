@@ -67,12 +67,12 @@ promote op (at, av) (bt, bv) = (rt, rv)
     rv = op (to at av) (to bt bv)
 
 fromBool :: Result -> Result
-fromBool (_, v) = (IsInt Signed (BitWidth 32), Rust.IfThenElse v 1 0)
+fromBool (_, v) = (IsInt Signed (BitWidth 32), Rust.IfThenElse v (Rust.Block [] (Just 1)) (Rust.Block [] (Just 0)))
 
 toBool :: Result -> Result
 toBool (_, v) = (IsInt Signed (BitWidth 32),
     case v of
-        Rust.IfThenElse v' (Rust.Lit (Rust.LitRep "1")) (Rust.Lit (Rust.LitRep "0")) -> v'
+        Rust.IfThenElse v' (Rust.Block [] (Just (Rust.Lit (Rust.LitRep "1")))) (Rust.Block [] (Just (Rust.Lit (Rust.LitRep "0")))) -> v'
         _ -> Rust.CmpNE v 0
     )
 
@@ -84,7 +84,7 @@ interpretExpr (CComma exprs _) = do
     exprs' <- mapM interpretExpr exprs
     let effects = map (Rust.Stmt . snd) (init exprs')
     let (ty, final) = last exprs'
-    return (ty, Rust.Block effects (Just final))
+    return (ty, Rust.BlockExpr (Rust.Block effects (Just final)))
 interpretExpr (CAssign op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
@@ -105,7 +105,7 @@ interpretExpr (CCond c (Just t) f _) = do
     c' <- interpretExpr c
     t' <- interpretExpr t
     f' <- interpretExpr f
-    return (promote (Rust.IfThenElse (snd (toBool c'))) t' f')
+    return (promote (\ t'' f'' -> Rust.IfThenElse (snd (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
 interpretExpr (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr lhs
     rhs' <- interpretExpr rhs
@@ -145,7 +145,7 @@ interpretExpr (CUnary op expr _) = do
     where
     tmp = Rust.VarName "_tmp"
     dereftmp = Rust.Deref (Rust.Var tmp)
-    preop op' (ty, lvalue) = (ty, Rust.Block [Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow lvalue)), Rust.Stmt (Rust.Assign dereftmp op' 1)] (Just dereftmp))
+    preop op' (ty, lvalue) = (ty, Rust.BlockExpr (Rust.Block [Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow lvalue)), Rust.Stmt (Rust.Assign dereftmp op' 1)] (Just dereftmp)))
 interpretExpr (CVar ident _) = do
     env <- get
     -- Take the definition from the first scope where it's found.
@@ -179,7 +179,7 @@ interpretStatement (CCompound [] items _) = do
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     -- Pop this block's declaration scope.
     modify tail
-    return (Rust.Block (concat stmts) Nothing)
+    return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement (CReturn Nothing _) = return (Rust.Return Nothing)
 interpretStatement (CReturn (Just expr) _) = do
     (_, expr') <- interpretExpr expr
@@ -194,5 +194,5 @@ interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
             , let ty = cTypeOf argspecs
             , let nm = identToString argname
             ]
-        body' = evalState (interpretStatement body) [env]
+        Rust.BlockExpr body' = evalState (interpretStatement body) [env]
     in Rust.Function name formals (toRustType (cTypeOf specs)) body'

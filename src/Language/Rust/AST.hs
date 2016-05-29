@@ -30,7 +30,12 @@ instance Pretty Stmt where
         , nest 4 $ maybe empty (\ initial -> text "=" <+> pPrint initial) minit
         ] <> text ";"
 
-data Item = Function String [(Var, Type)] Type Expr
+data Block = Block [Stmt] (Maybe Expr)
+
+instance Pretty Block where
+    pPrint (Block ss e) = sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
+
+data Item = Function String [(Var, Type)] Type Block
 
 instance Pretty Item where
     pPrint (Function nm args ret body) = cat
@@ -44,8 +49,8 @@ instance Pretty Item where
 data Expr
     = Lit Lit
     | Var Var
-    | Block [Stmt] (Maybe Expr)
-    | IfThenElse Expr Expr Expr
+    | BlockExpr Block
+    | IfThenElse Expr Block Block
     | Return (Maybe Expr)
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
@@ -105,14 +110,8 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
-        Block ss e -> sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
-        IfThenElse c t f -> sep
-            [ text "if" <+> pPrint c <+> text "{"
-            , nest 4 (pPrint t)
-            , text "} else {"
-            , nest 4 (pPrint f)
-            , text "}"
-            ]
+        BlockExpr x -> pPrint x
+        IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> text "else" <+> pPrint f
         Return Nothing -> text "return"
         Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
