@@ -63,6 +63,7 @@ instance Pretty Item where
 data Expr
     = Lit Lit
     | Var Var
+    | Call Expr [Expr]
     | BlockExpr Block
     | IfThenElse Expr Block Block
     | Loop Block
@@ -129,6 +130,11 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
+        Call f args -> cat
+            ( pPrint f <> text "("
+            : punctuate (text ",") (map (nest 4 . pPrint) args)
+            ++ [text ")"]
+            )
         -- If a block is at the beginning of a statement, Rust parses it
         -- as if it were followed by a semicolon. Parenthesizing all
         -- block expressions is excessive but correct.

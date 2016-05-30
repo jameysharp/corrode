@@ -17,7 +17,7 @@ data CType
     = IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
-    | IsOther
+    | IsFunc CType
     deriving (Eq, Ord)
 
 cTypeOf :: Show a => [CTypeSpecifier a] -> CType
@@ -38,7 +38,7 @@ toRustType :: CType -> Rust.Type
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
-toRustType IsOther = error "toRustType: tried to get a Rust type for type 'IsOther'"
+toRustType (IsFunc _) = error "toRustType: not implemented for IsFunc"
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
@@ -156,6 +156,10 @@ interpretExpr demand (CUnary op expr n) = case op of
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
     simple f = fmap f (interpretExpr True expr)
+interpretExpr _ (CCall func args _) = do
+    (IsFunc retTy, func') <- interpretExpr True func
+    args' <- mapM (fmap snd . interpretExpr True) args
+    return (retTy, Rust.Call func' args')
 interpretExpr _ (CVar ident _) = do
     env <- get
     case lookup ident env of
@@ -232,7 +236,7 @@ interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDecl
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
-    modify ((ident, IsOther) :)
+    modify ((ident, IsFunc retTy) :)
 
     -- Open a new scope for the formal parameters.
     scope $ do
