@@ -181,17 +181,22 @@ toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
 toBlock e = [Rust.Stmt e]
 
-interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
-interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
-interpretStatement (CCompound [] items _) = do
+scope :: EnvMonad a -> EnvMonad a
+scope m = do
     -- Push a new declaration scope for this block.
     modify ([] :)
+    a <- m
+    -- Pop this block's declaration scope.
+    modify tail
+    return a
+
+interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
+interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
+interpretStatement (CCompound [] items _) = scope $ do
     stmts <- forM items $ \ item -> case item of
         CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement stmt)
         CBlockDecl decl -> localDecls decl
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
-    -- Pop this block's declaration scope.
-    modify tail
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement (CIf c t mf _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
@@ -202,14 +207,10 @@ interpretStatement (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement b)
     return (Rust.While c' (Rust.Block b' Nothing))
-interpretStatement (CFor initial cond Nothing b _) = do
-    -- Push a new declaration scope for this block.
-    modify ([] :)
+interpretStatement (CFor initial cond Nothing b _) = scope $ do
     pre <- either (maybe (return []) (fmap (toBlock . snd) . interpretExpr False)) localDecls initial
     mkLoop <- maybe (return Rust.Loop) (fmap (Rust.While . snd . toBool) . interpretExpr True) cond
     b' <- interpretStatement b
-    -- Pop this block's declaration scope.
-    modify tail
     return (Rust.BlockExpr (Rust.Block pre (Just (mkLoop (Rust.Block (toBlock b') Nothing)))))
 interpretStatement (CCont _) = return Rust.Continue
 interpretStatement (CBreak _) = return Rust.Break
