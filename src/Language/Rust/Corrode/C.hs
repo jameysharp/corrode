@@ -200,6 +200,15 @@ interpretStatement (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement b)
     return (Rust.While c' (Rust.Block b' Nothing))
+interpretStatement (CFor initial cond Nothing b _) = do
+    -- Push a new declaration scope for this block.
+    modify ([] :)
+    pre <- either (maybe (return []) (fmap (toBlock . snd) . interpretExpr False)) localDecls initial
+    mkLoop <- maybe (return Rust.Loop) (fmap (Rust.While . snd . toBool) . interpretExpr True) cond
+    b' <- interpretStatement b
+    -- Pop this block's declaration scope.
+    modify tail
+    return (Rust.BlockExpr (Rust.Block pre (Just (mkLoop (Rust.Block (toBlock b') Nothing)))))
 interpretStatement (CCont _) = return Rust.Continue
 interpretStatement (CBreak _) = return Rust.Break
 interpretStatement (CReturn expr _) = do
