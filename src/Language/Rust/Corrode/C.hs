@@ -167,6 +167,14 @@ interpretExpr _ (CConst c) = return $ case c of
     _ -> error "interpretExpr: non-integer literals not implemented yet"
 interpretExpr _ _ = error "interpretExpr: unsupported expression"
 
+localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
+localDecls (CDecl spec decls _) = do
+    let ty = cTypeOf spec
+    forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
+        mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+        modify (\ (scope : env) -> ((ident, ty) : scope) : env)
+        return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
+
 toBlock :: Rust.Expr -> Rust.Block
 toBlock (Rust.BlockExpr b) = b
 toBlock e = Rust.Block [] (Just e)
@@ -178,12 +186,7 @@ interpretStatement (CCompound [] items _) = do
     modify ([] :)
     stmts <- forM items $ \ item -> case item of
         CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement stmt)
-        CBlockDecl (CDecl spec decls _) -> do
-            let ty = cTypeOf spec
-            forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
-                mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-                modify (\ (scope : env) -> ((ident, ty) : scope) : env)
-                return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
+        CBlockDecl decl -> localDecls decl
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     -- Pop this block's declaration scope.
     modify tail
