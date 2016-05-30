@@ -175,9 +175,9 @@ localDecls (CDecl spec decls _) = do
         modify (\ (scope : env) -> ((ident, ty) : scope) : env)
         return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
-toBlock :: Rust.Expr -> Rust.Block
-toBlock (Rust.BlockExpr b) = b
-toBlock e = Rust.Block [] (Just e)
+toBlock :: Rust.Expr -> [Rust.Stmt]
+toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
+toBlock e = [Rust.Stmt e]
 
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
 interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
@@ -194,12 +194,12 @@ interpretStatement (CCompound [] items _) = do
 interpretStatement (CIf c t mf _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
     t' <- fmap toBlock (interpretStatement t)
-    f' <- maybe (return (Rust.Block [] Nothing)) (fmap toBlock . interpretStatement) mf
-    return (Rust.IfThenElse c' t' f')
+    f' <- maybe (return []) (fmap toBlock . interpretStatement) mf
+    return (Rust.IfThenElse c' (Rust.Block t' Nothing) (Rust.Block f' Nothing))
 interpretStatement (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement b)
-    return (Rust.While c' b')
+    return (Rust.While c' (Rust.Block b' Nothing))
 interpretStatement (CCont _) = return Rust.Continue
 interpretStatement (CBreak _) = return Rust.Break
 interpretStatement (CReturn expr _) = do
@@ -216,4 +216,4 @@ interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
             , let nm = identToString argname
             ]
         body' = evalState (interpretStatement body) [env]
-    in Rust.Function name formals (toRustType (cTypeOf specs)) (toBlock body')
+    in Rust.Function name formals (toRustType (cTypeOf specs)) (Rust.Block (toBlock body') Nothing)

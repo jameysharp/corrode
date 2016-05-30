@@ -133,6 +133,7 @@ instance Pretty Expr where
         IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> case f of
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
+            Block [Stmt n@(IfThenElse{})] Nothing -> text "else" <+> pPrint n
             _ -> text "else" <+> pPrint f
         Loop b -> text "loop" <+> pPrint b
         While c b -> text "while" <+> pPrint c <+> pPrint b
