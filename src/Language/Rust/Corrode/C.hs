@@ -79,7 +79,7 @@ toBool (_, v) = (IsInt Signed (BitWidth 32),
         _ -> Rust.CmpNE v 0
     )
 
-type Environment = [[(Ident, CType)]]
+type Environment = [(Ident, CType)]
 type EnvMonad = State Environment
 
 interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
@@ -155,8 +155,7 @@ interpretExpr demand (CUnary op expr n) = case op of
     simple f = fmap f (interpretExpr True expr)
 interpretExpr _ (CVar ident _) = do
     env <- get
-    -- Take the definition from the first scope where it's found.
-    case msum (map (lookup ident) env) of
+    case lookup ident env of
         Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
 interpretExpr _ (CConst c) = return $ case c of
@@ -174,7 +173,7 @@ localDecls (CDecl spec decls _) = do
     let ty = cTypeOf typespecs
     forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
         mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-        modify (\ (scope : env) -> ((ident, ty) : scope) : env)
+        modify ((ident, ty) :)
         return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
@@ -183,11 +182,11 @@ toBlock e = [Rust.Stmt e]
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
-    -- Push a new declaration scope for this block.
-    modify ([] :)
+    -- Save the current environment.
+    old <- get
     a <- m
-    -- Pop this block's declaration scope.
-    modify tail
+    -- Restore the environment to its state before running m.
+    put old
     return a
 
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
@@ -234,5 +233,5 @@ interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
             [] -> Rust.Public
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
         retTy = cTypeOf typespecs
-        body' = evalState (interpretStatement body) [env]
+        body' = evalState (interpretStatement body) env
     in Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing)
