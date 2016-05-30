@@ -18,19 +18,19 @@ data CType
     | IsVoid
     deriving (Eq, Ord)
 
-cTypeOf :: Show a => [CDeclarationSpecifier a] -> CType
+cTypeOf :: Show a => [CTypeSpecifier a] -> CType
 cTypeOf = foldr go (IsInt Signed (BitWidth 32))
     where
-    go (CTypeSpec (CSignedType _)) (IsInt _ width) = IsInt Signed width
-    go (CTypeSpec (CUnsigType _)) (IsInt _ width) = IsInt Unsigned width
-    go (CTypeSpec (CCharType _)) (IsInt s _) = IsInt s (BitWidth 8)
-    go (CTypeSpec (CShortType _)) (IsInt s _) = IsInt s (BitWidth 16)
-    go (CTypeSpec (CIntType _)) (IsInt s _) = IsInt s (BitWidth 32)
-    go (CTypeSpec (CLongType _)) (IsInt s _) = IsInt s WordWidth
-    go (CTypeSpec (CFloatType _)) _ = IsFloat 32
-    go (CTypeSpec (CDoubleType _)) _ = IsFloat 64
-    go (CTypeSpec (CVoidType _)) _ = IsVoid
-    go spec _ = error ("cTypeOf: unsupported declaration specifier " ++ show spec)
+    go (CSignedType _) (IsInt _ width) = IsInt Signed width
+    go (CUnsigType _) (IsInt _ width) = IsInt Unsigned width
+    go (CCharType _) (IsInt s _) = IsInt s (BitWidth 8)
+    go (CShortType _) (IsInt s _) = IsInt s (BitWidth 16)
+    go (CIntType _) (IsInt s _) = IsInt s (BitWidth 32)
+    go (CLongType _) (IsInt s _) = IsInt s WordWidth
+    go (CFloatType _) _ = IsFloat 32
+    go (CDoubleType _) _ = IsFloat 64
+    go (CVoidType _) _ = IsVoid
+    go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
@@ -139,7 +139,8 @@ interpretExpr _ (CBinary op lhs rhs _) = do
         CLndOp -> fromBool $ promote Rust.LAnd (toBool lhs') (toBool rhs')
         CLorOp -> fromBool $ promote Rust.LOr (toBool lhs') (toBool rhs')
 interpretExpr _ (CCast (CDecl spec [] _) expr _) = do
-    let ty = cTypeOf spec
+    let ([], [], [], typespecs, False) = partitionDeclSpecs spec
+    let ty = cTypeOf typespecs
     (_, expr') <- interpretExpr True expr
     return (ty, Rust.Cast expr' (toRustType ty))
 interpretExpr demand (CUnary op expr n) = case op of
@@ -165,11 +166,12 @@ interpretExpr _ (CConst c) = return $ case c of
         (v, [_]) -> (IsFloat 32, Rust.Lit (Rust.LitRep (v ++ "f32")))
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
-interpretExpr _ _ = error "interpretExpr: unsupported expression"
+interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
 
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
 localDecls (CDecl spec decls _) = do
-    let ty = cTypeOf spec
+    let ([], [], [], typespecs, False) = partitionDeclSpecs spec
+    let ty = cTypeOf typespecs
     forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
         mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
         modify (\ (scope : env) -> ((ident, ty) : scope) : env)
@@ -221,8 +223,15 @@ interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Rig
     let (formals, env) = unzip
             [ ((Rust.VarName nm, toRustType ty), (argname, ty))
             | (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) <- args
-            , let ty = cTypeOf argspecs
+            , let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
+            , let ty = cTypeOf argtypespecs
             , let nm = identToString argname
             ]
+        (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
+        vis = case storage of
+            [CStatic _] -> Rust.Private
+            [] -> Rust.Public
+            _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
+        retTy = cTypeOf typespecs
         body' = evalState (interpretStatement body) [env]
-    in Rust.Function name formals (toRustType (cTypeOf specs)) (Rust.Block (toBlock body') Nothing)
+    in Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing)

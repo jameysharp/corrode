@@ -18,6 +18,9 @@ instance Pretty Lit where
 instance Pretty Var where
     pPrint (VarName s) = text s
 
+data Visibility = Public | Private
+    deriving Eq
+
 data Mutable = Immutable | Mutable
     deriving Eq
 
@@ -46,11 +49,11 @@ data Block = Block [Stmt] (Maybe Expr)
 instance Pretty Block where
     pPrint (Block ss e) = sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
 
-data Item = Function String [(Var, Type)] Type Block
+data Item = Function Visibility String [(Var, Type)] Type Block
 
 instance Pretty Item where
-    pPrint (Function nm args ret body) = cat
-        [ text "pub fn" <+> text nm <> text "("
+    pPrint (Function vis nm args ret body) = cat
+        [ (if vis == Public then text "pub" else empty) <+> text "fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [text "mut", pPrint v, text ":", pPrint t] | (v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
