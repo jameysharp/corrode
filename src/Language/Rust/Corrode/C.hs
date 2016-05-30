@@ -85,6 +85,18 @@ toBool (_, v) = (IsInt Signed (BitWidth 32),
 type Environment = [(Ident, CType)]
 type EnvMonad = State Environment
 
+addVar :: Ident -> CType -> EnvMonad ()
+addVar ident ty = modify ((ident, ty) :)
+
+scope :: EnvMonad a -> EnvMonad a
+scope m = do
+    -- Save the current environment.
+    old <- get
+    a <- m
+    -- Restore the environment to its state before running m.
+    put old
+    return a
+
 interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
 interpretExpr demand (CComma exprs _) = do
     let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
@@ -180,21 +192,12 @@ localDecls (CDecl spec decls _) = do
     let ty = cTypeOf typespecs
     forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
         mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-        modify ((ident, ty) :)
+        addVar ident ty
         return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
 toBlock e = [Rust.Stmt e]
-
-scope :: EnvMonad a -> EnvMonad a
-scope m = do
-    -- Save the current environment.
-    old <- get
-    a <- m
-    -- Restore the environment to its state before running m.
-    put old
-    return a
 
 interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
 interpretStatement (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
@@ -236,7 +239,7 @@ interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDecl
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
-    modify ((ident, IsFunc retTy) :)
+    addVar ident (IsFunc retTy)
 
     -- Open a new scope for the formal parameters.
     scope $ do
@@ -244,7 +247,7 @@ interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDecl
             let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
             let ty = cTypeOf argtypespecs
             let nm = identToString argname
-            modify ((argname, ty) :)
+            addVar argname ty
             return (Rust.VarName nm, toRustType ty)
         body' <- interpretStatement body
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
