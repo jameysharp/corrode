@@ -2,6 +2,7 @@ module Language.Rust.Corrode.C where
 
 import Control.Monad
 import Control.Monad.Trans.State.Lazy
+import Data.Maybe
 import Language.C
 import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
@@ -16,6 +17,7 @@ data CType
     = IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
+    | IsOther
     deriving (Eq, Ord)
 
 cTypeOf :: Show a => [CTypeSpecifier a] -> CType
@@ -36,6 +38,7 @@ toRustType :: CType -> Rust.Type
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
+toRustType IsOther = error "toRustType: tried to get a Rust type for type 'IsOther'"
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
@@ -218,20 +221,32 @@ interpretStatement (CReturn expr _) = do
     return (Rust.Return expr')
 interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
-interpretFunction :: Show a => CFunctionDef a -> Rust.Item
-interpretFunction (CFunDef specs (CDeclr (Just (Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) =
-    let (formals, env) = unzip
-            [ ((Rust.VarName nm, toRustType ty), (argname, ty))
-            | (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) <- args
-            , let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
-            , let ty = cTypeOf argtypespecs
-            , let nm = identToString argname
-            ]
-        (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
+interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
+interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) = do
+    let (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
         vis = case storage of
             [CStatic _] -> Rust.Private
             [] -> Rust.Public
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
         retTy = cTypeOf typespecs
-        body' = evalState (interpretStatement body) env
-    in Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing)
+
+    -- Add this function to the globals before evaluating its body so
+    -- recursive calls work.
+    modify ((ident, IsOther) :)
+
+    -- Open a new scope for the formal parameters.
+    scope $ do
+        formals <- forM args $ \ (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) -> do
+            let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
+            let ty = cTypeOf argtypespecs
+            let nm = identToString argname
+            modify ((argname, ty) :)
+            return (Rust.VarName nm, toRustType ty)
+        body' <- interpretStatement body
+        return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
+
+interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
+interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $ do
+    forM decls $ \ decl -> case decl of
+        CFDefExt f -> fmap Just (interpretFunction f)
+        _ -> return Nothing -- FIXME: ignore everything but function declarations for now

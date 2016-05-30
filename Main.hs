@@ -10,7 +10,5 @@ main :: IO ()
 main = do
     args <- getArgs
     forM_ args $ \ arg -> do
-        Right (CTranslUnit decls _node) <- parseCFile (newGCC "gcc") Nothing [] arg
-        forM_ decls $ \ decl -> case decl of
-            CFDefExt f -> putStrLn (prettyShow (itemIdioms (interpretFunction f)))
-            _ -> print decl
+        Right t <- parseCFile (newGCC "gcc") Nothing [] arg
+        mapM_ (putStrLn . prettyShow . itemIdioms) (interpretTranslationUnit t)
