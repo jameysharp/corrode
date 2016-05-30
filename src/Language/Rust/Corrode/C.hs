@@ -197,6 +197,8 @@ interpretStatement (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement b)
     return (Rust.While c' b')
+interpretStatement (CCont _) = return Rust.Continue
+interpretStatement (CBreak _) = return Rust.Break
 interpretStatement (CReturn expr _) = do
     expr' <- mapM (fmap snd . interpretExpr True) expr
     return (Rust.Return expr')

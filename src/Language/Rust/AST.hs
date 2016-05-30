@@ -31,7 +31,9 @@ instance Pretty Stmt where
     -- including one anyway is poor style.
     pPrint (Stmt (BlockExpr b)) = pPrint b -- no parens, no semicolon
     pPrint (Stmt e@(IfThenElse{})) = pPrint e -- no semicolon
+    pPrint (Stmt e@(Loop{})) = pPrint e -- no semicolon
     pPrint (Stmt e@(While{})) = pPrint e -- no semicolon
+    pPrint (Stmt e@(For{})) = pPrint e -- no semicolon
     pPrint (Stmt e) = pPrint e <> text ";"
     pPrint (Let mut var mty minit) = sep
         [ hsep [text "let", if mut == Mutable then text "mut" else empty, pPrint var]
@@ -60,7 +62,11 @@ data Expr
     | Var Var
     | BlockExpr Block
     | IfThenElse Expr Block Block
+    | Loop Block
     | While Expr Block
+    | For Var Expr Block
+    | Break
+    | Continue
     | Return (Maybe Expr)
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
@@ -128,7 +134,11 @@ instance Pretty Expr where
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
             _ -> text "else" <+> pPrint f
+        Loop b -> text "loop" <+> pPrint b
         While c b -> text "while" <+> pPrint c <+> pPrint b
+        For v i b -> text "for" <+> pPrint v <+> text "in" <+> pPrint i <+> pPrint b
+        Break -> text "break"
+        Continue -> text "continue"
         Return Nothing -> text "return"
         Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
