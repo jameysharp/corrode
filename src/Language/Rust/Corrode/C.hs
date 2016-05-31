@@ -243,7 +243,13 @@ interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDecl
 
     -- Open a new scope for the formal parameters.
     scope $ do
-        formals <- forM args $ \ (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) -> do
+        -- Treat argument lists `(void)` and `()` the same: we'll
+        -- pretend that both mean the function takes no arguments.
+        let args' = case args of
+                [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
+                _ -> args
+
+        formals <- forM args' $ \ (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) -> do
             let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
             let ty = cTypeOf argtypespecs
             let nm = identToString argname
