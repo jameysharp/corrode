@@ -200,29 +200,29 @@ toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
 toBlock e = [Rust.Stmt e]
 
-interpretStatement :: Show a => Rust.Expr -> Rust.Expr -> CStatement a -> EnvMonad Rust.Expr
-interpretStatement _ _ (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
-interpretStatement onBreak onContinue (CCompound [] items _) = scope $ do
+interpretStatement :: Show a => CType -> Rust.Expr -> Rust.Expr -> CStatement a -> EnvMonad Rust.Expr
+interpretStatement _ _ _ (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
+interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
     stmts <- forM items $ \ item -> case item of
-        CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement onBreak onContinue stmt)
+        CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement retTy onBreak onContinue stmt)
         CBlockDecl decl -> localDecls decl
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
-interpretStatement onBreak onContinue (CIf c t mf _) = do
+interpretStatement retTy onBreak onContinue (CIf c t mf _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
-    t' <- fmap toBlock (interpretStatement onBreak onContinue t)
-    f' <- maybe (return []) (fmap toBlock . interpretStatement onBreak onContinue) mf
+    t' <- fmap toBlock (interpretStatement retTy onBreak onContinue t)
+    f' <- maybe (return []) (fmap toBlock . interpretStatement retTy onBreak onContinue) mf
     return (Rust.IfThenElse c' (Rust.Block t' Nothing) (Rust.Block f' Nothing))
-interpretStatement _ _ (CWhile c b False _) = do
+interpretStatement retTy _ _ (CWhile c b False _) = do
     (_, c') <- fmap toBool (interpretExpr True c)
-    b' <- fmap toBlock (interpretStatement (Rust.Break Nothing) (Rust.Continue Nothing) b)
+    b' <- fmap toBlock (interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b)
     return (Rust.While Nothing c' (Rust.Block b' Nothing))
-interpretStatement _ _ (CFor initial cond mincr b _) = scope $ do
+interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
     pre <- either (maybe (return []) (fmap (toBlock . snd) . interpretExpr False)) localDecls initial
 
     (lt, b') <- case mincr of
         Nothing -> do
-            b' <- interpretStatement (Rust.Break Nothing) (Rust.Continue Nothing) b
+            b' <- interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b
             return (Nothing, b')
         Just incr -> do
             -- Rust doesn't have a loop form that updates variables
@@ -244,19 +244,19 @@ interpretStatement _ _ (CFor initial cond mincr b _) = scope $ do
             let continueTo = Just (Rust.Lifetime "continueTo")
             let breakTo = Just (Rust.Lifetime "breakTo")
 
-            b' <- interpretStatement (Rust.Break breakTo) (Rust.Break continueTo) b
+            b' <- interpretStatement retTy (Rust.Break breakTo) (Rust.Break continueTo) b
             (_, incr') <- interpretExpr False incr
             let inner = Rust.Loop continueTo (Rust.Block (toBlock b' ++ [Rust.Stmt (Rust.Break Nothing)]) Nothing)
             return (breakTo, Rust.BlockExpr (Rust.Block [Rust.Stmt inner, Rust.Stmt incr'] Nothing))
 
     mkLoop <- maybe (return (Rust.Loop lt)) (fmap (Rust.While lt . snd . toBool) . interpretExpr True) cond
     return (Rust.BlockExpr (Rust.Block pre (Just (mkLoop (Rust.Block (toBlock b') Nothing)))))
-interpretStatement _ onContinue (CCont _) = return onContinue
-interpretStatement onBreak _ (CBreak _) = return onBreak
-interpretStatement _ _ (CReturn expr _) = do
-    expr' <- mapM (fmap snd . interpretExpr True) expr
+interpretStatement _ _ onContinue (CCont _) = return onContinue
+interpretStatement _ onBreak _ (CBreak _) = return onBreak
+interpretStatement retTy _ _ (CReturn expr _) = do
+    expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
     return (Rust.Return expr')
-interpretStatement _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
+interpretStatement _ _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
 interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
 interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) = do
@@ -287,7 +287,7 @@ interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDecl
             return (Rust.VarName nm, toRustType ty)
 
         let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
-        body' <- interpretStatement noLoop noLoop body
+        body' <- interpretStatement retTy noLoop noLoop body
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
 
 interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
