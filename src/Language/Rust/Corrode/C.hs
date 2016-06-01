@@ -293,4 +293,8 @@ interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
 interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $ do
     forM decls $ \ decl -> case decl of
         CFDefExt f -> fmap Just (interpretFunction f)
+        CDeclExt (CDecl specs [(Just (CDeclr (Just ident) [CFunDeclr{}] _ _ _), Nothing, Nothing)] _) -> do
+            let (_, [], [], typespecs, _inline) = partitionDeclSpecs specs
+            addVar ident (IsFunc (cTypeOf typespecs))
+            return Nothing
         _ -> return Nothing -- FIXME: ignore everything but function declarations for now
