@@ -162,7 +162,7 @@ instance Pretty Expr where
         Not       e -> unary 12 "!" e
         Borrow    e -> unary 12 "&" e
         MutBorrow e -> unary 12 "&mut " e
-        Cast   e t -> binary 11 e "as" t
+        Cast   e t -> maybeParens (d > 11) (pPrintPrec l 11 e <+> text "as" <+> parens (pPrint t))
         Mul    a b -> binary 10 a "*" b
         Div    a b -> binary 10 a "/" b
         Mod    a b -> binary 10 a "%" b
