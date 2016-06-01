@@ -18,7 +18,7 @@ data CType
     | IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
-    | IsFunc CType
+    | IsFunc CType [CType]
     deriving (Eq, Ord)
 
 cTypeOf :: Show a => [CTypeSpecifier a] -> CType
@@ -41,7 +41,7 @@ toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
-toRustType (IsFunc _) = error "toRustType: not implemented for IsFunc"
+toRustType (IsFunc _ _) = error "toRustType: not implemented for IsFunc"
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
@@ -170,8 +170,8 @@ interpretExpr demand (CUnary op expr n) = case op of
     where
     simple f = fmap f (interpretExpr True expr)
 interpretExpr _ (CCall func args _) = do
-    (IsFunc retTy, func') <- interpretExpr True func
-    args' <- mapM (fmap snd . interpretExpr True) args
+    (IsFunc retTy argTys, func') <- interpretExpr True func
+    args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
     return (retTy, Rust.Call func' args')
 interpretExpr _ (CVar ident _) = do
     env <- get
@@ -258,34 +258,38 @@ interpretStatement retTy _ _ (CReturn expr _) = do
     return (Rust.Return expr')
 interpretStatement _ _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
+functionArgs :: Show a => Either [Ident] ([CDeclaration a], Bool) -> [(Maybe Ident, CType)]
+functionArgs (Left _) = error "old-style function declarations not supported"
+functionArgs (Right (_, True)) = error "variadic functions not supported"
+functionArgs (Right (args, False)) =
+    [ (argname, cTypeOf argtypespecs)
+    | CDecl argspecs [(Just (CDeclr argname [] _ _ _), Nothing, Nothing)] _ <-
+        -- Treat argument lists `(void)` and `()` the same: we'll
+        -- pretend that both mean the function takes no arguments.
+        case args of
+        [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
+        _ -> args
+    , let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
+    ]
+
 interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
-interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDeclr (Right (args, False)) _ _] _asm _attrs _) _ body _) = do
+interpretFunction (CFunDef specs (CDeclr (Just ident@(Ident name _ _)) [CFunDeclr args _ _] _asm _attrs _) _ body _) = do
     let (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
         vis = case storage of
             [CStatic _] -> Rust.Private
             [] -> Rust.Public
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
         retTy = cTypeOf typespecs
+        args' = [ (fromJust argname, ty) | (argname, ty) <- functionArgs args ]
+        formals = [ (Rust.VarName (identToString argname), toRustType ty) | (argname, ty) <- args' ]
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
-    addVar ident (IsFunc retTy)
+    addVar ident (IsFunc retTy (map snd args'))
 
     -- Open a new scope for the formal parameters.
     scope $ do
-        -- Treat argument lists `(void)` and `()` the same: we'll
-        -- pretend that both mean the function takes no arguments.
-        let args' = case args of
-                [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
-                _ -> args
-
-        formals <- forM args' $ \ (CDecl argspecs [(Just (CDeclr (Just argname) [] _ _ _), Nothing, Nothing)] _) -> do
-            let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
-            let ty = cTypeOf argtypespecs
-            let nm = identToString argname
-            addVar argname ty
-            return (Rust.VarName nm, toRustType ty)
-
+        mapM_ (uncurry addVar) args'
         let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
         body' <- interpretStatement retTy noLoop noLoop body
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
@@ -294,8 +298,8 @@ interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
 interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $ do
     forM decls $ \ decl -> case decl of
         CFDefExt f -> fmap Just (interpretFunction f)
-        CDeclExt (CDecl specs [(Just (CDeclr (Just ident) [CFunDeclr{}] _ _ _), Nothing, Nothing)] _) -> do
+        CDeclExt (CDecl specs [(Just (CDeclr (Just ident) [CFunDeclr args _ _] _ _ _), Nothing, Nothing)] _) -> do
             let (_, [], [], typespecs, _inline) = partitionDeclSpecs specs
-            addVar ident (IsFunc (cTypeOf typespecs))
+            addVar ident (IsFunc (cTypeOf typespecs) (map snd (functionArgs args)))
             return Nothing
         _ -> return Nothing -- FIXME: ignore everything but function declarations for now
