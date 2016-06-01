@@ -14,7 +14,8 @@ data IntWidth = BitWidth Int | WordWidth
     deriving (Eq, Ord)
 
 data CType
-    = IsInt Signed IntWidth
+    = IsBool
+    | IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
     | IsFunc CType
@@ -32,9 +33,11 @@ cTypeOf = foldr go (IsInt Signed (BitWidth 32))
     go (CFloatType _) _ = IsFloat 32
     go (CDoubleType _) _ = IsFloat 64
     go (CVoidType _) _ = IsVoid
+    go (CBoolType _) _ = IsBool
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
+toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
@@ -44,6 +47,7 @@ toRustType (IsFunc _) = error "toRustType: not implemented for IsFunc"
 intPromote :: CType -> CType
 -- "If an int can represent all values of the original type, the value is
 -- converted to an int,"
+intPromote IsBool = IsInt Signed (BitWidth 32)
 intPromote (IsInt _ (BitWidth w)) | w < 32 = IsInt Signed (BitWidth 32)
 -- "otherwise, it is converted to an unsigned int. ... All other types are
 -- unchanged by the integer promotions."
@@ -72,15 +76,8 @@ promote op (at, av) (bt, bv) = (rt, rv)
     to _ v = Rust.Cast v (toRustType rt)
     rv = op (to at av) (to bt bv)
 
-fromBool :: Result -> Result
-fromBool (_, v) = (IsInt Signed (BitWidth 32), Rust.IfThenElse v (Rust.Block [] (Just 1)) (Rust.Block [] (Just 0)))
-
 toBool :: Result -> Result
-toBool (_, v) = (IsInt Signed (BitWidth 32),
-    case v of
-        Rust.IfThenElse v' (Rust.Block [] (Just (Rust.Lit (Rust.LitRep "1")))) (Rust.Block [] (Just (Rust.Lit (Rust.LitRep "0")))) -> v'
-        _ -> Rust.CmpNE v 0
-    )
+toBool (t, v) = (IsBool, case t of IsBool -> v; _ -> Rust.CmpNE v 0)
 
 type Environment = [(Ident, CType)]
 type EnvMonad = State Environment
@@ -142,17 +139,19 @@ interpretExpr _ (CBinary op lhs rhs _) = do
         CSubOp -> promote Rust.Sub lhs' rhs'
         CShlOp -> promote Rust.ShiftL lhs' rhs'
         CShrOp -> promote Rust.ShiftR lhs' rhs'
-        CLeOp -> fromBool $ promote Rust.CmpLT lhs' rhs'
-        CGrOp -> fromBool $ promote Rust.CmpGT lhs' rhs'
-        CLeqOp -> fromBool $ promote Rust.CmpLE lhs' rhs'
-        CGeqOp -> fromBool $ promote Rust.CmpGE lhs' rhs'
-        CEqOp -> fromBool $ promote Rust.CmpEQ lhs' rhs'
-        CNeqOp -> fromBool $ promote Rust.CmpNE lhs' rhs'
+        CLeOp -> boolResult $ promote Rust.CmpLT lhs' rhs'
+        CGrOp -> boolResult $ promote Rust.CmpGT lhs' rhs'
+        CLeqOp -> boolResult $ promote Rust.CmpLE lhs' rhs'
+        CGeqOp -> boolResult $ promote Rust.CmpGE lhs' rhs'
+        CEqOp -> boolResult $ promote Rust.CmpEQ lhs' rhs'
+        CNeqOp -> boolResult $ promote Rust.CmpNE lhs' rhs'
         CAndOp -> promote Rust.And lhs' rhs'
         CXorOp -> promote Rust.Xor lhs' rhs'
         COrOp -> promote Rust.Or lhs' rhs'
-        CLndOp -> fromBool $ promote Rust.LAnd (toBool lhs') (toBool rhs')
-        CLorOp -> fromBool $ promote Rust.LOr (toBool lhs') (toBool rhs')
+        CLndOp -> (IsBool, Rust.LAnd (snd (toBool lhs')) (snd (toBool rhs')))
+        CLorOp -> (IsBool, Rust.LOr (snd (toBool lhs')) (snd (toBool rhs')))
+    where
+    boolResult (_, v) = (IsBool, v)
 interpretExpr _ (CCast (CDecl spec [] _) expr _) = do
     let ([], [], [], typespecs, False) = partitionDeclSpecs spec
     let ty = cTypeOf typespecs
@@ -164,7 +163,7 @@ interpretExpr demand (CUnary op expr n) = case op of
     CPlusOp -> interpretExpr demand expr
     CMinOp -> simple (fmap Rust.Neg)
     CCompOp -> simple (fmap Rust.Not)
-    CNegOp -> simple (fromBool . fmap Rust.Not . toBool)
+    CNegOp -> simple (fmap Rust.Not . toBool)
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
     simple f = fmap f (interpretExpr True expr)
