@@ -2,12 +2,17 @@ module Language.Rust.AST where
 
 import Text.PrettyPrint.HughesPJClass
 
+newtype Lifetime = Lifetime String
+    deriving Eq
 newtype Type = TypeName String
     deriving Eq
 newtype Lit = LitRep String
     deriving Eq
 newtype Var = VarName String
     deriving Eq
+
+instance Pretty Lifetime where
+    pPrint (Lifetime s) = text "'" <> text s
 
 instance Pretty Type where
     pPrint (TypeName s) = text s
@@ -66,11 +71,11 @@ data Expr
     | Call Expr [Expr]
     | BlockExpr Block
     | IfThenElse Expr Block Block
-    | Loop Block
-    | While Expr Block
-    | For Var Expr Block
-    | Break
-    | Continue
+    | Loop (Maybe Lifetime) Block
+    | While (Maybe Lifetime) Expr Block
+    | For (Maybe Lifetime) Var Expr Block
+    | Break (Maybe Lifetime)
+    | Continue (Maybe Lifetime)
     | Return (Maybe Expr)
     -- "Unary operators have the same precedence level and are stronger than any of the binary operators."
     -- precedence 12
@@ -144,11 +149,11 @@ instance Pretty Expr where
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
             Block [Stmt n@(IfThenElse{})] Nothing -> text "else" <+> pPrint n
             _ -> text "else" <+> pPrint f
-        Loop b -> text "loop" <+> pPrint b
-        While c b -> text "while" <+> pPrint c <+> pPrint b
-        For v i b -> text "for" <+> pPrint v <+> text "in" <+> pPrint i <+> pPrint b
-        Break -> text "break"
-        Continue -> text "continue"
+        Loop lt b -> optLabel lt <+> text "loop" <+> pPrint b
+        While lt c b -> optLabel lt <+> text "while" <+> pPrint c <+> pPrint b
+        For lt v i b -> optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> pPrint i <+> pPrint b
+        Break lt -> text "break" <+> maybe empty pPrint lt
+        Continue lt -> text "continue" <+> maybe empty pPrint lt
         Return Nothing -> text "return"
         Return (Just e) -> hang (text "return") 4 (pPrint e)
         -- operators:
@@ -179,6 +184,8 @@ instance Pretty Expr where
         Range  a b -> binary  1 a ".." b
         Assign a op b -> binary 1 a (assignOp op ++ "=") b
         where
+        optLabel = maybe empty (\ label -> pPrint label <> text ":")
+
         unary n op e = maybeParens (d > n) (text op <> pPrintPrec l n e)
         -- If a same-precedence operator appears nested on the right,
         -- then it needs parens, so increase the precedence there.
