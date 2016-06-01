@@ -68,13 +68,15 @@ usual a b
 
 type Result = (CType, Rust.Expr)
 
+castTo :: CType -> Result -> Rust.Expr
+castTo target (source, v) | source == target = v
+castTo target (_, v) = Rust.Cast v (toRustType target)
+
 promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
 promote op (at, av) (bt, bv) = (rt, rv)
     where
     rt = usual at bt
-    to t v | t == rt = v
-    to _ v = Rust.Cast v (toRustType rt)
-    rv = op (to at av) (to bt bv)
+    rv = op (castTo rt (at, av)) (castTo rt (bt, bv))
 
 toBool :: Result -> Result
 toBool (t, v) = (IsBool, case t of IsBool -> v; _ -> Rust.CmpNE v 0)
@@ -104,25 +106,25 @@ interpretExpr demand (CAssign op lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
     let op' = case op of
-            CAssignOp -> (Rust.:=)
-            CMulAssOp -> (Rust.:*=)
-            CDivAssOp -> (Rust.:/=)
-            CRmdAssOp -> (Rust.:%=)
-            CAddAssOp -> (Rust.:+=)
-            CSubAssOp -> (Rust.:-=)
-            CShlAssOp -> (Rust.:<<=)
-            CShrAssOp -> (Rust.:>>=)
-            CAndAssOp -> (Rust.:&=)
-            CXorAssOp -> (Rust.:^=)
-            COrAssOp  -> (Rust.:|=)
+            CAssignOp -> Nothing
+            CMulAssOp -> Just Rust.Mul
+            CDivAssOp -> Just Rust.Div
+            CRmdAssOp -> Just Rust.Mod
+            CAddAssOp -> Just Rust.Add
+            CSubAssOp -> Just Rust.Sub
+            CShlAssOp -> Just Rust.ShiftL
+            CShrAssOp -> Just Rust.ShiftR
+            CAndAssOp -> Just Rust.And
+            CXorAssOp -> Just Rust.Xor
+            COrAssOp  -> Just Rust.Or
         tmp = Rust.VarName "_tmp"
         dereftmp = Rust.Deref (Rust.Var tmp)
-    return $ if demand
-        then (fst lhs', Rust.BlockExpr (Rust.Block
+    return $ case op' of
+        Nothing | not demand -> (IsVoid, Rust.Assign (snd lhs') (Rust.:=) (castTo (fst lhs') rhs'))
+        _ -> (fst lhs', Rust.BlockExpr (Rust.Block
             [ Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow (snd lhs')))
-            , Rust.Stmt (Rust.Assign dereftmp op' (snd rhs'))
-            ] (Just dereftmp)))
-        else (IsVoid, Rust.Assign (snd lhs') op' (snd rhs'))
+            , Rust.Stmt (Rust.Assign dereftmp (Rust.:=) (castTo (fst lhs') (case op' of Just o -> promote o (fst lhs', dereftmp) rhs'; Nothing -> rhs')))
+            ] (if demand then Just dereftmp else Nothing)))
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
