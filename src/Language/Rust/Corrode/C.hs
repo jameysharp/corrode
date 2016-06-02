@@ -195,7 +195,7 @@ localDecls (CDecl spec decls _) = do
     let ([], [], [], typespecs, False) = partitionDeclSpecs spec
     let ty = cTypeOf typespecs
     forM decls $ \ (Just (CDeclr (Just ident) [] Nothing [] _), minit, Nothing) -> do
-        mexpr <- mapM (fmap snd . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
         addVar ident ty
         return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
