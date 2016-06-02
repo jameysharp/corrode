@@ -182,9 +182,14 @@ interpretExpr _ (CVar ident _) = do
         Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
 interpretExpr _ (CConst c) = return $ case c of
-    CIntConst (CInteger v _repr _flags) _ -> (IsInt Signed (BitWidth 32), fromInteger v)
+    CIntConst (CInteger v _repr flags) _ ->
+        let s = if testFlag FlagUnsigned flags then Unsigned else Signed
+            w = if testFlag FlagLongLong flags || testFlag FlagLong flags then WordWidth else BitWidth 32
+            ty = IsInt s w
+            Rust.TypeName suffix = toRustType ty
+        in (ty, Rust.Lit (Rust.LitRep (show v ++ suffix)))
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> (IsFloat 64, Rust.Lit (Rust.LitRep v))
+        (v, "") -> (IsFloat 64, Rust.Lit (Rust.LitRep (v ++ "f64")))
         (v, [_]) -> (IsFloat 32, Rust.Lit (Rust.LitRep (v ++ "f32")))
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
