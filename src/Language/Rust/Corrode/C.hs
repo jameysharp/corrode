@@ -165,13 +165,16 @@ interpretExpr _ (CCast (CDecl spec [] _) expr _) = do
 interpretExpr demand (CUnary op expr n) = case op of
     CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
-    CPlusOp -> interpretExpr demand expr
-    CMinOp -> simple (fmap Rust.Neg)
-    CCompOp -> simple (fmap Rust.Not)
-    CNegOp -> simple (fmap Rust.Not . toBool)
+    CPlusOp -> simple id
+    CMinOp -> simple Rust.Neg
+    CCompOp -> simple Rust.Not
+    CNegOp -> fmap (fmap Rust.Not . toBool) (interpretExpr True expr)
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
-    simple f = fmap f (interpretExpr True expr)
+    simple f = do
+        expr' <- interpretExpr True expr
+        let ty' = intPromote (fst expr')
+        return (ty', f (castTo ty' expr'))
 interpretExpr _ (CCall func args _) = do
     (IsFunc retTy argTys, func') <- interpretExpr True func
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
