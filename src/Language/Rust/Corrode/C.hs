@@ -117,14 +117,17 @@ interpretExpr demand (CAssign op lhs rhs _) = do
             CAndAssOp -> Just Rust.And
             CXorAssOp -> Just Rust.Xor
             COrAssOp  -> Just Rust.Or
-        tmp = Rust.VarName "_tmp"
-        dereftmp = Rust.Deref (Rust.Var tmp)
+        rhsvar = Rust.VarName "_rhs"
+        boundrhs = (fst rhs', Rust.Var rhsvar)
+        lhsvar = Rust.VarName "_lhs"
+        dereflhs = Rust.Deref (Rust.Var lhsvar)
     return $ case op' of
         Nothing | not demand -> (IsVoid, Rust.Assign (snd lhs') (Rust.:=) (castTo (fst lhs') rhs'))
         _ -> (fst lhs', Rust.BlockExpr (Rust.Block
-            [ Rust.Let Rust.Immutable tmp Nothing (Just (Rust.MutBorrow (snd lhs')))
-            , Rust.Stmt (Rust.Assign dereftmp (Rust.:=) (castTo (fst lhs') (case op' of Just o -> promote o (fst lhs', dereftmp) rhs'; Nothing -> rhs')))
-            ] (if demand then Just dereftmp else Nothing)))
+            [ Rust.Let Rust.Immutable rhsvar Nothing (Just (snd rhs'))
+            , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.MutBorrow (snd lhs')))
+            , Rust.Stmt (Rust.Assign dereflhs (Rust.:=) (castTo (fst lhs') (case op' of Just o -> promote o (fst lhs', dereflhs) boundrhs; Nothing -> boundrhs)))
+            ] (if demand then Just dereflhs else Nothing)))
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
