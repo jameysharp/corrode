@@ -69,6 +69,7 @@ data Expr
     = Lit Lit
     | Var Var
     | Call Expr [Expr]
+    | MethodCall Expr Var [Expr]
     | BlockExpr Block
     | IfThenElse Expr Block Block
     | Loop (Maybe Lifetime) Block
@@ -136,7 +137,12 @@ instance Pretty Expr where
         Lit x -> pPrint x
         Var x -> pPrint x
         Call f args -> cat
-            ( pPrint f <> text "("
+            ( pPrintPrec l 13 f <> text "("
+            : punctuate (text ",") (map (nest 4 . pPrint) args)
+            ++ [text ")"]
+            )
+        MethodCall self f args -> cat
+            ( pPrintPrec l 13 self <> text "." <> pPrint f <> text "("
             : punctuate (text ",") (map (nest 4 . pPrint) args)
             ++ [text ")"]
             )

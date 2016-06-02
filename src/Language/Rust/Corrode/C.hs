@@ -96,6 +96,15 @@ scope m = do
     put old
     return a
 
+wrapping :: Result -> Result
+wrapping (ty@(IsInt Unsigned _), Rust.Add lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_add") [rhs])
+wrapping (ty@(IsInt Unsigned _), Rust.Sub lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_sub") [rhs])
+wrapping (ty@(IsInt Unsigned _), Rust.Mul lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_mul") [rhs])
+wrapping (ty@(IsInt Unsigned _), Rust.Div lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_div") [rhs])
+wrapping (ty@(IsInt Unsigned _), Rust.Mod lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_rem") [rhs])
+wrapping (ty@(IsInt Unsigned _), Rust.Neg e) = (ty, Rust.MethodCall e (Rust.VarName "wrapping_neg") [])
+wrapping r = r
+
 interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
 interpretExpr demand (CComma exprs _) = do
     let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
@@ -126,7 +135,7 @@ interpretExpr demand (CAssign op lhs rhs _) = do
         _ -> (fst lhs', Rust.BlockExpr (Rust.Block
             [ Rust.Let Rust.Immutable rhsvar Nothing (Just (snd rhs'))
             , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.MutBorrow (snd lhs')))
-            , Rust.Stmt (Rust.Assign dereflhs (Rust.:=) (castTo (fst lhs') (case op' of Just o -> promote o (fst lhs', dereflhs) boundrhs; Nothing -> boundrhs)))
+            , Rust.Stmt (Rust.Assign dereflhs (Rust.:=) (castTo (fst lhs') (wrapping (case op' of Just o -> promote o (fst lhs', dereflhs) boundrhs; Nothing -> boundrhs))))
             ] (if demand then Just dereflhs else Nothing)))
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
@@ -136,7 +145,7 @@ interpretExpr demand (CCond c (Just t) f _) = do
 interpretExpr _ (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
-    return $ case op of
+    return $ wrapping $ case op of
         CMulOp -> promote Rust.Mul lhs' rhs'
         CDivOp -> promote Rust.Div lhs' rhs'
         CRmdOp -> promote Rust.Mod lhs' rhs'
@@ -166,7 +175,7 @@ interpretExpr demand (CUnary op expr n) = case op of
     CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CPlusOp -> simple id
-    CMinOp -> simple Rust.Neg
+    CMinOp -> fmap wrapping $ simple Rust.Neg
     CCompOp -> simple Rust.Not
     CNegOp -> fmap (fmap Rust.Not . toBool) (interpretExpr True expr)
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
