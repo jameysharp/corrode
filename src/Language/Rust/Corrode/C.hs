@@ -19,6 +19,7 @@ data CType
     | IsFloat Int
     | IsVoid
     | IsFunc CType [CType]
+    | IsPtr CType
     deriving (Eq, Ord)
 
 cTypeOf :: Show a => [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad CType
@@ -27,6 +28,7 @@ cTypeOf base derived = do
     foldrM derive base' derived
     where
     derive (CFunDeclr args _ _) retTy = IsFunc retTy . map snd <$> functionArgs args
+    derive (CPtrDeclr _ _) to = return (IsPtr to)
     derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
 
     go (CSignedType _) (IsInt _ width) = return (IsInt Signed width)
@@ -50,6 +52,7 @@ toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
 toRustType (IsFunc _ _) = error "toRustType: not implemented for IsFunc"
+toRustType (IsPtr to) = let Rust.TypeName to' = toRustType to in Rust.TypeName ("*mut " ++ to')
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
