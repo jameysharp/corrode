@@ -2,6 +2,7 @@ module Language.Rust.Corrode.C where
 
 import Control.Monad
 import Control.Monad.Trans.State.Lazy
+import Data.Foldable
 import Data.Maybe
 import Language.C
 import qualified Language.Rust.AST as Rust
@@ -20,22 +21,27 @@ data CType
     | IsFunc CType [CType]
     deriving (Eq, Ord)
 
-cTypeOf :: Show a => [CTypeSpecifier a] -> [CDerivedDeclarator a] -> CType
-cTypeOf base derived = foldr derive (foldr go (IsInt Signed (BitWidth 32)) base) derived
+cTypeOf :: Show a => [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad CType
+cTypeOf base derived = do
+    base' <- foldrM go (IsInt Signed (BitWidth 32)) base
+    foldrM derive base' derived
     where
-    derive (CFunDeclr args _ _) retTy = IsFunc retTy (map snd (functionArgs args))
+    derive (CFunDeclr args _ _) retTy = IsFunc retTy . map snd <$> functionArgs args
     derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
 
-    go (CSignedType _) (IsInt _ width) = IsInt Signed width
-    go (CUnsigType _) (IsInt _ width) = IsInt Unsigned width
-    go (CCharType _) (IsInt s _) = IsInt s (BitWidth 8)
-    go (CShortType _) (IsInt s _) = IsInt s (BitWidth 16)
-    go (CIntType _) (IsInt s _) = IsInt s (BitWidth 32)
-    go (CLongType _) (IsInt s _) = IsInt s WordWidth
-    go (CFloatType _) _ = IsFloat 32
-    go (CDoubleType _) _ = IsFloat 64
-    go (CVoidType _) _ = IsVoid
-    go (CBoolType _) _ = IsBool
+    go (CSignedType _) (IsInt _ width) = return (IsInt Signed width)
+    go (CUnsigType _) (IsInt _ width) = return (IsInt Unsigned width)
+    go (CCharType _) (IsInt s _) = return (IsInt s (BitWidth 8))
+    go (CShortType _) (IsInt s _) = return (IsInt s (BitWidth 16))
+    go (CIntType _) (IsInt s _) = return (IsInt s (BitWidth 32))
+    go (CLongType _) (IsInt s _) = return (IsInt s WordWidth)
+    go (CFloatType _) _ = return (IsFloat 32)
+    go (CDoubleType _) _ = return (IsFloat 64)
+    go (CVoidType _) _ = return IsVoid
+    go (CBoolType _) _ = return IsBool
+    go (CTypeDef ident _) _ = do
+        env <- get
+        maybe (error ("cTypeOf: reference to undefined type " ++ identToString ident)) return (lookup (Left ident) env)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
@@ -83,11 +89,14 @@ promote op (at, av) (bt, bv) = (rt, rv)
 toBool :: Result -> Result
 toBool (t, v) = (IsBool, case t of IsBool -> v; _ -> Rust.CmpNE v 0)
 
-type Environment = [(Ident, CType)]
+type Environment = [(Either Ident Ident, CType)]
 type EnvMonad = State Environment
 
 addVar :: Ident -> CType -> EnvMonad ()
-addVar ident ty = modify ((ident, ty) :)
+addVar ident ty = modify ((Right ident, ty) :)
+
+addType :: Ident -> CType -> EnvMonad ()
+addType ident ty = modify ((Left ident, ty) :)
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
@@ -170,10 +179,10 @@ interpretExpr _ (CBinary op lhs rhs _) = do
     boolResult (_, v) = (IsBool, v)
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
     let ([], [], [], typespecs, False) = partitionDeclSpecs spec
-    let ty = cTypeOf typespecs $ case declarators of
-            [] -> []
-            [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
-            _ -> error ("interpretExpr: invalid cast " ++ show declarators)
+    ty <- cTypeOf typespecs $ case declarators of
+        [] -> []
+        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
+        _ -> error ("interpretExpr: invalid cast " ++ show declarators)
     (_, expr') <- interpretExpr True expr
     return (ty, Rust.Cast expr' (toRustType ty))
 interpretExpr demand (CUnary op expr n) = case op of
@@ -195,7 +204,7 @@ interpretExpr _ (CCall func args _) = do
     return (retTy, Rust.Call func' args')
 interpretExpr _ (CVar ident _) = do
     env <- get
-    case lookup ident env of
+    case lookup (Right ident) env of
         Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
 interpretExpr _ (CConst c) = return $ case c of
@@ -216,7 +225,7 @@ localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
 localDecls (CDecl spec decls _) = do
     let ([], [], [], typespecs, False) = partitionDeclSpecs spec
     forM decls $ \ (Just (CDeclr (Just ident) derived Nothing [] _), minit, Nothing) -> do
-        let ty = cTypeOf typespecs derived
+        ty <- cTypeOf typespecs derived
         mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
         addVar ident ty
         return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
@@ -283,11 +292,11 @@ interpretStatement retTy _ _ (CReturn expr _) = do
     return (Rust.Return expr')
 interpretStatement _ _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
-functionArgs :: Show a => Either [Ident] ([CDeclaration a], Bool) -> [(Maybe Ident, CType)]
+functionArgs :: Show a => Either [Ident] ([CDeclaration a], Bool) -> EnvMonad [(Maybe Ident, CType)]
 functionArgs (Left _) = error "old-style function declarations not supported"
 functionArgs (Right (_, True)) = error "variadic functions not supported"
-functionArgs (Right (args, False)) =
-    [ (argname, cTypeOf argtypespecs derived)
+functionArgs (Right (args, False)) = sequence
+    [ (,) argname <$> cTypeOf argtypespecs derived
     | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
         -- Treat argument lists `(void)` and `()` the same: we'll
         -- pretend that both mean the function takes no arguments.
@@ -301,15 +310,16 @@ interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
 -- Note that function definitions can't be anonymous and their derived
 -- declarators must begin with CFunDeclr.
 interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr args _ _ : _) _ _ _) _ body _) = do
+    args' <- functionArgs args
+
     let (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
         vis = case storage of
             [CStatic _] -> Rust.Private
             [] -> Rust.Public
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
-        funTy@(IsFunc retTy _) = cTypeOf typespecs declarators
         name = identToString ident
-        args' = [ (argname, ty) | ~(Just argname, ty) <- functionArgs args ]
-        formals = [ (Rust.VarName (identToString argname), toRustType ty) | (argname, ty) <- args' ]
+
+    funTy@(IsFunc retTy _) <- cTypeOf typespecs declarators
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
@@ -317,7 +327,12 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
 
     -- Open a new scope for the formal parameters.
     scope $ do
-        mapM_ (uncurry addVar) args'
+        formals <- sequence
+            [ do
+                addVar argname ty
+                return (Rust.VarName (identToString argname), toRustType ty)
+            | ~(Just argname, ty) <- args'
+            ]
         let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
         body' <- interpretStatement retTy noLoop noLoop body
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
@@ -326,13 +341,17 @@ interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
 interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $ do
     forM decls $ \ decl -> case decl of
         CFDefExt f -> fmap Just (interpretFunction f)
-        CDeclExt (CDecl specs declarators _) ->
+        CDeclExt (CDecl specs declarators _) -> do
             let (storagespecs, [], [], typespecs, _inline) = partitionDeclSpecs specs
-            in case storagespecs of
-            [CTypedef _] -> error "typedef not yet implemented"
-            _ -> do
-                sequence_
-                    [ addVar ident (cTypeOf typespecs derived)
+            sequence_ $ case storagespecs of
+                [CTypedef _] ->
+                    [ addType ident =<< cTypeOf typespecs derived
+                    -- Typedefs must have a declarator which must not be
+                    -- abstract, and must not have an initializer or size.
+                    | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
+                    ]
+                _ ->
+                    [ addVar ident =<< cTypeOf typespecs derived
                     -- Top-level declarations must have a declarator
                     -- which must not be abstract, and must not have a
                     -- size. They may have an initializer.
@@ -340,5 +359,5 @@ interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $
                     -- initializers for non-functions.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), _, Nothing) <- declarators
                     ]
-                return Nothing
+            return Nothing
         _ -> return Nothing -- FIXME: ignore everything but function declarations for now
