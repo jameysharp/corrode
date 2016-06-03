@@ -10,5 +10,7 @@ main :: IO ()
 main = do
     args <- getArgs
     forM_ args $ \ arg -> do
-        Right t <- parseCFile (newGCC "gcc") Nothing [] arg
-        mapM_ (putStrLn . prettyShow . itemIdioms) (interpretTranslationUnit t)
+        parsed <- parseCFile (newGCC "gcc") Nothing [] arg
+        case parsed of
+            Left err -> print err
+            Right t -> mapM_ (putStrLn . prettyShow . itemIdioms) (interpretTranslationUnit t)
