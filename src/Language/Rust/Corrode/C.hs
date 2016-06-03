@@ -308,7 +308,7 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
         funTy@(IsFunc retTy _) = cTypeOf typespecs declarators
         name = identToString ident
-        args' = [ (fromJust argname, ty) | (argname, ty) <- functionArgs args ]
+        args' = [ (argname, ty) | ~(Just argname, ty) <- functionArgs args ]
         formals = [ (Rust.VarName (identToString argname), toRustType ty) | (argname, ty) <- args' ]
 
     -- Add this function to the globals before evaluating its body so
