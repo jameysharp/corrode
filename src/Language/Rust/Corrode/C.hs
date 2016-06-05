@@ -191,6 +191,13 @@ interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
 interpretExpr demand (CUnary op expr n) = case op of
     CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+    CAdrOp -> do
+        (ty, expr') <- interpretExpr True expr
+        let ty' = IsPtr ty
+        return (ty', Rust.Cast (Rust.MutBorrow expr') (toRustType ty'))
+    CIndOp -> do
+        (IsPtr ty', expr') <- interpretExpr True expr
+        return (ty', Rust.UnsafeExpr (Rust.Block [] (Just (Rust.Deref expr'))))
     CPlusOp -> simple id
     CMinOp -> fmap wrapping $ simple Rust.Neg
     CCompOp -> simple Rust.Not

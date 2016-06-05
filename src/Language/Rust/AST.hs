@@ -71,6 +71,7 @@ data Expr
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
     | BlockExpr Block
+    | UnsafeExpr Block
     | IfThenElse Expr Block Block
     | Loop (Maybe Lifetime) Block
     | While (Maybe Lifetime) Expr Block
@@ -150,6 +151,7 @@ instance Pretty Expr where
         -- as if it were followed by a semicolon. Parenthesizing all
         -- block expressions is excessive but correct.
         BlockExpr x -> text "(" <> pPrint x <> text ")"
+        UnsafeExpr x -> text "unsafe" <+> pPrint x
         IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> case f of
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
