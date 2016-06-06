@@ -54,13 +54,13 @@ data Block = Block [Stmt] (Maybe Expr)
 instance Pretty Block where
     pPrint (Block ss e) = sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
 
-data Item = Function Visibility String [(Var, Type)] Type Block
+data Item = Function Visibility String [(Mutable, Var, Type)] Type Block
 
 instance Pretty Item where
     pPrint (Function vis nm args ret body) = cat
         [ (if vis == Public then text "pub" else empty) <+> text "fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
-            [ sep [text "mut", pPrint v, text ":", pPrint t] | (v, t) <- args ]
+            [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
         , pPrint body
         ]

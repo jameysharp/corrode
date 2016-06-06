@@ -19,31 +19,35 @@ data CType
     | IsFloat Int
     | IsVoid
     | IsFunc CType [CType]
-    | IsPtr CType
+    | IsPtr Rust.Mutable CType
     deriving Eq
 
-cTypeOf :: Show a => [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad CType
-cTypeOf base derived = do
-    base' <- foldrM go (IsInt Signed (BitWidth 32)) base
+cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
+cTypeOf basequals base derived = do
+    base' <- foldrM go (mutable basequals, IsInt Signed (BitWidth 32)) base
     foldrM derive base' derived
     where
-    derive (CFunDeclr args _ _) retTy = IsFunc retTy . map snd <$> functionArgs args
-    derive (CPtrDeclr _ _) to = return (IsPtr to)
+    mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
+
+    derive (CFunDeclr args _ _) (c, retTy) = (,) c . IsFunc retTy . map snd <$> functionArgs args
+    derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
     derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
 
-    go (CSignedType _) (IsInt _ width) = return (IsInt Signed width)
-    go (CUnsigType _) (IsInt _ width) = return (IsInt Unsigned width)
-    go (CCharType _) (IsInt s _) = return (IsInt s (BitWidth 8))
-    go (CShortType _) (IsInt s _) = return (IsInt s (BitWidth 16))
-    go (CIntType _) (IsInt s _) = return (IsInt s (BitWidth 32))
-    go (CLongType _) (IsInt s _) = return (IsInt s WordWidth)
-    go (CFloatType _) _ = return (IsFloat 32)
-    go (CDoubleType _) _ = return (IsFloat 64)
-    go (CVoidType _) _ = return IsVoid
-    go (CBoolType _) _ = return IsBool
-    go (CTypeDef ident _) _ = do
+    go (CSignedType _) (mut, IsInt _ width) = return (mut, IsInt Signed width)
+    go (CUnsigType _) (mut, IsInt _ width) = return (mut, IsInt Unsigned width)
+    go (CCharType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 8))
+    go (CShortType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 16))
+    go (CIntType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 32))
+    go (CLongType _) (mut, IsInt s _) = return (mut, IsInt s WordWidth)
+    go (CFloatType _) (mut, _) = return (mut, IsFloat 32)
+    go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
+    go (CVoidType _) (mut, _) = return (mut, IsVoid)
+    go (CBoolType _) (mut, _) = return (mut, IsBool)
+    go (CTypeDef ident _) (mut1, _) = do
         env <- get
-        maybe (error ("cTypeOf: reference to undefined type " ++ identToString ident)) return (lookup (Left ident) env)
+        case lookup (Left ident) env of
+            Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
+            Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
 
 toRustType :: CType -> Rust.Type
@@ -52,7 +56,10 @@ toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
 toRustType (IsFunc _ _) = error "toRustType: not implemented for IsFunc"
-toRustType (IsPtr to) = let Rust.TypeName to' = toRustType to in Rust.TypeName ("*mut " ++ to')
+toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeName (rustMut mut ++ to')
+    where
+    rustMut Rust.Mutable = "*mut "
+    rustMut Rust.Immutable = "*const "
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
@@ -80,6 +87,7 @@ usual a b
 
 data Result = Result
     { resultType :: CType
+    , isMutable :: Rust.Mutable
     , result :: Rust.Expr
     }
 
@@ -88,25 +96,25 @@ castTo target source | resultType source == target = result source
 castTo target source = Rust.Cast (result source) (toRustType target)
 
 promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promote op a@(Result { resultType = at }) b@(Result { resultType = bt }) = Result { resultType = rt, result = rv }
+promote op a@(Result { resultType = at }) b@(Result { resultType = bt }) = Result { resultType = rt, isMutable = Rust.Immutable, result = rv }
     where
     rt = usual at bt
     rv = op (castTo rt a) (castTo rt b)
 
 toBool :: Result -> Result
-toBool (Result { resultType = t, result = v }) = Result { resultType = IsBool, result = case t of
+toBool (Result { resultType = t, result = v }) = Result { resultType = IsBool, isMutable = Rust.Immutable, result = case t of
     IsBool -> v
-    IsPtr _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
+    IsPtr _ _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
     _ -> Rust.CmpNE v 0
     }
 
-type Environment = [(Either Ident Ident, CType)]
+type Environment = [(Either Ident Ident, (Rust.Mutable, CType))]
 type EnvMonad = State Environment
 
-addVar :: Ident -> CType -> EnvMonad ()
+addVar :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
 addVar ident ty = modify ((Right ident, ty) :)
 
-addType :: Ident -> CType -> EnvMonad ()
+addType :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
 addType ident ty = modify ((Left ident, ty) :)
 
 scope :: EnvMonad a -> EnvMonad a
@@ -136,6 +144,7 @@ interpretExpr demand (CComma exprs _) = do
     mfinal' <- mapM (interpretExpr True) mfinal
     return Result
         { resultType = maybe IsVoid resultType mfinal'
+        , isMutable = maybe Rust.Immutable isMutable mfinal'
         , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
         }
 interpretExpr demand (CAssign op lhs rhs _) = do
@@ -160,6 +169,7 @@ interpretExpr demand (CAssign op lhs rhs _) = do
     return $ case op' of
         Nothing | not demand -> Result
             { resultType = IsVoid
+            , isMutable = Rust.Immutable
             , result = Rust.Assign (result lhs') (Rust.:=) (castTo (resultType lhs') rhs')
             }
         _ -> lhs'
@@ -194,19 +204,21 @@ interpretExpr _ (CBinary op lhs rhs _) = do
         CAndOp -> promote Rust.And lhs' rhs'
         CXorOp -> promote Rust.Xor lhs' rhs'
         COrOp -> promote Rust.Or lhs' rhs'
-        CLndOp -> Result { resultType = IsBool, result = Rust.LAnd (result (toBool lhs')) (result (toBool rhs')) }
-        CLorOp -> Result { resultType = IsBool, result = Rust.LOr (result (toBool lhs')) (result (toBool rhs')) }
+        CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (result (toBool lhs')) (result (toBool rhs')) }
+        CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (result (toBool lhs')) (result (toBool rhs')) }
     where
     boolResult r = r { resultType = IsBool }
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
-    let ([], [], [], typespecs, False) = partitionDeclSpecs spec
-    ty <- cTypeOf typespecs $ case declarators of
+    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+    -- Declaration mutability has no effect in casts.
+    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
         [] -> []
         [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
         _ -> error ("interpretExpr: invalid cast " ++ show declarators)
     expr' <- interpretExpr True expr
     return Result
         { resultType = ty
+        , isMutable = Rust.Immutable
         , result = Rust.Cast (result expr') (toRustType ty)
         }
 interpretExpr demand (CUnary op expr n) = case op of
@@ -214,16 +226,18 @@ interpretExpr demand (CUnary op expr n) = case op of
     CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CAdrOp -> do
         expr' <- interpretExpr True expr
-        let ty' = IsPtr (resultType expr')
+        let ty' = IsPtr (isMutable expr') (resultType expr')
         return Result
             { resultType = ty'
+            , isMutable = Rust.Immutable
             , result = Rust.Cast (Rust.MutBorrow (result expr')) (toRustType ty')
             }
     CIndOp -> do
         expr' <- interpretExpr True expr
-        let IsPtr ty' = resultType expr'
+        let IsPtr mut' ty' = resultType expr'
         return Result
             { resultType = ty'
+            , isMutable = mut'
             , result = Rust.UnsafeExpr (Rust.Block [] (Just (Rust.Deref (result expr'))))
             }
     CPlusOp -> simple id
@@ -239,17 +253,19 @@ interpretExpr demand (CUnary op expr n) = case op of
         let ty' = intPromote (resultType expr')
         return Result
             { resultType = ty'
+            , isMutable = Rust.Immutable
             , result = f (castTo ty' expr')
             }
 interpretExpr _ (CCall func args _) = do
     Result { resultType = IsFunc retTy argTys, result = func' } <- interpretExpr True func
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
-    return Result { resultType = retTy, result = Rust.Call func' args' }
+    return Result { resultType = retTy, isMutable = Rust.Immutable, result = Rust.Call func' args' }
 interpretExpr _ (CVar ident _) = do
     env <- get
     case lookup (Right ident) env of
-        Just ty -> return Result
+        Just (mut, ty) -> return Result
             { resultType = ty
+            , isMutable = mut
             , result = Rust.Var (Rust.VarName (identToString ident))
             }
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
@@ -266,17 +282,17 @@ interpretExpr _ (CConst c) = return $ case c of
     where
     litResult ty v =
         let Rust.TypeName suffix = toRustType ty
-        in Result { resultType = ty, result = Rust.Lit (Rust.LitRep (v ++ suffix)) }
+        in Result { resultType = ty, isMutable = Rust.Immutable, result = Rust.Lit (Rust.LitRep (v ++ suffix)) }
 interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
 
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
 localDecls (CDecl spec decls _) = do
-    let ([], [], [], typespecs, False) = partitionDeclSpecs spec
+    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
     forM decls $ \ (Just (CDeclr (Just ident) derived Nothing [] _), minit, Nothing) -> do
-        ty <- cTypeOf typespecs derived
+        (mut, ty) <- cTypeOf typequals typespecs derived
         mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-        addVar ident ty
-        return (Rust.Let Rust.Mutable (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
+        addVar ident (mut, ty)
+        return (Rust.Let mut (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
@@ -340,18 +356,20 @@ interpretStatement retTy _ _ (CReturn expr _) = do
     return (Rust.Return expr')
 interpretStatement _ _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
 
-functionArgs :: Show a => Either [Ident] ([CDeclaration a], Bool) -> EnvMonad [(Maybe Ident, CType)]
+functionArgs :: Show a => Either [Ident] ([CDeclaration a], Bool) -> EnvMonad [(Maybe (Rust.Mutable, Ident), CType)]
 functionArgs (Left _) = error "old-style function declarations not supported"
 functionArgs (Right (_, True)) = error "variadic functions not supported"
 functionArgs (Right (args, False)) = sequence
-    [ (,) argname <$> cTypeOf argtypespecs derived
+    [ do
+        (mut, ty) <- cTypeOf argtypequals argtypespecs derived
+        return (fmap ((,) mut) argname, ty)
     | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
         -- Treat argument lists `(void)` and `()` the same: we'll
         -- pretend that both mean the function takes no arguments.
         case args of
         [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
         _ -> args
-    , let ([], [], [], argtypespecs, False) = partitionDeclSpecs argspecs
+    , let ([], [], argtypequals, argtypespecs, False) = partitionDeclSpecs argspecs
     ]
 
 interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
@@ -360,26 +378,27 @@ interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
 interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr args _ _ : _) _ _ _) _ body _) = do
     args' <- functionArgs args
 
-    let (storage, [], [], typespecs, _inline) = partitionDeclSpecs specs
+    let (storage, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
         vis = case storage of
             [CStatic _] -> Rust.Private
             [] -> Rust.Public
             _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
         name = identToString ident
 
-    funTy@(IsFunc retTy _) <- cTypeOf typespecs declarators
+    -- Mutability is meaningless on function definitions.
+    (_mut, funTy@(IsFunc retTy _)) <- cTypeOf typequals typespecs declarators
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
-    addVar ident funTy
+    addVar ident (Rust.Mutable, funTy)
 
     -- Open a new scope for the formal parameters.
     scope $ do
         formals <- sequence
             [ do
-                addVar argname ty
-                return (Rust.VarName (identToString argname), toRustType ty)
-            | ~(Just argname, ty) <- args'
+                addVar argname (mut, ty)
+                return (mut, Rust.VarName (identToString argname), toRustType ty)
+            | ~(Just (mut, argname), ty) <- args'
             ]
         let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
         body' <- interpretStatement retTy noLoop noLoop body
@@ -390,16 +409,16 @@ interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $
     forM decls $ \ decl -> case decl of
         CFDefExt f -> fmap Just (interpretFunction f)
         CDeclExt (CDecl specs declarators _) -> do
-            let (storagespecs, [], [], typespecs, _inline) = partitionDeclSpecs specs
+            let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
             sequence_ $ case storagespecs of
                 [CTypedef _] ->
-                    [ addType ident =<< cTypeOf typespecs derived
+                    [ addType ident =<< cTypeOf typequals typespecs derived
                     -- Typedefs must have a declarator which must not be
                     -- abstract, and must not have an initializer or size.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
                     ]
                 _ ->
-                    [ addVar ident =<< cTypeOf typespecs derived
+                    [ addVar ident =<< cTypeOf typequals typespecs derived
                     -- Top-level declarations must have a declarator
                     -- which must not be abstract, and must not have a
                     -- size. They may have an initializer.
