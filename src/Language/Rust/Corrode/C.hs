@@ -90,7 +90,10 @@ promote op (at, av) (bt, bv) = (rt, rv)
     rv = op (castTo rt (at, av)) (castTo rt (bt, bv))
 
 toBool :: Result -> Result
-toBool (t, v) = (IsBool, case t of IsBool -> v; _ -> Rust.CmpNE v 0)
+toBool (t, v) = (,) IsBool $ case t of
+    IsBool -> v
+    IsPtr _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
+    _ -> Rust.CmpNE v 0
 
 type Environment = [(Either Ident Ident, CType)]
 type EnvMonad = State Environment
