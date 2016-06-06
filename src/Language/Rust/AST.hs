@@ -58,7 +58,7 @@ data Item = Function Visibility String [(Mutable, Var, Type)] Type Block
 
 instance Pretty Item where
     pPrint (Function vis nm args ret body) = cat
-        [ (if vis == Public then text "pub" else empty) <+> text "fn" <+> text nm <> text "("
+        [ (if vis == Public then text "pub" else empty) <+> text "unsafe fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret

@@ -238,7 +238,7 @@ interpretExpr demand (CUnary op expr n) = case op of
         return Result
             { resultType = ty'
             , isMutable = mut'
-            , result = Rust.UnsafeExpr (Rust.Block [] (Just (Rust.Deref (result expr'))))
+            , result = Rust.Deref (result expr')
             }
     CPlusOp -> simple id
     CMinOp -> fmap wrapping $ simple Rust.Neg
