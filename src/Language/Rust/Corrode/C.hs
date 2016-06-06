@@ -78,23 +78,27 @@ usual a b
     a'@(IsInt as aw) = intPromote a
     b'@(IsInt bs bw) = intPromote b
 
-type Result = (CType, Rust.Expr)
+data Result = Result
+    { resultType :: CType
+    , result :: Rust.Expr
+    }
 
 castTo :: CType -> Result -> Rust.Expr
-castTo target (source, v) | source == target = v
-castTo target (_, v) = Rust.Cast v (toRustType target)
+castTo target source | resultType source == target = result source
+castTo target source = Rust.Cast (result source) (toRustType target)
 
 promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promote op (at, av) (bt, bv) = (rt, rv)
+promote op a@(Result { resultType = at }) b@(Result { resultType = bt }) = Result { resultType = rt, result = rv }
     where
     rt = usual at bt
-    rv = op (castTo rt (at, av)) (castTo rt (bt, bv))
+    rv = op (castTo rt a) (castTo rt b)
 
 toBool :: Result -> Result
-toBool (t, v) = (,) IsBool $ case t of
+toBool (Result { resultType = t, result = v }) = Result { resultType = IsBool, result = case t of
     IsBool -> v
     IsPtr _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
     _ -> Rust.CmpNE v 0
+    }
 
 type Environment = [(Either Ident Ident, CType)]
 type EnvMonad = State Environment
@@ -115,20 +119,25 @@ scope m = do
     return a
 
 wrapping :: Result -> Result
-wrapping (ty@(IsInt Unsigned _), Rust.Add lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_add") [rhs])
-wrapping (ty@(IsInt Unsigned _), Rust.Sub lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_sub") [rhs])
-wrapping (ty@(IsInt Unsigned _), Rust.Mul lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_mul") [rhs])
-wrapping (ty@(IsInt Unsigned _), Rust.Div lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_div") [rhs])
-wrapping (ty@(IsInt Unsigned _), Rust.Mod lhs rhs) = (ty, Rust.MethodCall lhs (Rust.VarName "wrapping_rem") [rhs])
-wrapping (ty@(IsInt Unsigned _), Rust.Neg e) = (ty, Rust.MethodCall e (Rust.VarName "wrapping_neg") [])
+wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
+    Rust.Add lhs rhs -> r { result = Rust.MethodCall lhs (Rust.VarName "wrapping_add") [rhs] }
+    Rust.Sub lhs rhs -> r { result = Rust.MethodCall lhs (Rust.VarName "wrapping_sub") [rhs] }
+    Rust.Mul lhs rhs -> r { result = Rust.MethodCall lhs (Rust.VarName "wrapping_mul") [rhs] }
+    Rust.Div lhs rhs -> r { result = Rust.MethodCall lhs (Rust.VarName "wrapping_div") [rhs] }
+    Rust.Mod lhs rhs -> r { result = Rust.MethodCall lhs (Rust.VarName "wrapping_rem") [rhs] }
+    Rust.Neg e -> r { result = Rust.MethodCall e (Rust.VarName "wrapping_neg") [] }
+    _ -> r
 wrapping r = r
 
 interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
 interpretExpr demand (CComma exprs _) = do
     let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
-    effects' <- mapM (fmap (Rust.Stmt . snd) . interpretExpr False) effects
+    effects' <- mapM (fmap (Rust.Stmt . result) . interpretExpr False) effects
     mfinal' <- mapM (interpretExpr True) mfinal
-    return (maybe IsVoid fst mfinal', Rust.BlockExpr (Rust.Block effects' (fmap snd mfinal')))
+    return Result
+        { resultType = maybe IsVoid resultType mfinal'
+        , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
+        }
 interpretExpr demand (CAssign op lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
@@ -145,21 +154,26 @@ interpretExpr demand (CAssign op lhs rhs _) = do
             CXorAssOp -> Just Rust.Xor
             COrAssOp  -> Just Rust.Or
         rhsvar = Rust.VarName "_rhs"
-        boundrhs = (fst rhs', Rust.Var rhsvar)
+        boundrhs = rhs' { result = Rust.Var rhsvar }
         lhsvar = Rust.VarName "_lhs"
-        dereflhs = Rust.Deref (Rust.Var lhsvar)
+        dereflhs = lhs' { result = Rust.Deref (Rust.Var lhsvar) }
     return $ case op' of
-        Nothing | not demand -> (IsVoid, Rust.Assign (snd lhs') (Rust.:=) (castTo (fst lhs') rhs'))
-        _ -> (fst lhs', Rust.BlockExpr (Rust.Block
-            [ Rust.Let Rust.Immutable rhsvar Nothing (Just (snd rhs'))
-            , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.MutBorrow (snd lhs')))
-            , Rust.Stmt (Rust.Assign dereflhs (Rust.:=) (castTo (fst lhs') (wrapping (case op' of Just o -> promote o (fst lhs', dereflhs) boundrhs; Nothing -> boundrhs))))
-            ] (if demand then Just dereflhs else Nothing)))
+        Nothing | not demand -> Result
+            { resultType = IsVoid
+            , result = Rust.Assign (result lhs') (Rust.:=) (castTo (resultType lhs') rhs')
+            }
+        _ -> lhs'
+            { result = Rust.BlockExpr (Rust.Block
+                [ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
+                , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.MutBorrow (result lhs')))
+                , Rust.Stmt (Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (wrapping (case op' of Just o -> promote o dereflhs boundrhs; Nothing -> boundrhs))))
+                ] (if demand then Just (result dereflhs) else Nothing))
+            }
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
-    return (promote (\ t'' f'' -> Rust.IfThenElse (snd (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
+    return (promote (\ t'' f'' -> Rust.IfThenElse (result (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
 interpretExpr _ (CBinary op lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
@@ -180,59 +194,79 @@ interpretExpr _ (CBinary op lhs rhs _) = do
         CAndOp -> promote Rust.And lhs' rhs'
         CXorOp -> promote Rust.Xor lhs' rhs'
         COrOp -> promote Rust.Or lhs' rhs'
-        CLndOp -> (IsBool, Rust.LAnd (snd (toBool lhs')) (snd (toBool rhs')))
-        CLorOp -> (IsBool, Rust.LOr (snd (toBool lhs')) (snd (toBool rhs')))
+        CLndOp -> Result { resultType = IsBool, result = Rust.LAnd (result (toBool lhs')) (result (toBool rhs')) }
+        CLorOp -> Result { resultType = IsBool, result = Rust.LOr (result (toBool lhs')) (result (toBool rhs')) }
     where
-    boolResult (_, v) = (IsBool, v)
+    boolResult r = r { resultType = IsBool }
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
     let ([], [], [], typespecs, False) = partitionDeclSpecs spec
     ty <- cTypeOf typespecs $ case declarators of
         [] -> []
         [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
         _ -> error ("interpretExpr: invalid cast " ++ show declarators)
-    (_, expr') <- interpretExpr True expr
-    return (ty, Rust.Cast expr' (toRustType ty))
+    expr' <- interpretExpr True expr
+    return Result
+        { resultType = ty
+        , result = Rust.Cast (result expr') (toRustType ty)
+        }
 interpretExpr demand (CUnary op expr n) = case op of
     CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
     CAdrOp -> do
-        (ty, expr') <- interpretExpr True expr
-        let ty' = IsPtr ty
-        return (ty', Rust.Cast (Rust.MutBorrow expr') (toRustType ty'))
+        expr' <- interpretExpr True expr
+        let ty' = IsPtr (resultType expr')
+        return Result
+            { resultType = ty'
+            , result = Rust.Cast (Rust.MutBorrow (result expr')) (toRustType ty')
+            }
     CIndOp -> do
-        (IsPtr ty', expr') <- interpretExpr True expr
-        return (ty', Rust.UnsafeExpr (Rust.Block [] (Just (Rust.Deref expr'))))
+        expr' <- interpretExpr True expr
+        let IsPtr ty' = resultType expr'
+        return Result
+            { resultType = ty'
+            , result = Rust.UnsafeExpr (Rust.Block [] (Just (Rust.Deref (result expr'))))
+            }
     CPlusOp -> simple id
     CMinOp -> fmap wrapping $ simple Rust.Neg
     CCompOp -> simple Rust.Not
-    CNegOp -> fmap (fmap Rust.Not . toBool) (interpretExpr True expr)
+    CNegOp -> do
+        expr' <- fmap toBool (interpretExpr True expr)
+        return expr' { result = Rust.Not (result expr') }
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
     simple f = do
         expr' <- interpretExpr True expr
-        let ty' = intPromote (fst expr')
-        return (ty', f (castTo ty' expr'))
+        let ty' = intPromote (resultType expr')
+        return Result
+            { resultType = ty'
+            , result = f (castTo ty' expr')
+            }
 interpretExpr _ (CCall func args _) = do
-    (IsFunc retTy argTys, func') <- interpretExpr True func
+    Result { resultType = IsFunc retTy argTys, result = func' } <- interpretExpr True func
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
-    return (retTy, Rust.Call func' args')
+    return Result { resultType = retTy, result = Rust.Call func' args' }
 interpretExpr _ (CVar ident _) = do
     env <- get
     case lookup (Right ident) env of
-        Just ty -> return (ty, Rust.Var (Rust.VarName (identToString ident)))
+        Just ty -> return Result
+            { resultType = ty
+            , result = Rust.Var (Rust.VarName (identToString ident))
+            }
         Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
 interpretExpr _ (CConst c) = return $ case c of
     CIntConst (CInteger v _repr flags) _ ->
         let s = if testFlag FlagUnsigned flags then Unsigned else Signed
             w = if testFlag FlagLongLong flags || testFlag FlagLong flags then WordWidth else BitWidth 32
-            ty = IsInt s w
-            Rust.TypeName suffix = toRustType ty
-        in (ty, Rust.Lit (Rust.LitRep (show v ++ suffix)))
+        in litResult (IsInt s w) (show v)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> (IsFloat 64, Rust.Lit (Rust.LitRep (v ++ "f64")))
-        (v, [_]) -> (IsFloat 32, Rust.Lit (Rust.LitRep (v ++ "f32")))
+        (v, "") -> litResult (IsFloat 64) v
+        (v, [_]) -> litResult (IsFloat 32) v
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
     _ -> error "interpretExpr: non-integer literals not implemented yet"
+    where
+    litResult ty v =
+        let Rust.TypeName suffix = toRustType ty
+        in Result { resultType = ty, result = Rust.Lit (Rust.LitRep (v ++ suffix)) }
 interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
 
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
@@ -249,7 +283,7 @@ toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
 toBlock e = [Rust.Stmt e]
 
 interpretStatement :: Show a => CType -> Rust.Expr -> Rust.Expr -> CStatement a -> EnvMonad Rust.Expr
-interpretStatement _ _ _ (CExpr (Just expr) _) = fmap snd (interpretExpr False expr)
+interpretStatement _ _ _ (CExpr (Just expr) _) = fmap result (interpretExpr False expr)
 interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
     stmts <- forM items $ \ item -> case item of
         CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement retTy onBreak onContinue stmt)
@@ -257,16 +291,16 @@ interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement retTy onBreak onContinue (CIf c t mf _) = do
-    (_, c') <- fmap toBool (interpretExpr True c)
+    c' <- fmap toBool (interpretExpr True c)
     t' <- fmap toBlock (interpretStatement retTy onBreak onContinue t)
     f' <- maybe (return []) (fmap toBlock . interpretStatement retTy onBreak onContinue) mf
-    return (Rust.IfThenElse c' (Rust.Block t' Nothing) (Rust.Block f' Nothing))
+    return (Rust.IfThenElse (result c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
 interpretStatement retTy _ _ (CWhile c b False _) = do
-    (_, c') <- fmap toBool (interpretExpr True c)
+    c' <- fmap toBool (interpretExpr True c)
     b' <- fmap toBlock (interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b)
-    return (Rust.While Nothing c' (Rust.Block b' Nothing))
+    return (Rust.While Nothing (result c') (Rust.Block b' Nothing))
 interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
-    pre <- either (maybe (return []) (fmap (toBlock . snd) . interpretExpr False)) localDecls initial
+    pre <- either (maybe (return []) (fmap (toBlock . result) . interpretExpr False)) localDecls initial
 
     (lt, b') <- case mincr of
         Nothing -> do
@@ -293,11 +327,11 @@ interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
             let breakTo = Just (Rust.Lifetime "breakTo")
 
             b' <- interpretStatement retTy (Rust.Break breakTo) (Rust.Break continueTo) b
-            (_, incr') <- interpretExpr False incr
+            incr' <- interpretExpr False incr
             let inner = Rust.Loop continueTo (Rust.Block (toBlock b' ++ [Rust.Stmt (Rust.Break Nothing)]) Nothing)
-            return (breakTo, Rust.BlockExpr (Rust.Block [Rust.Stmt inner, Rust.Stmt incr'] Nothing))
+            return (breakTo, Rust.BlockExpr (Rust.Block [Rust.Stmt inner, Rust.Stmt (result incr')] Nothing))
 
-    mkLoop <- maybe (return (Rust.Loop lt)) (fmap (Rust.While lt . snd . toBool) . interpretExpr True) cond
+    mkLoop <- maybe (return (Rust.Loop lt)) (fmap (Rust.While lt . result . toBool) . interpretExpr True) cond
     return (Rust.BlockExpr (Rust.Block pre (Just (mkLoop (Rust.Block (toBlock b') Nothing)))))
 interpretStatement _ _ onContinue (CCont _) = return onContinue
 interpretStatement _ onBreak _ (CBreak _) = return onBreak
