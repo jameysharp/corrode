@@ -8,7 +8,7 @@ import Language.C
 import qualified Language.Rust.AST as Rust
 
 data Signed = Signed | Unsigned
-    deriving (Eq, Ord)
+    deriving Eq
 
 data IntWidth = BitWidth Int | WordWidth
     deriving (Eq, Ord)
@@ -20,7 +20,7 @@ data CType
     | IsVoid
     | IsFunc CType [CType]
     | IsPtr CType
-    deriving (Eq, Ord)
+    deriving Eq
 
 cTypeOf :: Show a => [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad CType
 cTypeOf base derived = do
@@ -66,8 +66,9 @@ intPromote x = x
 
 -- * The "usual arithmetic conversions" (C99 section 6.3.1.8)
 usual :: CType -> CType -> CType
-usual a@(IsFloat _) b = max a b
-usual a b@(IsFloat _) = max a b
+usual (IsFloat aw) (IsFloat bw) = IsFloat (max aw bw)
+usual a@(IsFloat _) _ = a
+usual _ b@(IsFloat _) = b
 usual a b
     | a' == b' = a'
     | as == bs = IsInt as (max aw bw)
