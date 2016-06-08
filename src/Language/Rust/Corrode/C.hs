@@ -1,3 +1,5 @@
+{-# LANGUAGE ViewPatterns #-}
+
 module Language.Rust.Corrode.C where
 
 import Control.Monad
@@ -8,10 +10,10 @@ import Language.C
 import qualified Language.Rust.AST as Rust
 
 data Signed = Signed | Unsigned
-    deriving Eq
+    deriving (Show, Eq)
 
 data IntWidth = BitWidth Int | WordWidth
-    deriving (Eq, Ord)
+    deriving (Show, Eq, Ord)
 
 data CType
     = IsBool
@@ -20,7 +22,7 @@ data CType
     | IsVoid
     | IsFunc CType [CType]
     | IsPtr Rust.Mutable CType
-    deriving Eq
+    deriving (Show, Eq)
 
 cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
 cTypeOf basequals base derived = do
@@ -76,14 +78,12 @@ usual :: CType -> CType -> CType
 usual (IsFloat aw) (IsFloat bw) = IsFloat (max aw bw)
 usual a@(IsFloat _) _ = a
 usual _ b@(IsFloat _) = b
-usual a b
-    | a' == b' = a'
+usual a@(intPromote -> IsInt as aw) b@(intPromote -> IsInt bs bw)
+    | a == b = a
     | as == bs = IsInt as (max aw bw)
-    | as == Unsigned = if aw >= bw then a' else b'
-    | otherwise      = if bw >= aw then b' else a'
-    where
-    a'@(IsInt as aw) = intPromote a
-    b'@(IsInt bs bw) = intPromote b
+    | as == Unsigned = if aw >= bw then a else b
+    | otherwise      = if bw >= aw then b else a
+usual a b = error ("attempt to apply arithmetic conversions to " ++ show a ++ " and " ++ show b)
 
 data Result = Result
     { resultType :: CType

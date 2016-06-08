@@ -27,7 +27,7 @@ data Visibility = Public | Private
     deriving Eq
 
 data Mutable = Immutable | Mutable
-    deriving Eq
+    deriving (Show, Eq)
 
 data Stmt
     = Stmt Expr
