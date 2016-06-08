@@ -85,6 +85,19 @@ usual a@(intPromote -> IsInt as aw) b@(intPromote -> IsInt bs bw)
     | otherwise      = if bw >= aw then b else a
 usual a b = error ("attempt to apply arithmetic conversions to " ++ show a ++ " and " ++ show b)
 
+compatiblePtr :: CType -> CType -> CType
+compatiblePtr (IsPtr _ IsVoid) b = b
+compatiblePtr a (IsPtr _ IsVoid) = a
+compatiblePtr (IsPtr m1 a) (IsPtr m2 b) = IsPtr (leastMutable m1 m2) (compatiblePtr a b)
+    where
+    leastMutable Rust.Mutable Rust.Mutable = Rust.Mutable
+    leastMutable _ _ = Rust.Immutable
+compatiblePtr a b | a == b = a
+-- Types are not compatible, which as far as I can tell is not allowed
+-- by C99. But GCC only treats it as a warning, so we cast both sides
+-- to a void pointer, which should work on the usual architectures.
+compatiblePtr _ _ = IsVoid
+
 data Result = Result
     { resultType :: CType
     , isMutable :: Rust.Mutable
@@ -96,10 +109,17 @@ castTo target source | resultType source == target = result source
 castTo target source = Rust.Cast (result source) (toRustType target)
 
 promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promote op a@(Result { resultType = at }) b@(Result { resultType = bt }) = Result { resultType = rt, isMutable = Rust.Immutable, result = rv }
+promote op a b = Result { resultType = rt, isMutable = Rust.Immutable, result = rv }
     where
-    rt = usual at bt
+    rt = usual (resultType a) (resultType b)
     rv = op (castTo rt a) (castTo rt b)
+
+promotePtr :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
+promotePtr op a b = Result
+    { resultType = IsBool
+    , isMutable = Rust.Immutable
+    , result = let ty = compatiblePtr (resultType a) (resultType b) in op (castTo ty a) (castTo ty b)
+    }
 
 toBool :: Result -> Result
 toBool (Result { resultType = t, result = v }) = Result { resultType = IsBool, isMutable = Rust.Immutable, result = case t of
@@ -191,23 +211,31 @@ interpretExpr _ (CBinary op lhs rhs _) = do
         CMulOp -> promote Rust.Mul lhs' rhs'
         CDivOp -> promote Rust.Div lhs' rhs'
         CRmdOp -> promote Rust.Mod lhs' rhs'
-        CAddOp -> promote Rust.Add lhs' rhs'
-        CSubOp -> promote Rust.Sub lhs' rhs'
+        CAddOp -> case (resultType lhs', resultType rhs') of
+            (IsPtr _ _, _) -> lhs' { result = Rust.MethodCall (result lhs') (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs'] }
+            (_, IsPtr _ _) -> rhs' { result = Rust.MethodCall (result rhs') (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs'] }
+            _ -> promote Rust.Add lhs' rhs'
+        CSubOp -> case (resultType lhs', resultType rhs') of
+            (IsPtr _ _, IsPtr _ _) -> error "not sure how to translate pointer difference to Rust"
+            (IsPtr _ _, _) -> lhs' { result = Rust.MethodCall (result lhs') (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs')] }
+            _ -> promote Rust.Sub lhs' rhs'
         CShlOp -> promote Rust.ShiftL lhs' rhs'
         CShrOp -> promote Rust.ShiftR lhs' rhs'
-        CLeOp -> boolResult $ promote Rust.CmpLT lhs' rhs'
-        CGrOp -> boolResult $ promote Rust.CmpGT lhs' rhs'
-        CLeqOp -> boolResult $ promote Rust.CmpLE lhs' rhs'
-        CGeqOp -> boolResult $ promote Rust.CmpGE lhs' rhs'
-        CEqOp -> boolResult $ promote Rust.CmpEQ lhs' rhs'
-        CNeqOp -> boolResult $ promote Rust.CmpNE lhs' rhs'
+        CLeOp -> comparison Rust.CmpLT lhs' rhs'
+        CGrOp -> comparison Rust.CmpGT lhs' rhs'
+        CLeqOp -> comparison Rust.CmpLE lhs' rhs'
+        CGeqOp -> comparison Rust.CmpGE lhs' rhs'
+        CEqOp -> comparison Rust.CmpEQ lhs' rhs'
+        CNeqOp -> comparison Rust.CmpNE lhs' rhs'
         CAndOp -> promote Rust.And lhs' rhs'
         CXorOp -> promote Rust.Xor lhs' rhs'
         COrOp -> promote Rust.Or lhs' rhs'
         CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (result (toBool lhs')) (result (toBool rhs')) }
         CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (result (toBool lhs')) (result (toBool rhs')) }
     where
-    boolResult r = r { resultType = IsBool }
+    comparison op' lhs' rhs' = case (resultType lhs', resultType rhs') of
+        (IsPtr _ _, IsPtr _ _) -> promotePtr op' lhs' rhs'
+        _ -> (promote op' lhs' rhs') { resultType = IsBool }
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
     let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
     -- Declaration mutability has no effect in casts.
