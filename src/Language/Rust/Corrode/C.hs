@@ -175,7 +175,7 @@ interpretExpr demand (CAssign op lhs rhs _) = do
         _ -> lhs'
             { result = Rust.BlockExpr (Rust.Block
                 [ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
-                , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.MutBorrow (result lhs')))
+                , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs')))
                 , Rust.Stmt (Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (wrapping (case op' of Just o -> promote o dereflhs boundrhs; Nothing -> boundrhs))))
                 ] (if demand then Just (result dereflhs) else Nothing))
             }
@@ -230,7 +230,7 @@ interpretExpr demand (CUnary op expr n) = case op of
         return Result
             { resultType = ty'
             , isMutable = Rust.Immutable
-            , result = Rust.Cast (Rust.MutBorrow (result expr')) (toRustType ty')
+            , result = Rust.Cast (Rust.Borrow (isMutable expr') (result expr')) (toRustType ty')
             }
     CIndOp -> do
         expr' <- interpretExpr True expr

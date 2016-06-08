@@ -84,8 +84,7 @@ data Expr
     | Neg Expr
     | Deref Expr
     | Not Expr -- NOTE: this is both logical not and bitwise complement
-    | Borrow Expr
-    | MutBorrow Expr
+    | Borrow Mutable Expr
     -- "Operators at the same precedence level are evaluated left-to-right."
     -- precedence 11
     | Cast Expr Type
@@ -168,8 +167,7 @@ instance Pretty Expr where
         Neg       e -> unary 12 "-" e
         Deref     e -> unary 12 "*" e
         Not       e -> unary 12 "!" e
-        Borrow    e -> unary 12 "&" e
-        MutBorrow e -> unary 12 "&mut " e
+        Borrow m  e -> unary 12 (case m of Immutable -> "&"; Mutable -> "&mut ") e
         Cast   e t -> maybeParens (d > 11) (pPrintPrec l 11 e <+> text "as" <+> parens (pPrint t))
         Mul    a b -> binary 10 a "*" b
         Div    a b -> binary 10 a "/" b
