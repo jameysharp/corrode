@@ -181,12 +181,12 @@ instance Pretty Expr where
         And    a b -> binary  7 a "&" b
         Xor    a b -> binary  6 a "^" b
         Or     a b -> binary  5 a "|" b
-        CmpLT  a b -> binary  4 a "<" b
-        CmpGT  a b -> binary  4 a ">" b
-        CmpLE  a b -> binary  4 a "<=" b
-        CmpGE  a b -> binary  4 a ">=" b
-        CmpEQ  a b -> binary  4 a "==" b
-        CmpNE  a b -> binary  4 a "!=" b
+        CmpLT  a b -> nonass  4 a "<" b
+        CmpGT  a b -> nonass  4 a ">" b
+        CmpLE  a b -> nonass  4 a "<=" b
+        CmpGE  a b -> nonass  4 a ">=" b
+        CmpEQ  a b -> nonass  4 a "==" b
+        CmpNE  a b -> nonass  4 a "!=" b
         LAnd   a b -> binary  3 a "&&" b
         LOr    a b -> binary  2 a "||" b
         Range  a b -> binary  1 a ".." b
@@ -198,6 +198,9 @@ instance Pretty Expr where
         -- If a same-precedence operator appears nested on the right,
         -- then it needs parens, so increase the precedence there.
         binary n a op b = maybeParens (d > n) (pPrintPrec l n a <+> text op <+> pPrintPrec l (n + 1) b)
+
+        -- Non-associative operators need parens if they're nested.
+        nonass n a op b = maybeParens (d >= n) (pPrintPrec l n a <+> text op <+> pPrintPrec l n b)
 
         assignOp (:=) = ""
         assignOp (:+=) = "+"
