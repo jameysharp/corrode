@@ -192,19 +192,8 @@ isSimple (Rust.Var{}) = True
 isSimple (Rust.Deref p) = isSimple p
 isSimple _ = False
 
-interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
-interpretExpr demand (CComma exprs _) = do
-    let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
-    effects' <- mapM (fmap (Rust.Stmt . result) . interpretExpr False) effects
-    mfinal' <- mapM (interpretExpr True) mfinal
-    return Result
-        { resultType = maybe IsVoid resultType mfinal'
-        , isMutable = maybe Rust.Immutable isMutable mfinal'
-        , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
-        }
-interpretExpr demand (CAssign op lhs rhs _) = do
-    lhs' <- interpretExpr True lhs
-    rhs' <- interpretExpr True rhs
+compound :: Bool -> Bool -> CAssignOp -> Result -> Result -> Result
+compound returnOld demand op lhs rhs =
     let op' = case op of
             CAssignOp -> Nothing
             CMulAssOp -> Just CMulOp
@@ -217,25 +206,44 @@ interpretExpr demand (CAssign op lhs rhs _) = do
             CAndAssOp -> Just CAndOp
             CXorAssOp -> Just CXorOp
             COrAssOp  -> Just COrOp
-        (bindings, dereflhs, boundrhs) = if isSimple (result lhs')
-            then ([], lhs', rhs')
+        (bindings1, dereflhs, boundrhs) = if isSimple (result lhs)
+            then ([], lhs, rhs)
             else
                 let lhsvar = Rust.VarName "_lhs"
                     rhsvar = Rust.VarName "_rhs"
-                in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
-                    , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs')))
-                    ], lhs' { result = Rust.Deref (Rust.Var lhsvar) }, rhs' { result = Rust.Var rhsvar })
-        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (case op' of Just o -> binop o dereflhs boundrhs; Nothing -> boundrhs))
-        b = if not demand && null bindings
-            then assignment
-            else Rust.BlockExpr (Rust.Block (bindings ++ [Rust.Stmt assignment]) (if demand then Just (result dereflhs) else Nothing))
-    return $ if not demand
-        then Result
-            { resultType = IsVoid
-            , isMutable = Rust.Immutable
-            , result = b
-            }
-        else lhs' { result = b }
+                in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs))
+                    , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs)))
+                    ], lhs { result = Rust.Deref (Rust.Var lhsvar) }, rhs { result = Rust.Var rhsvar })
+        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs) (case op' of Just o -> binop o dereflhs boundrhs; Nothing -> boundrhs))
+        (bindings2, ret) = if not demand
+            then ([], Nothing)
+            else if not returnOld
+            then ([], Just (result dereflhs))
+            else
+                let oldvar = Rust.VarName "_old"
+                in ([Rust.Let Rust.Immutable oldvar Nothing (Just (result dereflhs))], Just (Rust.Var oldvar))
+    in case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
+    b@(Rust.Block body Nothing) -> Result
+        { resultType = IsVoid
+        , isMutable = Rust.Immutable
+        , result = case body of
+            [Rust.Stmt e] -> e
+            _ -> Rust.BlockExpr b
+        }
+    b -> lhs { result = Rust.BlockExpr b }
+
+interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
+interpretExpr demand (CComma exprs _) = do
+    let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
+    effects' <- mapM (fmap (Rust.Stmt . result) . interpretExpr False) effects
+    mfinal' <- mapM (interpretExpr True) mfinal
+    return Result
+        { resultType = maybe IsVoid resultType mfinal'
+        , isMutable = maybe Rust.Immutable isMutable mfinal'
+        , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
+        }
+interpretExpr demand (CAssign op lhs rhs _) =
+    compound False demand op <$> interpretExpr True lhs <*> interpretExpr True rhs
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
@@ -256,9 +264,11 @@ interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
         , isMutable = Rust.Immutable
         , result = Rust.Cast (result expr') (toRustType ty)
         }
-interpretExpr demand (CUnary op expr n) = case op of
-    CPreIncOp -> interpretExpr demand (CAssign CAddAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
-    CPreDecOp -> interpretExpr demand (CAssign CSubAssOp expr (CConst (CIntConst (CInteger 1 DecRepr noFlags) n)) n)
+interpretExpr demand (CUnary op expr _) = case op of
+    CPreIncOp -> compound False demand CAddAssOp <$> interpretExpr True expr <*> one
+    CPreDecOp -> compound False demand CSubAssOp <$> interpretExpr True expr <*> one
+    CPostIncOp -> compound True demand CAddAssOp <$> interpretExpr True expr <*> one
+    CPostDecOp -> compound True demand CSubAssOp <$> interpretExpr True expr <*> one
     CAdrOp -> do
         expr' <- interpretExpr True expr
         let ty' = IsPtr (isMutable expr') (resultType expr')
@@ -281,8 +291,8 @@ interpretExpr demand (CUnary op expr n) = case op of
     CNegOp -> do
         expr' <- interpretExpr True expr
         return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.Not (toBool expr') }
-    _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
+    one = return Result { resultType = IsInt Signed (BitWidth 32), isMutable = Rust.Immutable, result = 1 }
     simple f = do
         expr' <- interpretExpr True expr
         let ty' = intPromote (resultType expr')
