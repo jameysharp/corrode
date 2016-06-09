@@ -157,6 +157,37 @@ wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
     _ -> r
 wrapping r = r
 
+binop :: CBinaryOp -> Result -> Result -> Result
+binop op lhs rhs = wrapping $ case op of
+    CMulOp -> promote Rust.Mul lhs rhs
+    CDivOp -> promote Rust.Div lhs rhs
+    CRmdOp -> promote Rust.Mod lhs rhs
+    CAddOp -> case (resultType lhs, resultType rhs) of
+        (IsPtr _ _, _) -> lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs] }
+        (_, IsPtr _ _) -> rhs { result = Rust.MethodCall (result rhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs] }
+        _ -> promote Rust.Add lhs rhs
+    CSubOp -> case (resultType lhs, resultType rhs) of
+        (IsPtr _ _, IsPtr _ _) -> error "not sure how to translate pointer difference to Rust"
+        (IsPtr _ _, _) -> lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
+        _ -> promote Rust.Sub lhs rhs
+    CShlOp -> promote Rust.ShiftL lhs rhs
+    CShrOp -> promote Rust.ShiftR lhs rhs
+    CLeOp -> comparison Rust.CmpLT
+    CGrOp -> comparison Rust.CmpGT
+    CLeqOp -> comparison Rust.CmpLE
+    CGeqOp -> comparison Rust.CmpGE
+    CEqOp -> comparison Rust.CmpEQ
+    CNeqOp -> comparison Rust.CmpNE
+    CAndOp -> promote Rust.And lhs rhs
+    CXorOp -> promote Rust.Xor lhs rhs
+    COrOp -> promote Rust.Or lhs rhs
+    CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (result (toBool lhs)) (result (toBool rhs)) }
+    CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (result (toBool lhs)) (result (toBool rhs)) }
+    where
+    comparison op' = case (resultType lhs, resultType rhs) of
+        (IsPtr _ _, IsPtr _ _) -> promotePtr op' lhs rhs
+        _ -> (promote op' lhs rhs) { resultType = IsBool }
+
 isSimple :: Rust.Expr -> Bool
 isSimple (Rust.Var{}) = True
 isSimple (Rust.Deref p) = isSimple p
@@ -177,16 +208,16 @@ interpretExpr demand (CAssign op lhs rhs _) = do
     rhs' <- interpretExpr True rhs
     let op' = case op of
             CAssignOp -> Nothing
-            CMulAssOp -> Just Rust.Mul
-            CDivAssOp -> Just Rust.Div
-            CRmdAssOp -> Just Rust.Mod
-            CAddAssOp -> Just Rust.Add
-            CSubAssOp -> Just Rust.Sub
-            CShlAssOp -> Just Rust.ShiftL
-            CShrAssOp -> Just Rust.ShiftR
-            CAndAssOp -> Just Rust.And
-            CXorAssOp -> Just Rust.Xor
-            COrAssOp  -> Just Rust.Or
+            CMulAssOp -> Just CMulOp
+            CDivAssOp -> Just CDivOp
+            CRmdAssOp -> Just CRmdOp
+            CAddAssOp -> Just CAddOp
+            CSubAssOp -> Just CSubOp
+            CShlAssOp -> Just CShlOp
+            CShrAssOp -> Just CShrOp
+            CAndAssOp -> Just CAndOp
+            CXorAssOp -> Just CXorOp
+            COrAssOp  -> Just COrOp
         (bindings, dereflhs, boundrhs) = if isSimple (result lhs')
             then ([], lhs', rhs')
             else
@@ -195,7 +226,7 @@ interpretExpr demand (CAssign op lhs rhs _) = do
                 in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
                     , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs')))
                     ], lhs' { result = Rust.Deref (Rust.Var lhsvar) }, rhs' { result = Rust.Var rhsvar })
-        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (case op' of Just o -> wrapping (promote o dereflhs boundrhs); Nothing -> boundrhs))
+        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (case op' of Just o -> binop o dereflhs boundrhs; Nothing -> boundrhs))
         b = if not demand && null bindings
             then assignment
             else Rust.BlockExpr (Rust.Block (bindings ++ [Rust.Stmt assignment]) (if demand then Just (result dereflhs) else Nothing))
@@ -211,38 +242,8 @@ interpretExpr demand (CCond c (Just t) f _) = do
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
     return (promote (\ t'' f'' -> Rust.IfThenElse (result (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
-interpretExpr _ (CBinary op lhs rhs _) = do
-    lhs' <- interpretExpr True lhs
-    rhs' <- interpretExpr True rhs
-    return $ wrapping $ case op of
-        CMulOp -> promote Rust.Mul lhs' rhs'
-        CDivOp -> promote Rust.Div lhs' rhs'
-        CRmdOp -> promote Rust.Mod lhs' rhs'
-        CAddOp -> case (resultType lhs', resultType rhs') of
-            (IsPtr _ _, _) -> lhs' { result = Rust.MethodCall (result lhs') (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs'] }
-            (_, IsPtr _ _) -> rhs' { result = Rust.MethodCall (result rhs') (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs'] }
-            _ -> promote Rust.Add lhs' rhs'
-        CSubOp -> case (resultType lhs', resultType rhs') of
-            (IsPtr _ _, IsPtr _ _) -> error "not sure how to translate pointer difference to Rust"
-            (IsPtr _ _, _) -> lhs' { result = Rust.MethodCall (result lhs') (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs')] }
-            _ -> promote Rust.Sub lhs' rhs'
-        CShlOp -> promote Rust.ShiftL lhs' rhs'
-        CShrOp -> promote Rust.ShiftR lhs' rhs'
-        CLeOp -> comparison Rust.CmpLT lhs' rhs'
-        CGrOp -> comparison Rust.CmpGT lhs' rhs'
-        CLeqOp -> comparison Rust.CmpLE lhs' rhs'
-        CGeqOp -> comparison Rust.CmpGE lhs' rhs'
-        CEqOp -> comparison Rust.CmpEQ lhs' rhs'
-        CNeqOp -> comparison Rust.CmpNE lhs' rhs'
-        CAndOp -> promote Rust.And lhs' rhs'
-        CXorOp -> promote Rust.Xor lhs' rhs'
-        COrOp -> promote Rust.Or lhs' rhs'
-        CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (result (toBool lhs')) (result (toBool rhs')) }
-        CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (result (toBool lhs')) (result (toBool rhs')) }
-    where
-    comparison op' lhs' rhs' = case (resultType lhs', resultType rhs') of
-        (IsPtr _ _, IsPtr _ _) -> promotePtr op' lhs' rhs'
-        _ -> (promote op' lhs' rhs') { resultType = IsBool }
+interpretExpr _ (CBinary op lhs rhs _) =
+    binop op <$> interpretExpr True lhs <*> interpretExpr True rhs
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
     let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
     -- Declaration mutability has no effect in casts.
