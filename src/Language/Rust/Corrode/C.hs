@@ -157,6 +157,11 @@ wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
     _ -> r
 wrapping r = r
 
+isSimple :: Rust.Expr -> Bool
+isSimple (Rust.Var{}) = True
+isSimple (Rust.Deref p) = isSimple p
+isSimple _ = False
+
 interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
 interpretExpr demand (CComma exprs _) = do
     let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
@@ -182,23 +187,25 @@ interpretExpr demand (CAssign op lhs rhs _) = do
             CAndAssOp -> Just Rust.And
             CXorAssOp -> Just Rust.Xor
             COrAssOp  -> Just Rust.Or
-        rhsvar = Rust.VarName "_rhs"
-        boundrhs = rhs' { result = Rust.Var rhsvar }
-        lhsvar = Rust.VarName "_lhs"
-        dereflhs = lhs' { result = Rust.Deref (Rust.Var lhsvar) }
-    return $ case op' of
-        Nothing | not demand -> Result
+        (bindings, dereflhs, boundrhs) = if isSimple (result lhs')
+            then ([], lhs', rhs')
+            else
+                let lhsvar = Rust.VarName "_lhs"
+                    rhsvar = Rust.VarName "_rhs"
+                in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
+                    , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs')))
+                    ], lhs' { result = Rust.Deref (Rust.Var lhsvar) }, rhs' { result = Rust.Var rhsvar })
+        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (case op' of Just o -> wrapping (promote o dereflhs boundrhs); Nothing -> boundrhs))
+        b = if not demand && null bindings
+            then assignment
+            else Rust.BlockExpr (Rust.Block (bindings ++ [Rust.Stmt assignment]) (if demand then Just (result dereflhs) else Nothing))
+    return $ if not demand
+        then Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
-            , result = Rust.Assign (result lhs') (Rust.:=) (castTo (resultType lhs') rhs')
+            , result = b
             }
-        _ -> lhs'
-            { result = Rust.BlockExpr (Rust.Block
-                [ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs'))
-                , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs')))
-                , Rust.Stmt (Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs') (wrapping (case op' of Just o -> promote o dereflhs boundrhs; Nothing -> boundrhs))))
-                ] (if demand then Just (result dereflhs) else Nothing))
-            }
+        else lhs' { result = b }
 interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
