@@ -121,12 +121,11 @@ promotePtr op a b = Result
     , result = let ty = compatiblePtr (resultType a) (resultType b) in op (castTo ty a) (castTo ty b)
     }
 
-toBool :: Result -> Result
-toBool (Result { resultType = t, result = v }) = Result { resultType = IsBool, isMutable = Rust.Immutable, result = case t of
+toBool :: Result -> Rust.Expr
+toBool (Result { resultType = t, result = v }) = case t of
     IsBool -> v
     IsPtr _ _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
     _ -> Rust.CmpNE v 0
-    }
 
 type Environment = [(Either Ident Ident, (Rust.Mutable, CType))]
 type EnvMonad = State Environment
@@ -181,8 +180,8 @@ binop op lhs rhs = wrapping $ case op of
     CAndOp -> promote Rust.And lhs rhs
     CXorOp -> promote Rust.Xor lhs rhs
     COrOp -> promote Rust.Or lhs rhs
-    CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (result (toBool lhs)) (result (toBool rhs)) }
-    CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (result (toBool lhs)) (result (toBool rhs)) }
+    CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
+    CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
     where
     comparison op' = case (resultType lhs, resultType rhs) of
         (IsPtr _ _, IsPtr _ _) -> promotePtr op' lhs rhs
@@ -241,7 +240,7 @@ interpretExpr demand (CCond c (Just t) f _) = do
     c' <- interpretExpr True c
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
-    return (promote (\ t'' f'' -> Rust.IfThenElse (result (toBool c')) (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
+    return (promote (\ t'' f'' -> Rust.IfThenElse (toBool c') (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
 interpretExpr _ (CBinary op lhs rhs _) =
     binop op <$> interpretExpr True lhs <*> interpretExpr True rhs
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
@@ -280,8 +279,8 @@ interpretExpr demand (CUnary op expr n) = case op of
     CMinOp -> fmap wrapping $ simple Rust.Neg
     CCompOp -> simple Rust.Not
     CNegOp -> do
-        expr' <- fmap toBool (interpretExpr True expr)
-        return expr' { result = Rust.Not (result expr') }
+        expr' <- interpretExpr True expr
+        return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.Not (toBool expr') }
     _ -> error ("interpretExpr: unsupported unary operator " ++ show op)
     where
     simple f = do
@@ -343,14 +342,14 @@ interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
         _ -> error ("interpretStatement: unsupported statement " ++ show item)
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement retTy onBreak onContinue (CIf c t mf _) = do
-    c' <- fmap toBool (interpretExpr True c)
+    c' <- interpretExpr True c
     t' <- fmap toBlock (interpretStatement retTy onBreak onContinue t)
     f' <- maybe (return []) (fmap toBlock . interpretStatement retTy onBreak onContinue) mf
-    return (Rust.IfThenElse (result c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
+    return (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
 interpretStatement retTy _ _ (CWhile c b False _) = do
-    c' <- fmap toBool (interpretExpr True c)
+    c' <- interpretExpr True c
     b' <- fmap toBlock (interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b)
-    return (Rust.While Nothing (result c') (Rust.Block b' Nothing))
+    return (Rust.While Nothing (toBool c') (Rust.Block b' Nothing))
 interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
     pre <- either (maybe (return []) (fmap (toBlock . result) . interpretExpr False)) localDecls initial
 
@@ -383,7 +382,7 @@ interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
             let inner = Rust.Loop continueTo (Rust.Block (toBlock b' ++ [Rust.Stmt (Rust.Break Nothing)]) Nothing)
             return (breakTo, Rust.BlockExpr (Rust.Block [Rust.Stmt inner, Rust.Stmt (result incr')] Nothing))
 
-    mkLoop <- maybe (return (Rust.Loop lt)) (fmap (Rust.While lt . result . toBool) . interpretExpr True) cond
+    mkLoop <- maybe (return (Rust.Loop lt)) (fmap (Rust.While lt . toBool) . interpretExpr True) cond
     return (Rust.BlockExpr (Rust.Block pre (Just (mkLoop (Rust.Block (toBlock b') Nothing)))))
 interpretStatement _ _ onContinue (CCont _) = return onContinue
 interpretStatement _ onBreak _ (CBreak _) = return onBreak
