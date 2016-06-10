@@ -328,7 +328,24 @@ interpretExpr _ (CConst c) = return $ case c of
     litResult ty v =
         let Rust.TypeName suffix = toRustType ty
         in Result { resultType = ty, isMutable = Rust.Immutable, result = Rust.Lit (Rust.LitRep (v ++ suffix)) }
+interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
+    let no = error "interpretExpr of GCC statement expressions doesn't support return, break, or continue yet"
+    let (effects, final) = case last stmts of
+            CBlockStmt (CExpr expr _) | demand -> (init stmts, expr)
+            _ -> (stmts, Nothing)
+    effects' <- mapM (interpretBlockItem no no no) effects
+    final' <- mapM (interpretExpr True) final
+    return Result
+        { resultType = maybe IsVoid resultType final'
+        , isMutable = maybe Rust.Immutable isMutable final'
+        , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result final'))
+        }
 interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
+
+interpretBlockItem :: Show a => CType -> Rust.Expr -> Rust.Expr -> CCompoundBlockItem a -> EnvMonad [Rust.Stmt]
+interpretBlockItem retTy onBreak onContinue (CBlockStmt stmt) = fmap (return . Rust.Stmt) (interpretStatement retTy onBreak onContinue stmt)
+interpretBlockItem _ _ _ (CBlockDecl decl) = localDecls decl
+interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statement " ++ show item)
 
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
 localDecls (CDecl spec decls _) = do
@@ -346,10 +363,7 @@ toBlock e = [Rust.Stmt e]
 interpretStatement :: Show a => CType -> Rust.Expr -> Rust.Expr -> CStatement a -> EnvMonad Rust.Expr
 interpretStatement _ _ _ (CExpr (Just expr) _) = fmap result (interpretExpr False expr)
 interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
-    stmts <- forM items $ \ item -> case item of
-        CBlockStmt stmt -> fmap (return . Rust.Stmt) (interpretStatement retTy onBreak onContinue stmt)
-        CBlockDecl decl -> localDecls decl
-        _ -> error ("interpretStatement: unsupported statement " ++ show item)
+    stmts <- mapM (interpretBlockItem retTy onBreak onContinue) items
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 interpretStatement retTy onBreak onContinue (CIf c t mf _) = do
     c' <- interpretExpr True c
