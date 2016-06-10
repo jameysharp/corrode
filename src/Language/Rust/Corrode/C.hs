@@ -245,10 +245,16 @@ interpretExpr demand (CComma exprs _) = do
 interpretExpr demand (CAssign op lhs rhs _) =
     compound False demand op <$> interpretExpr True lhs <*> interpretExpr True rhs
 interpretExpr demand (CCond c (Just t) f _) = do
-    c' <- interpretExpr True c
+    c' <- fmap toBool (interpretExpr True c)
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
-    return (promote (\ t'' f'' -> Rust.IfThenElse (toBool c') (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f')
+    return $ if demand
+        then promote (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
+        else Result
+            { resultType = IsVoid
+            , isMutable = Rust.Immutable
+            , result = Rust.IfThenElse c' (Rust.Block (toBlock (result t')) Nothing) (Rust.Block (toBlock (result f')) Nothing)
+            }
 interpretExpr _ (CBinary op lhs rhs _) =
     binop op <$> interpretExpr True lhs <*> interpretExpr True rhs
 interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
