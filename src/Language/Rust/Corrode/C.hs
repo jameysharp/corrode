@@ -301,6 +301,18 @@ interpretExpr demand (CUnary op expr _) = case op of
             , isMutable = Rust.Immutable
             , result = f (castTo ty' expr')
             }
+interpretExpr _ (CSizeofType (CDecl spec declarators _) _) = do
+    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
+        [] -> []
+        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
+        _ -> error ("interpretExpr: invalid sizeof type " ++ show declarators)
+    let Rust.TypeName ty' = toRustType ty
+    return Result
+        { resultType = IsInt Unsigned WordWidth
+        , isMutable = Rust.Immutable
+        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty' ++ ">"))) []
+        }
 interpretExpr _ (CCall func args _) = do
     Result { resultType = IsFunc retTy argTys, result = func' } <- interpretExpr True func
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
