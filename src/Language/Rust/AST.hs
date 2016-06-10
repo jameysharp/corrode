@@ -37,7 +37,7 @@ instance Pretty Stmt where
     -- Any statement consisting of an expression whose syntax ends with
     -- a block does not need to be followed by a semicolon, and
     -- including one anyway is poor style.
-    pPrint (Stmt (BlockExpr b)) = pPrint b -- no parens, no semicolon
+    pPrint (Stmt (BlockExpr b)) = pPrintBlock empty b -- no parens, no semicolon
     pPrint (Stmt e@(IfThenElse{})) = pPrint e -- no semicolon
     pPrint (Stmt e@(Loop{})) = pPrint e -- no semicolon
     pPrint (Stmt e@(While{})) = pPrint e -- no semicolon
@@ -51,19 +51,19 @@ instance Pretty Stmt where
 
 data Block = Block [Stmt] (Maybe Expr)
 
-instance Pretty Block where
-    pPrint (Block ss e) = sep (text "{" : map (nest 4 . pPrint) ss ++ [maybe empty (nest 4 . pPrint) e, text "}"])
+pPrintBlock :: Doc -> Block -> Doc
+pPrintBlock pre (Block [] e) = sep [pre <+> text "{", nest 4 (maybe empty pPrint e), text "}"]
+pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss ++ [maybe empty pPrint e])) $+$ text "}"
 
 data Item = Function Visibility String [(Mutable, Var, Type)] Type Block
 
 instance Pretty Item where
-    pPrint (Function vis nm args ret body) = cat
+    pPrint (Function vis nm args ret body) = pPrintBlock (cat
         [ (if vis == Public then text "pub" else empty) <+> text "unsafe fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
-        , pPrint body
-        ]
+        ]) body
 
 data Expr
     = Lit Lit
@@ -149,16 +149,16 @@ instance Pretty Expr where
         -- If a block is at the beginning of a statement, Rust parses it
         -- as if it were followed by a semicolon. Parenthesizing all
         -- block expressions is excessive but correct.
-        BlockExpr x -> text "(" <> pPrint x <> text ")"
-        UnsafeExpr x -> text "unsafe" <+> pPrint x
-        IfThenElse c t f -> text "if" <+> pPrint c <+> pPrint t <+> case f of
+        BlockExpr x -> text "(" <> pPrintBlock empty x <> text ")"
+        UnsafeExpr x -> pPrintBlock (text "unsafe") x
+        IfThenElse c t f -> pPrintBlock (text "if" <+> pPrint c) t <+> case f of
             Block [] Nothing -> empty
             Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
             Block [Stmt n@(IfThenElse{})] Nothing -> text "else" <+> pPrint n
-            _ -> text "else" <+> pPrint f
-        Loop lt b -> optLabel lt <+> text "loop" <+> pPrint b
-        While lt c b -> optLabel lt <+> text "while" <+> pPrint c <+> pPrint b
-        For lt v i b -> optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> pPrint i <+> pPrint b
+            _ -> pPrintBlock (text "else") f
+        Loop lt b -> pPrintBlock (optLabel lt <+> text "loop") b
+        While lt c b -> pPrintBlock (optLabel lt <+> text "while" <+> pPrint c) b
+        For lt v i b -> pPrintBlock (optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> pPrint i) b
         Break lt -> text "break" <+> maybe empty pPrint lt
         Continue lt -> text "continue" <+> maybe empty pPrint lt
         Return Nothing -> text "return"
