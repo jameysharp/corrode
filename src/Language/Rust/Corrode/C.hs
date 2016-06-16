@@ -482,26 +482,37 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
 
 interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
-interpretTranslationUnit (CTranslUnit decls _) = catMaybes $ flip evalState [] $ do
+interpretTranslationUnit (CTranslUnit decls _) = concat $ flip evalState [] $ do
     forM decls $ \ decl -> case decl of
-        CFDefExt f -> fmap Just (interpretFunction f)
+        CFDefExt f -> fmap return (interpretFunction f)
         CDeclExt (CDecl specs declarators _) -> do
             let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
-            sequence_ $ case storagespecs of
+            fmap concat $ sequence $ case storagespecs of
                 [CTypedef _] ->
-                    [ addType ident =<< cTypeOf typequals typespecs derived
+                    [ do
+                        addType ident =<< cTypeOf typequals typespecs derived
+                        return []
                     -- Typedefs must have a declarator which must not be
                     -- abstract, and must not have an initializer or size.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
                     ]
                 _ ->
-                    [ addVar ident =<< cTypeOf typequals typespecs derived
+                    [ do
+                        (mut, ty) <- cTypeOf typequals typespecs derived
+                        addVar ident (mut, ty)
+                        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+                        return $ if isFunc derived || any isExtern storagespecs
+                          then []
+                          else [Rust.Static mut (Rust.VarName (identToString ident)) (toRustType ty) (fromMaybe 0 mexpr)]
                     -- Top-level declarations must have a declarator
                     -- which must not be abstract, and must not have a
                     -- size. They may have an initializer.
-                    -- TODO: emit declarations with optional
-                    -- initializers for non-functions.
-                    | ~(Just (CDeclr (Just ident) derived _ _ _), _, Nothing) <- declarators
+                    | ~(Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) <- declarators
                     ]
-            return Nothing
-        _ -> return Nothing -- FIXME: ignore everything but function declarations for now
+        _ -> return [] -- FIXME: ignore everything but function declarations for now
+    where
+    isFunc (CFunDeclr {} : _) = True
+    isFunc _ = False
+
+    isExtern (CExtern _) = True
+    isExtern _ = False
