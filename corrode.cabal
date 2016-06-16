@@ -17,7 +17,7 @@ library
   ghc-options:         -Wall
   default-language:    Haskell2010
   build-depends:       base >=4.8 && <4.9,
-                       language-c >=0.4 && <0.5,
+                       language-c >=0.4 && <0.6,
                        pretty,
                        transformers
 
@@ -27,6 +27,6 @@ executable corrode
   default-language:    Haskell2010
   build-depends:       base >=4.8 && <4.9,
                        corrode,
-                       language-c >=0.4 && <0.5,
+                       language-c >=0.4 && <0.6,
                        pretty,
                        transformers >=0.2
