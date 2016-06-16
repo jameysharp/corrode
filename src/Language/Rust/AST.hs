@@ -55,7 +55,9 @@ pPrintBlock :: Doc -> Block -> Doc
 pPrintBlock pre (Block [] e) = sep [pre <+> text "{", nest 4 (maybe empty pPrint e), text "}"]
 pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss ++ [maybe empty pPrint e])) $+$ text "}"
 
-data Item = Function Visibility String [(Mutable, Var, Type)] Type Block
+data Item
+    = Function Visibility String [(Mutable, Var, Type)] Type Block
+    | Static Mutable Var Type Expr
 
 instance Pretty Item where
     pPrint (Function vis nm args ret body) = pPrintBlock (cat
@@ -64,6 +66,11 @@ instance Pretty Item where
             [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
         ]) body
+    pPrint (Static mut var ty initial) = sep
+        [ hsep [text "static", if mut == Mutable then text "mut" else empty, pPrint var]
+        , nest 4 $ text ":" <+> pPrint ty
+        , nest 4 $ text "=" <+> pPrint initial
+        ] <> text ";"
 
 data Expr
     = Lit Lit

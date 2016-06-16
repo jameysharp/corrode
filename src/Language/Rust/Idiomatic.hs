@@ -39,3 +39,4 @@ tailBlock b = b
 
 itemIdioms :: Rust.Item -> Rust.Item
 itemIdioms (Rust.Function vis name formals ret b) = Rust.Function vis name formals ret (tailBlock b)
+itemIdioms i = i
