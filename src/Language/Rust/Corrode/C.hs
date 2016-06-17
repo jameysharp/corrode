@@ -291,7 +291,14 @@ interpretExpr demand (CUnary op expr _) = case op of
             , isMutable = mut'
             , result = Rust.Deref (result expr')
             }
-    CPlusOp -> simple id
+    CPlusOp -> do
+        expr' <- interpretExpr demand expr
+        let ty' = intPromote (resultType expr')
+        return Result
+            { resultType = ty'
+            , isMutable = Rust.Immutable
+            , result = castTo ty' expr'
+            }
     CMinOp -> fmap wrapping $ simple Rust.Neg
     CCompOp -> simple Rust.Not
     CNegOp -> do
