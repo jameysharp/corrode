@@ -41,6 +41,7 @@ cTypeOf basequals base derived = do
     go (CShortType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 16))
     go (CIntType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 32))
     go (CLongType _) (mut, IsInt s _) = return (mut, IsInt s WordWidth)
+    go (CLongType _) (mut, IsFloat w) = return (mut, IsFloat w)
     go (CFloatType _) (mut, _) = return (mut, IsFloat 32)
     go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
