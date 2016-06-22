@@ -22,6 +22,7 @@ data CType
     | IsVoid
     | IsFunc CType [CType]
     | IsPtr Rust.Mutable CType
+    | IsStruct String [(String, CType)]
     deriving (Show, Eq)
 
 cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
@@ -46,6 +47,13 @@ cTypeOf basequals base derived = do
     go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
+    go (CSUType (CStruct CStructTag (Just ident) (Just declarations) _ _) _) (mut, _) = do
+        fields <- forM declarations $ \ (CDecl spec decls _) -> do
+            let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+            forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
+                (_mut, ty) <- cTypeOf typequals typespecs fieldDerived
+                return (identToString field, ty)
+        return (mut, IsStruct (identToString ident) (concat fields))
     go (CTypeDef ident _) (mut1, _) = do
         env <- get
         case lookup (Left ident) env of
@@ -63,6 +71,7 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     where
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
+toRustType (IsStruct name _fields) = Rust.TypeName name
 
 -- * The "integer promotions" (C99 section 6.3.1.1 paragraph 2)
 intPromote :: CType -> CType
