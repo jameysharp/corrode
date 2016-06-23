@@ -73,8 +73,8 @@ instance Pretty Item where
         , nest 4 $ text "=" <+> pPrint initial
         ] <> text ";"
     pPrint (Struct name fields) =
-        text "struct" <+> text name <+> text "{" $+$
-        nest 4 (vcat [ text field <+> text ":" <+> pPrint ty <> text "," | (field, ty) <- fields ]) $+$
+        text "pub struct" <+> text name <+> text "{" $+$
+        nest 4 (vcat [ text "pub" <+> text field <+> text ":" <+> pPrint ty <> text "," | (field, ty) <- fields ]) $+$
         text "}"
 
 data Expr
