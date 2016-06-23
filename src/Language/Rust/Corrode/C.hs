@@ -55,8 +55,8 @@ cTypeOf basequals base derived = do
                 return (identToString field, ty)
         return (mut, IsStruct (identToString ident) (concat fields))
     go (CTypeDef ident _) (mut1, _) = do
-        env <- get
-        case lookup (TypedefIdent ident) env of
+        mty <- getIdent (TypedefIdent ident)
+        case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
@@ -145,11 +145,11 @@ data IdentKind
 type Environment = [(IdentKind, (Rust.Mutable, CType))]
 type EnvMonad = State Environment
 
-addVar :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
-addVar ident ty = modify ((SymbolIdent ident, ty) :)
+getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
+getIdent ident = fmap (lookup ident) get
 
-addType :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
-addType ident ty = modify ((TypedefIdent ident, ty) :)
+addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
+addIdent ident ty = modify ((ident, ty) :)
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
@@ -358,8 +358,8 @@ interpretExpr _ (CCall func args _) = do
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
     return Result { resultType = retTy, isMutable = Rust.Immutable, result = Rust.Call func' args' }
 interpretExpr _ (CVar ident _) = do
-    env <- get
-    case lookup (SymbolIdent ident) env of
+    sym <- getIdent (SymbolIdent ident)
+    case sym of
         Just (mut, ty) -> return Result
             { resultType = ty
             , isMutable = mut
@@ -405,7 +405,7 @@ localDecls (CDecl spec decls _) = do
     forM decls $ \ (Just (CDeclr (Just ident) derived Nothing [] _), minit, Nothing) -> do
         (mut, ty) <- cTypeOf typequals typespecs derived
         mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-        addVar ident (mut, ty)
+        addIdent (SymbolIdent ident) (mut, ty)
         return (Rust.Let mut (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
@@ -501,13 +501,13 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
-    addVar ident (Rust.Mutable, funTy)
+    addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
 
     -- Open a new scope for the formal parameters.
     scope $ do
         formals <- sequence
             [ do
-                addVar argname (mut, ty)
+                addIdent (SymbolIdent argname) (mut, ty)
                 return (mut, Rust.VarName (identToString argname), toRustType ty)
             | ~(Just (mut, argname), ty) <- args'
             ]
@@ -524,7 +524,7 @@ interpretTranslationUnit (CTranslUnit decls _) = concat $ flip evalState [] $ do
             fmap concat $ sequence $ case storagespecs of
                 [CTypedef _] ->
                     [ do
-                        addType ident =<< cTypeOf typequals typespecs derived
+                        addIdent (TypedefIdent ident) =<< cTypeOf typequals typespecs derived
                         return []
                     -- Typedefs must have a declarator which must not be
                     -- abstract, and must not have an initializer or size.
@@ -533,7 +533,7 @@ interpretTranslationUnit (CTranslUnit decls _) = concat $ flip evalState [] $ do
                 _ ->
                     [ do
                         (mut, ty) <- cTypeOf typequals typespecs derived
-                        addVar ident (mut, ty)
+                        addIdent (SymbolIdent ident) (mut, ty)
                         mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
                         return $ if isFunc derived || any isExtern storagespecs
                           then []
