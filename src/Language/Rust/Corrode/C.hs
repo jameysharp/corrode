@@ -49,13 +49,22 @@ cTypeOf basequals base derived = do
     go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
+    go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
+        mty <- getIdent (StructIdent ident)
+        return $ (,) mut $ case mty of
+            Just (_, ty) -> ty
+            -- FIXME: treating incomplete types as having no fields, but that's probably wrong
+            Nothing -> IsStruct (identToString ident) []
     go (CSUType (CStruct CStructTag (Just ident) (Just declarations) _ _) _) (mut, _) = do
-        fields <- forM declarations $ \ (CDecl spec decls _) -> do
+        fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
             let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
             forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
                 (_mut, ty) <- cTypeOf typequals typespecs fieldDerived
                 return (identToString field, ty)
-        return (mut, IsStruct (identToString ident) (concat fields))
+        let ty = IsStruct (identToString ident) fields
+        addIdent (StructIdent ident) (Rust.Immutable, ty)
+        tell [Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ]]
+        return (mut, ty)
     go (CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)
         case mty of
@@ -142,6 +151,7 @@ toBool (Result { resultType = t, result = v }) = case t of
 data IdentKind
     = SymbolIdent Ident
     | TypedefIdent Ident
+    | StructIdent Ident
     deriving Eq
 
 type Environment = [(IdentKind, (Rust.Mutable, CType))]

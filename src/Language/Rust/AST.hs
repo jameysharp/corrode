@@ -58,6 +58,7 @@ pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss 
 data Item
     = Function Visibility String [(Mutable, Var, Type)] Type Block
     | Static Mutable Var Type Expr
+    | Struct String [(String, Type)]
 
 instance Pretty Item where
     pPrint (Function vis nm args ret body) = pPrintBlock (cat
@@ -71,6 +72,10 @@ instance Pretty Item where
         , nest 4 $ text ":" <+> pPrint ty
         , nest 4 $ text "=" <+> pPrint initial
         ] <> text ";"
+    pPrint (Struct name fields) =
+        text "struct" <+> text name <+> text "{" $+$
+        nest 4 (vcat [ text field <+> text ":" <+> pPrint ty <> text "," | (field, ty) <- fields ]) $+$
+        text "}"
 
 data Expr
     = Lit Lit
