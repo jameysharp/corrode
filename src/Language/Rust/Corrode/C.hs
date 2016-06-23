@@ -369,6 +369,16 @@ interpretExpr _ (CCall func args _) = do
     Result { resultType = IsFunc retTy argTys, result = func' } <- interpretExpr True func
     args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
     return Result { resultType = retTy, isMutable = Rust.Immutable, result = Rust.Call func' args' }
+interpretExpr _ (CMember obj ident deref node) = do
+    obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
+    let IsStruct _ fields = resultType obj'
+    let field = identToString ident
+    let Just ty = lookup field fields
+    return Result
+        { resultType = ty
+        , isMutable = isMutable obj'
+        , result = Rust.Member (result obj') (Rust.VarName field)
+        }
 interpretExpr _ (CVar ident _) = do
     sym <- getIdent (SymbolIdent ident)
     case sym of

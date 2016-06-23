@@ -82,6 +82,7 @@ data Expr
     | Var Var
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
+    | Member Expr Var
     | BlockExpr Block
     | UnsafeExpr Block
     | IfThenElse Expr Block Block
@@ -158,6 +159,7 @@ instance Pretty Expr where
             : punctuate (text ",") (map (nest 4 . pPrint) args)
             ++ [text ")"]
             )
+        Member obj field -> pPrintPrec l 13 obj <> text "." <> pPrint field
         -- If a block is at the beginning of a statement, Rust parses it
         -- as if it were followed by a semicolon. Parenthesizing all
         -- block expressions is excessive but correct.
