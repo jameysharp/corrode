@@ -56,7 +56,7 @@ cTypeOf basequals base derived = do
         return (mut, IsStruct (identToString ident) (concat fields))
     go (CTypeDef ident _) (mut1, _) = do
         env <- get
-        case lookup (Left ident) env of
+        case lookup (TypedefIdent ident) env of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
@@ -137,14 +137,19 @@ toBool (Result { resultType = t, result = v }) = case t of
     IsPtr _ _ -> Rust.Not (Rust.MethodCall v (Rust.VarName "is_null") [])
     _ -> Rust.CmpNE v 0
 
-type Environment = [(Either Ident Ident, (Rust.Mutable, CType))]
+data IdentKind
+    = SymbolIdent Ident
+    | TypedefIdent Ident
+    deriving Eq
+
+type Environment = [(IdentKind, (Rust.Mutable, CType))]
 type EnvMonad = State Environment
 
 addVar :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
-addVar ident ty = modify ((Right ident, ty) :)
+addVar ident ty = modify ((SymbolIdent ident, ty) :)
 
 addType :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
-addType ident ty = modify ((Left ident, ty) :)
+addType ident ty = modify ((TypedefIdent ident, ty) :)
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
@@ -354,7 +359,7 @@ interpretExpr _ (CCall func args _) = do
     return Result { resultType = retTy, isMutable = Rust.Immutable, result = Rust.Call func' args' }
 interpretExpr _ (CVar ident _) = do
     env <- get
-    case lookup (Right ident) env of
+    case lookup (SymbolIdent ident) env of
         Just (mut, ty) -> return Result
             { resultType = ty
             , isMutable = mut
