@@ -27,17 +27,12 @@ data CType
     | IsStruct String [(String, CType)]
     deriving (Show, Eq)
 
-cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
-cTypeOf basequals base derived = do
-    base' <- foldrM go (mutable basequals, IsInt Signed (BitWidth 32)) base
-    foldrM derive base' derived
+mutable :: [CTypeQualifier a] -> Rust.Mutable
+mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
+
+baseTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> EnvMonad (Rust.Mutable, CType)
+baseTypeOf basequals = foldrM go (mutable basequals, IsInt Signed (BitWidth 32))
     where
-    mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
-
-    derive (CFunDeclr args _ _) (c, retTy) = (,) c . IsFunc retTy . map snd <$> functionArgs args
-    derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
-    derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
-
     go (CSignedType _) (mut, IsInt _ width) = return (mut, IsInt Signed width)
     go (CUnsigType _) (mut, IsInt _ width) = return (mut, IsInt Unsigned width)
     go (CCharType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 8))
@@ -71,6 +66,18 @@ cTypeOf basequals base derived = do
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
+
+derivedTypeOf :: Show a => (Rust.Mutable, CType) -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
+derivedTypeOf = foldrM derive
+    where
+    derive (CFunDeclr args _ _) (c, retTy) = (,) c . IsFunc retTy . map snd <$> functionArgs args
+    derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
+    derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
+
+cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
+cTypeOf basequals base derived = do
+    base' <- baseTypeOf basequals base
+    derivedTypeOf base' derived
 
 toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
@@ -424,8 +431,9 @@ interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statemen
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
 localDecls (CDecl spec decls _) = do
     let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+    baseTy <- baseTypeOf typequals typespecs
     forM decls $ \ (Just (CDeclr (Just ident) derived Nothing [] _), minit, Nothing) -> do
-        (mut, ty) <- cTypeOf typequals typespecs derived
+        (mut, ty) <- derivedTypeOf baseTy derived
         mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
         addIdent (SymbolIdent ident) (mut, ty)
         return (Rust.Let mut (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
@@ -545,16 +553,17 @@ interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT
             tell [f']
         CDeclExt (CDecl specs declarators _) -> do
             let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
+            baseTy <- baseTypeOf typequals typespecs
             sequence_ $ case storagespecs of
                 [CTypedef _] ->
-                    [ addIdent (TypedefIdent ident) =<< cTypeOf typequals typespecs derived
+                    [ addIdent (TypedefIdent ident) =<< derivedTypeOf baseTy derived
                     -- Typedefs must have a declarator which must not be
                     -- abstract, and must not have an initializer or size.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
                     ]
                 _ ->
                     [ do
-                        (mut, ty) <- cTypeOf typequals typespecs derived
+                        (mut, ty) <- derivedTypeOf baseTy derived
                         addIdent (SymbolIdent ident) (mut, ty)
                         unless (isFunc derived || any isExtern storagespecs) $ do
                             mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
