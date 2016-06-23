@@ -3,7 +3,9 @@
 module Language.Rust.Corrode.C where
 
 import Control.Monad
+import Control.Monad.Trans.Class
 import Control.Monad.Trans.State.Lazy
+import Control.Monad.Trans.Writer.Lazy
 import Data.Foldable
 import Data.Maybe
 import Language.C
@@ -143,21 +145,21 @@ data IdentKind
     deriving Eq
 
 type Environment = [(IdentKind, (Rust.Mutable, CType))]
-type EnvMonad = State Environment
+type EnvMonad = WriterT [Rust.Item] (State Environment)
 
 getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
-getIdent ident = fmap (lookup ident) get
+getIdent ident = fmap (lookup ident) (lift get)
 
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
-addIdent ident ty = modify ((ident, ty) :)
+addIdent ident ty = lift (modify ((ident, ty) :))
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- get
+    old <- lift $ get
     a <- m
     -- Restore the environment to its state before running m.
-    put old
+    lift $ put old
     return a
 
 wrapping :: Result -> Result
@@ -516,16 +518,16 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
         return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
 
 interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
-interpretTranslationUnit (CTranslUnit decls _) = concat $ flip evalState [] $ do
+interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT $ do
     forM decls $ \ decl -> case decl of
-        CFDefExt f -> fmap return (interpretFunction f)
+        CFDefExt f -> do
+            f' <- interpretFunction f
+            tell [f']
         CDeclExt (CDecl specs declarators _) -> do
             let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
-            fmap concat $ sequence $ case storagespecs of
+            sequence_ $ case storagespecs of
                 [CTypedef _] ->
-                    [ do
-                        addIdent (TypedefIdent ident) =<< cTypeOf typequals typespecs derived
-                        return []
+                    [ addIdent (TypedefIdent ident) =<< cTypeOf typequals typespecs derived
                     -- Typedefs must have a declarator which must not be
                     -- abstract, and must not have an initializer or size.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
@@ -534,16 +536,15 @@ interpretTranslationUnit (CTranslUnit decls _) = concat $ flip evalState [] $ do
                     [ do
                         (mut, ty) <- cTypeOf typequals typespecs derived
                         addIdent (SymbolIdent ident) (mut, ty)
-                        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-                        return $ if isFunc derived || any isExtern storagespecs
-                          then []
-                          else [Rust.Static mut (Rust.VarName (identToString ident)) (toRustType ty) (fromMaybe 0 mexpr)]
+                        unless (isFunc derived || any isExtern storagespecs) $ do
+                            mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+                            tell [Rust.Static mut (Rust.VarName (identToString ident)) (toRustType ty) (fromMaybe 0 mexpr)]
                     -- Top-level declarations must have a declarator
                     -- which must not be abstract, and must not have a
                     -- size. They may have an initializer.
                     | ~(Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) <- declarators
                     ]
-        _ -> return [] -- FIXME: ignore everything but function declarations for now
+        CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
     where
     isFunc (CFunDeclr {} : _) = True
     isFunc _ = False
