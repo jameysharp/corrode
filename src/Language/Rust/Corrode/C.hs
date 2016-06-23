@@ -428,15 +428,43 @@ interpretBlockItem retTy onBreak onContinue (CBlockStmt stmt) = fmap (return . R
 interpretBlockItem _ _ _ (CBlockDecl decl) = localDecls decl
 interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statement " ++ show item)
 
-localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
-localDecls (CDecl spec decls _) = do
-    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+interpretDeclarations :: Show a => CDeclaration a -> EnvMonad [(Rust.Mutable, Rust.Var, Rust.Type, Maybe Rust.Expr)]
+interpretDeclarations (CDecl specs decls _) = do
+    let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
     baseTy <- baseTypeOf typequals typespecs
-    forM decls $ \ (Just (CDeclr (Just ident) derived Nothing [] _), minit, Nothing) -> do
-        (mut, ty) <- derivedTypeOf baseTy derived
-        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-        addIdent (SymbolIdent ident) (mut, ty)
-        return (Rust.Let mut (Rust.VarName (identToString ident)) (Just (toRustType ty)) mexpr)
+    case storagespecs of
+        [CTypedef _] -> do
+            -- Typedefs must have a declarator which must not be
+            -- abstract, and must not have an initializer or size.
+            forM_ decls $ \ (Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) -> do
+                ty <- derivedTypeOf baseTy derived
+                addIdent (TypedefIdent ident) ty
+            -- TODO: Translate typedefs rather than flattening them?
+            return []
+        _ -> do
+            -- Non-typedef declarations must have a declarator
+            -- which must not be abstract, and must not have a
+            -- size. They may have an initializer.
+            mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
+                (mut, ty) <- derivedTypeOf baseTy derived
+                addIdent (SymbolIdent ident) (mut, ty)
+                if isFunc derived || any isExtern storagespecs
+                    then return Nothing
+                    else do
+                        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+                        return (Just (mut, Rust.VarName (identToString ident), toRustType ty, mexpr))
+            return (catMaybes mbinds)
+    where
+    isFunc (CFunDeclr {} : _) = True
+    isFunc _ = False
+
+    isExtern (CExtern _) = True
+    isExtern _ = False
+
+localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
+localDecls decl = do
+    binds <- interpretDeclarations decl
+    return [ Rust.Let mut var (Just ty) mexpr | (mut, var, ty, mexpr) <- binds ]
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
@@ -551,32 +579,7 @@ interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT
         CFDefExt f -> do
             f' <- interpretFunction f
             tell [f']
-        CDeclExt (CDecl specs declarators _) -> do
-            let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
-            baseTy <- baseTypeOf typequals typespecs
-            sequence_ $ case storagespecs of
-                [CTypedef _] ->
-                    [ addIdent (TypedefIdent ident) =<< derivedTypeOf baseTy derived
-                    -- Typedefs must have a declarator which must not be
-                    -- abstract, and must not have an initializer or size.
-                    | ~(Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) <- declarators
-                    ]
-                _ ->
-                    [ do
-                        (mut, ty) <- derivedTypeOf baseTy derived
-                        addIdent (SymbolIdent ident) (mut, ty)
-                        unless (isFunc derived || any isExtern storagespecs) $ do
-                            mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
-                            tell [Rust.Static mut (Rust.VarName (identToString ident)) (toRustType ty) (fromMaybe 0 mexpr)]
-                    -- Top-level declarations must have a declarator
-                    -- which must not be abstract, and must not have a
-                    -- size. They may have an initializer.
-                    | ~(Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) <- declarators
-                    ]
+        CDeclExt decl' -> do
+            binds <- interpretDeclarations decl'
+            tell [ Rust.Static mut var ty (fromMaybe 0 mexpr) | (mut, var, ty, mexpr) <- binds ]
         CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
-    where
-    isFunc (CFunDeclr {} : _) = True
-    isFunc _ = False
-
-    isExtern (CExtern _) = True
-    isExtern _ = False
