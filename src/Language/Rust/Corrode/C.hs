@@ -497,7 +497,7 @@ interpretStatement retTy _ _ (CWhile c b False _) = do
     b' <- fmap toBlock (interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b)
     return (Rust.While Nothing (toBool c') (Rust.Block b' Nothing))
 interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
-    pre <- either (maybe (return []) (fmap (toBlock . result) . interpretExpr False)) localDecls initial
+    pre <- either (maybe (return []) (fmap (return . Rust.Stmt . result) . interpretExpr False)) localDecls initial
 
     (lt, b') <- case mincr of
         Nothing -> do
