@@ -80,6 +80,7 @@ instance Pretty Item where
 data Expr
     = Lit Lit
     | Var Var
+    | StructExpr String [(String, Expr)]
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
     | Member Expr Var
@@ -149,6 +150,11 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
+        StructExpr str fields -> sep
+            ( text str <+> text "{"
+            : punctuate (text ",") [ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ]
+            ++ [text "}"]
+            )
         Call f args -> cat
             ( pPrintPrec l 13 f <> text "("
             : punctuate (text ",") (map (nest 4 . pPrint) args)

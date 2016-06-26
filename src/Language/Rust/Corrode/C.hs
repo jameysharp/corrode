@@ -428,6 +428,18 @@ interpretBlockItem retTy onBreak onContinue (CBlockStmt stmt) = fmap (return . R
 interpretBlockItem _ _ _ (CBlockDecl decl) = localDecls decl
 interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statement " ++ show item)
 
+interpretInitializer :: Show a => CType -> CInitializer a -> EnvMonad Rust.Expr
+-- Initializers for compound types must be surrounded by braces:
+interpretInitializer (IsStruct str fields) ~(CInitList binds _) = Rust.StructExpr str <$> sequence
+    [ (,) field <$> interpretInitializer ty initial
+    -- TODO: handle labeled initializers
+    | ((field, ty), ~([], initial)) <- zip fields binds
+    ]
+-- Initializers for scalar types must either be a bare expression or the
+-- same surrounded by braces:
+interpretInitializer ty (CInitExpr initial _) = fmap (castTo ty) (interpretExpr True initial)
+interpretInitializer ty (CInitList ~[([], CInitExpr initial _)] _) = fmap (castTo ty) (interpretExpr True initial)
+
 interpretDeclarations :: Show a => CDeclaration a -> EnvMonad [(Rust.Mutable, Rust.Var, Rust.Type, Maybe Rust.Expr)]
 interpretDeclarations (CDecl specs decls _) = do
     let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
@@ -451,7 +463,7 @@ interpretDeclarations (CDecl specs decls _) = do
                 if isFunc derived || any isExtern storagespecs
                     then return Nothing
                     else do
-                        mexpr <- mapM (fmap (castTo ty) . interpretExpr True . (\ (CInitExpr initial _) -> initial)) minit
+                        mexpr <- mapM (interpretInitializer ty) minit
                         return (Just (mut, Rust.VarName (identToString ident), toRustType ty, mexpr))
             return (catMaybes mbinds)
     where
