@@ -79,6 +79,16 @@ cTypeOf basequals base derived = do
     base' <- baseTypeOf basequals base
     derivedTypeOf base' derived
 
+typeName :: Show a => CDeclaration a -> EnvMonad CType
+typeName (CDecl spec declarators _) = do
+    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+    -- Declaration mutability has no effect in type names.
+    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
+        [] -> []
+        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
+        _ -> error ("invalid type name " ++ show declarators)
+    return ty
+
 toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
@@ -291,13 +301,8 @@ interpretExpr demand (CCond c (Just t) f _) = do
             }
 interpretExpr _ (CBinary op lhs rhs _) =
     binop op <$> interpretExpr True lhs <*> interpretExpr True rhs
-interpretExpr _ (CCast (CDecl spec declarators _) expr _) = do
-    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
-    -- Declaration mutability has no effect in casts.
-    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
-        [] -> []
-        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
-        _ -> error ("interpretExpr: invalid cast " ++ show declarators)
+interpretExpr _ (CCast decl expr _) = do
+    ty <- typeName decl
     expr' <- interpretExpr True expr
     return Result
         { resultType = ty
@@ -348,24 +353,16 @@ interpretExpr demand (CUnary op expr _) = case op of
             , isMutable = Rust.Immutable
             , result = f (castTo ty' expr')
             }
-interpretExpr _ (CSizeofType (CDecl spec declarators _) _) = do
-    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
-    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
-        [] -> []
-        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
-        _ -> error ("interpretExpr: invalid sizeof type " ++ show declarators)
+interpretExpr _ (CSizeofType decl _) = do
+    ty <- typeName decl
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
         , isMutable = Rust.Immutable
         , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty' ++ ">"))) []
         }
-interpretExpr _ (CAlignofType (CDecl spec declarators _) _) = do
-    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
-    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
-        [] -> []
-        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
-        _ -> error ("interpretExpr: invalid alignof type " ++ show declarators)
+interpretExpr _ (CAlignofType decl _) = do
+    ty <- typeName decl
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
