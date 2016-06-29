@@ -30,8 +30,16 @@ data CType
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
-baseTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> EnvMonad (Rust.Mutable, CType)
-baseTypeOf basequals = foldrM go (mutable basequals, IsInt Signed (BitWidth 32))
+baseTypeOf :: Show a => [CDeclarationSpecifier a] -> EnvMonad (Maybe (CStorageSpecifier a), (Rust.Mutable, CType))
+baseTypeOf specs = do
+    -- TODO: process attributes and the `inline` keyword
+    let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
+    let mstorage = case storage of
+            [] -> Nothing
+            [spec] -> Just spec
+            _ -> error ("too many storage class specifiers: " ++ show storage)
+    base <- foldrM go (mutable basequals, IsInt Signed (BitWidth 32)) basespecs
+    return (mstorage, base)
     where
     go (CSignedType _) (mut, IsInt _ width) = return (mut, IsInt Signed width)
     go (CUnsigType _) (mut, IsInt _ width) = return (mut, IsInt Unsigned width)
@@ -52,8 +60,8 @@ baseTypeOf basequals = foldrM go (mutable basequals, IsInt Signed (BitWidth 32))
             Nothing -> IsStruct (identToString ident) []
     go (CSUType (CStruct CStructTag (Just ident) (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
-            let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
-            base <- baseTypeOf typequals typespecs
+            -- storage class specifiers are not allowed inside struct definitions
+            (Nothing, base) <- baseTypeOf spec
             forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
                 (_mut, ty) <- derivedTypeOf base fieldDerived
                 return (identToString field, ty)
@@ -75,16 +83,12 @@ derivedTypeOf = foldrM derive
     derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
     derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
 
-cTypeOf :: Show a => [CTypeQualifier a] -> [CTypeSpecifier a] -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
-cTypeOf basequals base derived = do
-    base' <- baseTypeOf basequals base
-    derivedTypeOf base' derived
-
 typeName :: Show a => CDeclaration a -> EnvMonad CType
 typeName (CDecl spec declarators _) = do
-    let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+    -- Storage class specifiers are not allowed on type names.
+    (Nothing, base) <- baseTypeOf spec
     -- Declaration mutability has no effect in type names.
-    (_mut, ty) <- cTypeOf typequals typespecs $ case declarators of
+    (_mut, ty) <- derivedTypeOf base $ case declarators of
         [] -> []
         [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
         _ -> error ("invalid type name " ++ show declarators)
@@ -440,10 +444,9 @@ interpretInitializer ty (CInitList ~[([], CInitExpr initial _)] _) = fmap (castT
 
 interpretDeclarations :: Show a => CDeclaration a -> EnvMonad [(Rust.Mutable, Rust.Var, Rust.Type, Maybe Rust.Expr)]
 interpretDeclarations (CDecl specs decls _) = do
-    let (storagespecs, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
-    baseTy <- baseTypeOf typequals typespecs
+    (storagespecs, baseTy) <- baseTypeOf specs
     case storagespecs of
-        [CTypedef _] -> do
+        Just (CTypedef _) -> do
             -- Typedefs must have a declarator which must not be
             -- abstract, and must not have an initializer or size.
             forM_ decls $ \ (Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) -> do
@@ -458,7 +461,7 @@ interpretDeclarations (CDecl specs decls _) = do
             mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
                 (mut, ty) <- derivedTypeOf baseTy derived
                 addIdent (SymbolIdent ident) (mut, ty)
-                if isFunc derived || any isExtern storagespecs
+                if isFunc derived || isExtern storagespecs
                     then return Nothing
                     else do
                         mexpr <- mapM (interpretInitializer ty) minit
@@ -468,7 +471,7 @@ interpretDeclarations (CDecl specs decls _) = do
     isFunc (CFunDeclr {} : _) = True
     isFunc _ = False
 
-    isExtern (CExtern _) = True
+    isExtern (Just (CExtern _)) = True
     isExtern _ = False
 
 localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
@@ -540,7 +543,15 @@ functionArgs (Left _) = error "old-style function declarations not supported"
 functionArgs (Right (_, True)) = error "variadic functions not supported"
 functionArgs (Right (args, False)) = sequence
     [ do
-        (mut, ty) <- cTypeOf argtypequals argtypespecs derived
+        -- TODO: accept storage class specifier Just (CRegister _), but ignore
+        --       it unless the "address not taken" semantics let us generate
+        --       better code
+        -- XXX: is storage class specifier Just (CAuto _) legal? if so I think
+        --      it should have no effect
+        -- pretty sure no other storage class specifiers are allowed on
+        -- function arguments
+        (Nothing, base) <- baseTypeOf argspecs
+        (mut, ty) <- derivedTypeOf base derived
         return (fmap ((,) mut) argname, ty)
     | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
         -- Treat argument lists `(void)` and `()` the same: we'll
@@ -548,7 +559,6 @@ functionArgs (Right (args, False)) = sequence
         case args of
         [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
         _ -> args
-    , let ([], [], argtypequals, argtypespecs, False) = partitionDeclSpecs argspecs
     ]
 
 interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
@@ -557,15 +567,15 @@ interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
 interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr args _ _ : _) _ _ _) _ body _) = do
     args' <- functionArgs args
 
-    let (storage, [], typequals, typespecs, _inline) = partitionDeclSpecs specs
-        vis = case storage of
-            [CStatic _] -> Rust.Private
-            [] -> Rust.Public
-            _ -> error ("interpretFunction: unsupported storage specifiers " ++ show storage)
+    (storage, baseTy) <- baseTypeOf specs
+    let vis = case storage of
+            Nothing -> Rust.Public
+            Just (CStatic _) -> Rust.Private
+            Just s -> error ("interpretFunction: illegal storage specifier " ++ show s)
         name = identToString ident
 
     -- Mutability is meaningless on function definitions.
-    (_mut, funTy@(IsFunc retTy _)) <- cTypeOf typequals typespecs declarators
+    (_mut, funTy@(IsFunc retTy _)) <- derivedTypeOf baseTy declarators
 
     -- Add this function to the globals before evaluating its body so
     -- recursive calls work.
