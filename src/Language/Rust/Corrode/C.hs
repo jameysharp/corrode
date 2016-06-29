@@ -53,8 +53,9 @@ baseTypeOf basequals = foldrM go (mutable basequals, IsInt Signed (BitWidth 32))
     go (CSUType (CStruct CStructTag (Just ident) (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
             let ([], [], typequals, typespecs, False) = partitionDeclSpecs spec
+            base <- baseTypeOf typequals typespecs
             forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
-                (_mut, ty) <- cTypeOf typequals typespecs fieldDerived
+                (_mut, ty) <- derivedTypeOf base fieldDerived
                 return (identToString field, ty)
         let ty = IsStruct (identToString ident) fields
         addIdent (StructIdent ident) (Rust.Immutable, ty)
