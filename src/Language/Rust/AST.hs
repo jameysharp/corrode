@@ -55,14 +55,19 @@ pPrintBlock :: Doc -> Block -> Doc
 pPrintBlock pre (Block [] e) = sep [pre <+> text "{", nest 4 (maybe empty pPrint e), text "}"]
 pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss ++ [maybe empty pPrint e])) $+$ text "}"
 
-data Item
-    = Function Visibility String [(Mutable, Var, Type)] Type Block
+data Item = Item Visibility ItemKind
+
+instance Pretty Item where
+    pPrint (Item vis k) = (if vis == Public then zeroWidthText "pub " else empty) <> pPrint k
+
+data ItemKind
+    = Function String [(Mutable, Var, Type)] Type Block
     | Static Mutable Var Type Expr
     | Struct String [(String, Type)]
 
-instance Pretty Item where
-    pPrint (Function vis nm args ret body) = pPrintBlock (cat
-        [ (if vis == Public then text "pub" else empty) <+> text "unsafe fn" <+> text nm <> text "("
+instance Pretty ItemKind where
+    pPrint (Function nm args ret body) = pPrintBlock (cat
+        [ text "unsafe fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
@@ -73,7 +78,7 @@ instance Pretty Item where
         , nest 4 $ text "=" <+> pPrint initial
         ] <> text ";"
     pPrint (Struct name fields) =
-        text "pub struct" <+> text name <+> text "{" $+$
+        text "struct" <+> text name <+> text "{" $+$
         nest 4 (vcat [ text "pub" <+> text field <+> text ":" <+> pPrint ty <> text "," | (field, ty) <- fields ]) $+$
         text "}"
 

@@ -67,7 +67,7 @@ baseTypeOf specs = do
                 return (identToString field, ty)
         let ty = IsStruct (identToString ident) fields
         addIdent (StructIdent ident) (Rust.Immutable, ty)
-        tell [Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ]]
+        tell [Rust.Item Rust.Public (Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, ty)
     go (CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)
@@ -443,8 +443,9 @@ interpretInitializer ty (CInitExpr initial _) = fmap (castTo ty) (interpretExpr 
 interpretInitializer ty (CInitList ~[([], CInitExpr initial _)] _) = fmap (castTo ty) (interpretExpr True initial)
 
 makeStaticBinding :: Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> Rust.Item
+-- TODO: determine visibility according to the `static` storage class.
 -- TODO: construct a correct default value for non-scalar static variables.
-makeStaticBinding mut var ty mexpr = Rust.Static mut var ty (fromMaybe 0 mexpr)
+makeStaticBinding mut var ty mexpr = Rust.Item Rust.Private (Rust.Static mut var ty (fromMaybe 0 mexpr))
 
 makeLetBinding :: Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> Rust.Stmt
 makeLetBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
@@ -598,7 +599,7 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
             ]
         let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
         body' <- interpretStatement retTy noLoop noLoop body
-        return (Rust.Function vis name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing))
+        return (Rust.Item vis (Rust.Function name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing)))
 
 interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
 interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT $ do

@@ -38,5 +38,5 @@ tailBlock (Rust.Block (unsnoc -> Just (b, Rust.Stmt (tailExpr -> Just e))) Nothi
 tailBlock b = b
 
 itemIdioms :: Rust.Item -> Rust.Item
-itemIdioms (Rust.Function vis name formals ret b) = Rust.Function vis name formals ret (tailBlock b)
+itemIdioms (Rust.Item vis (Rust.Function name formals ret b)) = Rust.Item vis (Rust.Function name formals ret (tailBlock b))
 itemIdioms i = i
