@@ -67,7 +67,7 @@ baseTypeOf specs = do
                 return (identToString field, ty)
         let ty = IsStruct (identToString ident) fields
         addIdent (StructIdent ident) (Rust.Immutable, ty)
-        tell [Rust.Item Rust.Public (Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
+        emitItems [Rust.Item Rust.Public (Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, ty)
     go (CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)
@@ -184,6 +184,9 @@ getIdent ident = fmap (lookup ident) (lift get)
 
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
 addIdent ident ty = lift (modify ((ident, ty) :))
+
+emitItems :: [Rust.Item] -> EnvMonad ()
+emitItems = tell
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
@@ -606,8 +609,8 @@ interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT
     forM decls $ \ decl -> case decl of
         CFDefExt f -> do
             f' <- interpretFunction f
-            tell [f']
+            emitItems [f']
         CDeclExt decl' -> do
             binds <- interpretDeclarations makeStaticBinding decl'
-            tell binds
+            emitItems binds
         CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
