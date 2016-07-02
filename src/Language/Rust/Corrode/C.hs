@@ -427,7 +427,7 @@ interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
 
 interpretBlockItem :: Show a => CType -> Rust.Expr -> Rust.Expr -> CCompoundBlockItem a -> EnvMonad [Rust.Stmt]
 interpretBlockItem retTy onBreak onContinue (CBlockStmt stmt) = fmap (return . Rust.Stmt) (interpretStatement retTy onBreak onContinue stmt)
-interpretBlockItem _ _ _ (CBlockDecl decl) = localDecls decl
+interpretBlockItem _ _ _ (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statement " ++ show item)
 
 interpretInitializer :: Show a => CType -> CInitializer a -> EnvMonad Rust.Expr
@@ -442,8 +442,15 @@ interpretInitializer (IsStruct str fields) ~(CInitList binds _) = Rust.StructExp
 interpretInitializer ty (CInitExpr initial _) = fmap (castTo ty) (interpretExpr True initial)
 interpretInitializer ty (CInitList ~[([], CInitExpr initial _)] _) = fmap (castTo ty) (interpretExpr True initial)
 
-interpretDeclarations :: Show a => CDeclaration a -> EnvMonad [(Rust.Mutable, Rust.Var, Rust.Type, Maybe Rust.Expr)]
-interpretDeclarations (CDecl specs decls _) = do
+makeStaticBinding :: Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> Rust.Item
+-- TODO: construct a correct default value for non-scalar static variables.
+makeStaticBinding mut var ty mexpr = Rust.Static mut var ty (fromMaybe 0 mexpr)
+
+makeLetBinding :: Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> Rust.Stmt
+makeLetBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
+
+interpretDeclarations :: Show a => (Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> b) -> CDeclaration a -> EnvMonad [b]
+interpretDeclarations fromBinding (CDecl specs decls _) = do
     (storagespecs, baseTy) <- baseTypeOf specs
     case storagespecs of
         Just (CTypedef _) -> do
@@ -465,7 +472,7 @@ interpretDeclarations (CDecl specs decls _) = do
                     then return Nothing
                     else do
                         mexpr <- mapM (interpretInitializer ty) minit
-                        return (Just (mut, Rust.VarName (identToString ident), toRustType ty, mexpr))
+                        return (Just (fromBinding mut (Rust.VarName (identToString ident)) (toRustType ty) mexpr))
             return (catMaybes mbinds)
     where
     isFunc (CFunDeclr {} : _) = True
@@ -473,11 +480,6 @@ interpretDeclarations (CDecl specs decls _) = do
 
     isExtern (Just (CExtern _)) = True
     isExtern _ = False
-
-localDecls :: Show a => CDeclaration a -> EnvMonad [Rust.Stmt]
-localDecls decl = do
-    binds <- interpretDeclarations decl
-    return [ Rust.Let mut var (Just ty) mexpr | (mut, var, ty, mexpr) <- binds ]
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
@@ -503,7 +505,7 @@ interpretStatement retTy _ _ (CFor initial cond mincr b _) = scope $ do
         Left (Just expr) -> do
             expr' <- interpretExpr False expr
             return [Rust.Stmt (result expr')]
-        Right decls -> localDecls decls
+        Right decls -> interpretDeclarations makeLetBinding decls
 
     (lt, b') <- case mincr of
         Nothing -> do
@@ -605,6 +607,6 @@ interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT
             f' <- interpretFunction f
             tell [f']
         CDeclExt decl' -> do
-            binds <- interpretDeclarations decl'
-            tell [ Rust.Static mut var ty (fromMaybe 0 mexpr) | (mut, var, ty, mexpr) <- binds ]
+            binds <- interpretDeclarations makeStaticBinding decl'
+            tell binds
         CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
