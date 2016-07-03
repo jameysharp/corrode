@@ -1,6 +1,6 @@
 {-# LANGUAGE ViewPatterns #-}
 
-module Language.Rust.Corrode.C where
+module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
 import Control.Monad.Trans.Class
