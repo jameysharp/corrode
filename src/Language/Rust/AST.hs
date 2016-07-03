@@ -64,6 +64,7 @@ data ItemKind
     = Function String [(Mutable, Var, Type)] Type Block
     | Static Mutable Var Type Expr
     | Struct String [(String, Type)]
+    | Extern [ExternItem]
 
 instance Pretty ItemKind where
     pPrint (Function nm args ret body) = pPrintBlock (cat
@@ -81,6 +82,30 @@ instance Pretty ItemKind where
         text "struct" <+> text name <+> text "{" $+$
         nest 4 (vcat [ text "pub" <+> text field <+> text ":" <+> pPrint ty <> text "," | (field, ty) <- fields ]) $+$
         text "}"
+    pPrint (Extern defs) = vcat
+        ( text "extern {"
+        : map (nest 4 . pPrint) defs
+        ++ [text "}"]
+        )
+
+data ExternItem
+    = ExternFn String [(Var, Type)] Type
+    | ExternStatic Mutable Var Type
+
+instance Pretty ExternItem where
+    pPrint (ExternFn nm args ret) = cat
+        [ text "fn" <+> text nm <> text "("
+        , nest 4 $ sep $ punctuate (text ",")
+            [ sep [pPrint v, text ":", pPrint t] | (v, t) <- args ]
+        , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret <> text ";"
+        ]
+    pPrint (ExternStatic mut var ty) = hsep
+        [ text "static"
+        , if mut == Mutable then text "mut" else empty
+        , pPrint var
+        , text ":"
+        , pPrint ty
+        ] <> text ";"
 
 data Expr
     = Lit Lit

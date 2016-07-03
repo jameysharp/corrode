@@ -177,7 +177,7 @@ data IdentKind
     deriving Eq
 
 type Environment = [(IdentKind, (Rust.Mutable, CType))]
-type EnvMonad = WriterT [Rust.Item] (State Environment)
+type EnvMonad = WriterT ([Rust.Item], [Rust.ExternItem]) (State Environment)
 
 getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
 getIdent ident = fmap (lookup ident) (lift get)
@@ -186,7 +186,10 @@ addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
 addIdent ident ty = lift (modify ((ident, ty) :))
 
 emitItems :: [Rust.Item] -> EnvMonad ()
-emitItems = tell
+emitItems items = tell (items, [])
+
+emitExterns :: [Rust.ExternItem] -> EnvMonad ()
+emitExterns items = tell ([], items)
 
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
@@ -472,18 +475,37 @@ interpretDeclarations fromBinding (CDecl specs decls _) = do
             mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
                 (mut, ty) <- derivedTypeOf baseTy derived
                 addIdent (SymbolIdent ident) (mut, ty)
-                if isFunc derived || isExtern storagespecs
-                    then return Nothing
-                    else do
+                let name = identToString ident
+                case (derived, storagespecs) of
+                    -- Static function prototypes don't need to be
+                    -- translated because the function definition must
+                    -- be in the same translation unit.
+                    (CFunDeclr {} : _, Just (CStatic _)) -> return Nothing
+                    -- Other function prototypes need to be translated
+                    -- unless the function definition appears in the same
+                    -- translation unit; do it and prune duplicates later.
+                    (CFunDeclr args _ _ : _, _) -> do
+                        args' <- functionArgs args
+                        let (IsFunc retTy _) = ty
+                            formals =
+                                [ (Rust.VarName argName, toRustType argTy)
+                                | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
+                                , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
+                                ]
+                        emitExterns [Rust.ExternFn name formals (toRustType retTy)]
+                        return Nothing
+                    -- Non-function externs need to be translated unless
+                    -- an identical non-extern declaration appears in the
+                    -- same translation unit; do it and prune duplicates
+                    -- later.
+                    (_, Just (CExtern _)) -> do
+                        emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
+                        return Nothing
+                    -- Anything else is a variable declaration to translate.
+                    _ -> do
                         mexpr <- mapM (interpretInitializer ty) minit
-                        return (Just (fromBinding mut (Rust.VarName (identToString ident)) (toRustType ty) mexpr))
+                        return (Just (fromBinding mut (Rust.VarName name) (toRustType ty) mexpr))
             return (catMaybes mbinds)
-    where
-    isFunc (CFunDeclr {} : _) = True
-    isFunc _ = False
-
-    isExtern (Just (CExtern _)) = True
-    isExtern _ = False
 
 toBlock :: Rust.Expr -> [Rust.Stmt]
 toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
@@ -605,12 +627,26 @@ interpretFunction (CFunDef specs (CDeclr ~(Just ident) ~declarators@(CFunDeclr a
         return (Rust.Item vis (Rust.Function name formals (toRustType retTy) (Rust.Block (toBlock body') Nothing)))
 
 interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
-interpretTranslationUnit (CTranslUnit decls _) = flip evalState [] $ execWriterT $ do
-    forM decls $ \ decl -> case decl of
-        CFDefExt f -> do
-            f' <- interpretFunction f
-            emitItems [f']
-        CDeclExt decl' -> do
-            binds <- interpretDeclarations makeStaticBinding decl'
-            emitItems binds
-        CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
+interpretTranslationUnit (CTranslUnit decls _) = (if null externs' then id else (Rust.Item Rust.Private (Rust.Extern externs') :)) items
+    where
+    (items, externs) = flip evalState [] $ execWriterT $ do
+        forM decls $ \ decl -> case decl of
+            CFDefExt f -> do
+                f' <- interpretFunction f
+                emitItems [f']
+            CDeclExt decl' -> do
+                binds <- interpretDeclarations makeStaticBinding decl'
+                emitItems binds
+            CAsmExt _ _ -> return () -- FIXME: ignore assembly for now
+
+    itemNames = catMaybes
+        [ case item of
+            Rust.Item _ (Rust.Function name _ _ _) -> Just name
+            Rust.Item _ (Rust.Static _ (Rust.VarName name) _ _) -> Just name
+            _ -> Nothing
+        | item <- items
+        ]
+
+    externName (Rust.ExternFn name _ _) = name
+    externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
+    externs' = filter (\ item -> externName item `notElem` itemNames) externs
