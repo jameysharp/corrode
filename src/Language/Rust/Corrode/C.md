@@ -28,6 +28,7 @@ module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
 import Control.Monad.Trans.Class
+import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State.Lazy
 import Control.Monad.Trans.Writer.Lazy
 import Data.Foldable
@@ -588,10 +589,17 @@ calls work.
     addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
 ```
 
-Open a new scope for the body of this function.
+Open a new scope for the body of this function, while making the return
+type available so we can correctly translate `return` statements.
 
 ```haskell
-    scope $ do
+    let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
+    let funcFlow m = runReaderT m ControlFlow
+            { functionReturnType = retTy
+            , onBreak = noLoop
+            , onContinue = noLoop
+            }
+    funcFlow $ scope $ do
 ```
 
 Add each formal parameter into the new environment, tagged as
@@ -605,7 +613,7 @@ Add each formal parameter into the new environment, tagged as
 > original program.
 
 ```haskell
-        formals <- sequence
+        formals <- lift $ sequence
             [ do
                 addIdent (SymbolIdent argname) (mut, ty)
                 return (mut, Rust.VarName (identToString argname), toRustType ty)
@@ -616,8 +624,7 @@ Add each formal parameter into the new environment, tagged as
 Interpret the body of the function.
 
 ```haskell
-        let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
-        body' <- interpretStatement retTy noLoop noLoop body
+        body' <- interpretStatement body
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
@@ -695,21 +702,25 @@ mean the function takes no arguments.
 Statements
 ==========
 
+In order to interpret `return`, `break`, and `continue` statements, we
+need a bit of extra context, which we'll discuss as we go. Let's wrap
+that context up in a simple data type.
+
+```haskell
+data ControlFlow = ControlFlow
+    { functionReturnType :: CType
+    , onBreak :: Rust.Expr
+    , onContinue :: Rust.Expr
+    }
+```
+
 Inside a function, we find C statements. Interestingly, syntax which is
 a statement in C is almost always an expression instead in Rust. So
 `interpretStatement` transforms one `CStatement` into one Rust
 expression.
 
-In order to interpret `return`, `break`, and `continue` statements, we
-need a bit of extra context passed in. Let's explore the uses of those
-parameters as we encounter them.
-
-> **TODO**: Move `retTy`, `onBreak`, and `onContinue` arguments into a
-> `ReaderT` monad transformer so we don't have to explicitly thread them
-> through recursive calls.
-
 ```haskell
-interpretStatement :: Show a => CType -> Rust.Expr -> Rust.Expr -> CStatement a -> EnvMonad Rust.Expr
+interpretStatement :: Show a => CStatement a -> ReaderT ControlFlow EnvMonad Rust.Expr
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -721,8 +732,8 @@ appears in a context where its result matters. In a statement
 expression, the result is discarded, so we pass `False`.
 
 ```haskell
-interpretStatement _ _ _ (CExpr (Just expr) _) = do
-    expr' <- interpretExpr False expr
+interpretStatement (CExpr (Just expr) _) = do
+    expr' <- lift (interpretExpr False expr)
     return (result expr')
 ```
 
@@ -731,8 +742,8 @@ compound statement contains a sequence of zero or more statements or
 declarations; see `interpretBlockItem` below for details.
 
 ```haskell
-interpretStatement retTy onBreak onContinue (CCompound [] items _) = scope $ do
-    stmts <- mapM (interpretBlockItem retTy onBreak onContinue) items
+interpretStatement (CCompound [] items _) = scope $ do
+    stmts <- mapM interpretBlockItem items
     return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
 ```
 
@@ -751,10 +762,10 @@ and wrap those lists up into blocks, so we don't care whether the
 original program used a compound statement in that branch or not.
 
 ```haskell
-interpretStatement retTy onBreak onContinue (CIf c t mf _) = do
-    c' <- interpretExpr True c
-    t' <- fmap toBlock (interpretStatement retTy onBreak onContinue t)
-    f' <- maybe (return []) (fmap toBlock . interpretStatement retTy onBreak onContinue) mf
+interpretStatement (CIf c t mf _) = do
+    c' <- lift (interpretExpr True c)
+    t' <- fmap toBlock (interpretStatement t)
+    f' <- maybe (return []) (fmap toBlock . interpretStatement) mf
     return (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
 ```
 
@@ -764,10 +775,10 @@ semantics in both languages, aside from differences analagous to the
 loop body must be a block.
 
 ```haskell
-interpretStatement retTy _ _ (CWhile c b False _) = do
-    c' <- interpretExpr True c
-    b' <- fmap toBlock (interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b)
-    return (Rust.While Nothing (toBool c') (Rust.Block b' Nothing))
+interpretStatement (CWhile c b False _) = do
+    c' <- lift (interpretExpr True c)
+    b' <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
+    return (Rust.While Nothing (toBool c') (Rust.Block (toBlock b') Nothing))
 ```
 
 C's `for` loops can be tricky to translate to Rust, which doesn't have
@@ -778,8 +789,8 @@ a new scope, insert any assignments and `let`-bindings at the beginning
 of it, and we're good to go.
 
 ```haskell
-interpretStatement retTy _ _ (CFor initial mcond mincr b _) = scope $ do
-    pre <- case initial of
+interpretStatement (CFor initial mcond mincr b _) = scope $ do
+    pre <- lift $ case initial of
         Left Nothing -> return []
         Left (Just expr) -> do
             expr' <- interpretExpr False expr
@@ -823,12 +834,12 @@ so that they refer to the outer loop, not the one we inserted.
             let continueTo = Just (Rust.Lifetime "continueTo")
             let breakTo = Just (Rust.Lifetime "breakTo")
 
-            b' <- interpretStatement retTy (Rust.Break breakTo) (Rust.Break continueTo) b
+            b' <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
             let end = Rust.Stmt (Rust.Break Nothing)
             let innerBlock = Rust.Block (toBlock b' ++ [end]) Nothing
             let inner = Rust.Stmt (Rust.Loop continueTo innerBlock)
 
-            incr' <- interpretExpr False incr
+            incr' <- lift (interpretExpr False incr)
             let outerBlock = Rust.Block [inner, Rust.Stmt (result incr')] Nothing
             return (breakTo, Rust.BlockExpr outerBlock)
 ```
@@ -840,7 +851,7 @@ expressions, with no magic loops inserted into the body.
 
 ```haskell
         Nothing -> do
-            b' <- interpretStatement retTy (Rust.Break Nothing) (Rust.Continue Nothing) b
+            b' <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
             return (Nothing, b')
     let block = Rust.Block (toBlock b') Nothing
 ```
@@ -851,7 +862,7 @@ given condition. In either case, we apply the label selected previously
 to this loop.
 
 ```haskell
-    loop <- case mcond of
+    loop <- lift $ case mcond of
         Nothing -> return (Rust.Loop lt block)
         Just cond -> do
             cond' <- interpretExpr True cond
@@ -872,8 +883,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement _ _ onContinue (CCont _) = return onContinue
-interpretStatement _ onBreak _ (CBreak _) = return onBreak
+interpretStatement (CCont _) = asks onContinue
+interpretStatement (CBreak _) = asks onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -884,8 +895,9 @@ declared return type, then we need to insert a type-cast to the correct
 type.
 
 ```haskell
-interpretStatement retTy _ _ (CReturn expr _) = do
-    expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
+interpretStatement (CReturn expr _) = do
+    retTy <- asks functionReturnType
+    expr' <- lift (mapM (fmap (castTo retTy) . interpretExpr True) expr)
     return (Rust.Return expr')
 ```
 
@@ -895,7 +907,22 @@ translation for yet.
 > **TODO**: Translate more kinds of statements. `:-)`
 
 ```haskell
-interpretStatement _ _ _ stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
+interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
+```
+
+Inside loops above, we needed to update the translation to use if either
+`break` or `continue` statements show up. `loopScope` runs the provided
+translation action using an updated pair of `break`/`continue`
+expressions.
+
+```haskell
+loopScope
+    :: Rust.Expr
+    -> Rust.Expr
+    -> ReaderT ControlFlow EnvMonad a
+    -> ReaderT ControlFlow EnvMonad a
+loopScope b c = withReaderT $ \ flow ->
+    flow { onBreak = b, onContinue = c }
 ```
 
 
@@ -907,12 +934,12 @@ as well as nested statements. `interpretBlockItem` produces a sequence
 of zero or more Rust statements for each compound block item.
 
 ```haskell
-interpretBlockItem :: Show a => CType -> Rust.Expr -> Rust.Expr -> CCompoundBlockItem a -> EnvMonad [Rust.Stmt]
-interpretBlockItem retTy onBreak onContinue (CBlockStmt stmt) = do
-    stmt' <- interpretStatement retTy onBreak onContinue stmt
+interpretBlockItem :: Show a => CCompoundBlockItem a -> ReaderT ControlFlow EnvMonad [Rust.Stmt]
+interpretBlockItem (CBlockStmt stmt) = do
+    stmt' <- interpretStatement stmt
     return [Rust.Stmt stmt']
-interpretBlockItem _ _ _ (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
-interpretBlockItem _ _ _ item = error ("interpretBlockItem: unsupported statement " ++ show item)
+interpretBlockItem (CBlockDecl decl) = lift (interpretDeclarations makeLetBinding decl)
+interpretBlockItem item = error ("interpretBlockItem: unsupported statement " ++ show item)
 ```
 
 `toBlock` is a helper function which turns a Rust expression into a list
@@ -933,13 +960,13 @@ changes that `m` made to the environment. Any items added to the output
 are kept, though.
 
 ```haskell
-scope :: EnvMonad a -> EnvMonad a
+scope :: ReaderT ControlFlow EnvMonad a -> ReaderT ControlFlow EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- lift $ get
+    old <- lift (lift get)
     a <- m
     -- Restore the environment to its state before running m.
-    lift $ put old
+    lift (lift (put old))
     return a
 ```
 
@@ -1304,18 +1331,20 @@ GCC's "statement expression" extension translates pretty directly to
 Rust block expressions.
 
 ```haskell
-interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
-    let no = error "interpretExpr of GCC statement expressions doesn't support return, break, or continue yet"
+interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = noFlow $ scope $ do
     let (effects, final) = case last stmts of
             CBlockStmt (CExpr expr _) | demand -> (init stmts, expr)
             _ -> (stmts, Nothing)
-    effects' <- mapM (interpretBlockItem no no no) effects
-    final' <- mapM (interpretExpr True) final
+    effects' <- mapM interpretBlockItem effects
+    final' <- lift (mapM (interpretExpr True) final)
     return Result
         { resultType = maybe IsVoid resultType final'
         , isMutable = maybe Rust.Immutable isMutable final'
         , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result final'))
         }
+    where
+    no = error "interpretExpr of GCC statement expressions doesn't support return, break, or continue yet"
+    noFlow m = runReaderT m (ControlFlow no no no)
 ```
 
 Otherwise, we have not yet implemented this kind of expression.
