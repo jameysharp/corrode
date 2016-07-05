@@ -89,14 +89,16 @@ instance Pretty ItemKind where
         )
 
 data ExternItem
-    = ExternFn String [(Var, Type)] Type
+    = ExternFn String [(Var, Type)] Bool Type
     | ExternStatic Mutable Var Type
 
 instance Pretty ExternItem where
-    pPrint (ExternFn nm args ret) = cat
+    pPrint (ExternFn nm args variadic ret) = cat
         [ text "fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
-            [ sep [pPrint v, text ":", pPrint t] | (v, t) <- args ]
+            ( [ sep [pPrint v, text ":", pPrint t] | (v, t) <- args ]
+            ++ if variadic then [text "..."] else []
+            )
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret <> text ";"
         ]
     pPrint (ExternStatic mut var ty) = hsep

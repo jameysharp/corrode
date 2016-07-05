@@ -240,7 +240,7 @@ for this translation unit it becomes clear.
         | item <- items
         ]
 
-    externName (Rust.ExternFn name _ _) = name
+    externName (Rust.ExternFn name _ _ _) = name
     externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
     externs' = filter (\ item -> externName item `notElem` itemNames) externs
 ```
@@ -468,14 +468,14 @@ duplicates later.
 
 ```haskell
                     (CFunDeclr args _ _ : _, _) -> do
-                        args' <- functionArgs args
-                        let (IsFunc retTy _) = ty
+                        (args', variadic) <- functionArgs args
+                        let (IsFunc retTy _ _) = ty
                             formals =
                                 [ (Rust.VarName argName, toRustType argTy)
                                 | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
                                 , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                                 ]
-                        emitExterns [Rust.ExternFn name formals (toRustType retTy)]
+                        emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
                         return Nothing
 ```
 
@@ -567,19 +567,22 @@ Translate into our internal representation the function's name, formal
 parameters, and return type. Determine whether the function should be
 visible outside this module based on whether it is declared `static`.
 
+Definitions of variadic functions are not allowed because Rust does not
+support them.
+
 Note that `const` is legal but meaningless on the return type of a
 function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    args' <- functionArgs args
+    (args', False) <- functionArgs args
     (storage, baseTy) <- baseTypeOf specs
     let vis = case storage of
             Nothing -> Rust.Public
             Just (CStatic _) -> Rust.Private
             Just s -> error ("interpretFunction: illegal storage specifier " ++ show s)
         name = identToString ident
-    (_mut, funTy@(IsFunc retTy _)) <- derivedTypeOf baseTy declarators
+    (_mut, funTy@(IsFunc retTy _ _)) <- derivedTypeOf baseTy declarators
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -644,13 +647,15 @@ expression.
 
 There are several places we need to process function argument lists.
 `functionArgs` distils language-c's represention of the gory details of
-C syntax down to just the information we need.
+C syntax down to just the information we need. Specifically, we return a
+list of the arguments and a flag indicating whether the function is
+"variadic", meaning that any number of additional arguments are allowed.
 
 ```haskell
 functionArgs
     :: Show a
     => Either [Ident] ([CDeclaration a], Bool)
-    -> EnvMonad [(Maybe (Rust.Mutable, Ident), CType)]
+    -> EnvMonad ([(Maybe (Rust.Mutable, Ident), CType)], Bool)
 ```
 
 > **TODO**: Handling old-style function declarations is probably not
@@ -658,17 +663,9 @@ functionArgs
 
 ```haskell
 functionArgs (Left _) = error "old-style function declarations not supported"
-```
-
-> **FIXME**: Although we can't translate the implemention of variadic
-> functions to Rust (because Rust deliberately doesn't support C's
-> unsafe variadic ABI in safe code), we can and _should_ translate calls
-> to external variadic library functions like `printf`.
-
-```haskell
-functionArgs (Right (_, True)) = error "variadic functions not supported"
-functionArgs (Right (args, False)) = sequence
-    [ do
+functionArgs (Right (args, variadic)) = do
+    args' <- sequence
+        [ do
 ```
 
 > **TODO**: Accept storage class specifier `Just (CRegister _)`, but
@@ -682,20 +679,21 @@ I'm pretty sure no other storage class specifiers are allowed on
 function arguments.
 
 ```haskell
-        (Nothing, base) <- baseTypeOf argspecs
-        (mut, ty) <- derivedTypeOf base derived
-        return (fmap ((,) mut) argname, ty)
-    | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
+            (Nothing, base) <- baseTypeOf argspecs
+            (mut, ty) <- derivedTypeOf base derived
+            return (fmap ((,) mut) argname, ty)
+        | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
 ```
 
 Treat argument lists `(void)` and `()` the same: we'll pretend that both
 mean the function takes no arguments.
 
 ```haskell
-        case args of
-        [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
-        _ -> args
-    ]
+            case args of
+            [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
+            _ -> args
+        ]
+    return (args', variadic)
 ```
 
 
@@ -1240,19 +1238,40 @@ interpretExpr _ (CAlignofType decl _) = do
 ```
 
 Function calls first translate the expression which identifies which
-function to call. Then for each actual parameter, the expression given
-for that parameter is translated and then cast (if necessary) to the
-type of the corresponding formal parameter.
+function to call, and any argument expressions.
 
 ```haskell
 interpretExpr _ (CCall func args _) = do
-    Result { resultType = IsFunc retTy argTys, result = func' } <- interpretExpr True func
-    args' <- zipWithM (\ ty arg -> fmap (castTo ty) (interpretExpr True arg)) argTys args
+    Result { resultType = IsFunc retTy argTys variadic, result = func' } <- interpretExpr True func
+    args' <- castArgs variadic argTys args
     return Result
         { resultType = retTy
         , isMutable = Rust.Immutable
         , result = Rust.Call func' args'
         }
+    where
+```
+
+For each actual parameter, the expression given for that parameter is
+translated and then cast (if necessary) to the type of the corresponding
+formal parameter.
+
+If we're calling a variadic function, then there can be any number of
+arguments after the ones explicitly given in the function's type, and
+those extra arguments can be of any type.
+
+Otherwise, there must be exactly as many arguments as the function's
+type specified, or it's a syntax error.
+
+```haskell
+    castArgs _ [] [] = return []
+    castArgs variadic (ty : tys) (arg : rest) = do
+        arg' <- interpretExpr True arg
+        args' <- castArgs variadic tys rest
+        return (castTo ty arg' : args')
+    castArgs True [] rest = mapM (fmap result . interpretExpr True) rest
+    castArgs False [] _ = error "too many arguments in function call"
+    castArgs _ _ [] = error "too few arguments in function call"
 ```
 
 Structure member access has two forms in C (`.` and `->`), which only
@@ -1619,7 +1638,7 @@ data CType
     | IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
-    | IsFunc CType [CType]
+    | IsFunc CType [CType] Bool
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
     deriving (Show, Eq)
@@ -1629,7 +1648,7 @@ toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
-toRustType (IsFunc _ _) = error "toRustType: not implemented for IsFunc"
+toRustType (IsFunc _ _ _) = error "toRustType: not implemented for IsFunc"
 toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeName (rustMut mut ++ to')
     where
     rustMut Rust.Mutable = "*mut "
@@ -1685,7 +1704,9 @@ baseTypeOf specs = do
 derivedTypeOf :: Show a => (Rust.Mutable, CType) -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
 derivedTypeOf = foldrM derive
     where
-    derive (CFunDeclr args _ _) (c, retTy) = (,) c . IsFunc retTy . map snd <$> functionArgs args
+    derive (CFunDeclr args _ _) (c, retTy) = do
+        (args', variadic) <- functionArgs args
+        return (c, IsFunc retTy (map snd args') variadic)
     derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
     derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
 
