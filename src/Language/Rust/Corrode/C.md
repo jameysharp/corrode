@@ -852,15 +852,13 @@ statements into
 
 so that they refer to the outer loop, not the one we inserted.
 
-> **FIXME**: Allocate function-unique lifetimes instead of reusing the
-> same names every time, which generates spurious warnings with the
-> default rustc lint settings.
-
 ```haskell
     (lt, b') <- case mincr of
         Just incr -> do
-            let continueTo = Just (Rust.Lifetime "continueTo")
-            let breakTo = Just (Rust.Lifetime "breakTo")
+            breakName <- lift (uniqueName "break")
+            continueName <- lift (uniqueName "continue")
+            let breakTo = Just (Rust.Lifetime breakName)
+            let continueTo = Just (Rust.Lifetime continueName)
 
             b' <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
             let end = Rust.Stmt (Rust.Break Nothing)
