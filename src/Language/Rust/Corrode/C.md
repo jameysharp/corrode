@@ -100,6 +100,18 @@ data IdentKind
     deriving Eq
 ```
 
+Sometimes we need to construct a unique name, because the Rust pattern
+we want to generate requires a name someplace where C did not require
+one. We'll follow a standard pattern for this and just generate a unique
+number each time we need a new name.
+
+```haskell
+data EnvState = EnvState
+    { environment :: Environment
+    , unique :: Int
+    }
+```
+
 The C language is defined such that a compiler can generate code in a
 single top-to-bottom pass through a translation unit. That is, any uses
 of a name must come after the point in the translation unit where that
@@ -124,7 +136,7 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad = WriterT ([Rust.Item], [Rust.ExternItem]) (State Environment)
+type EnvMonad = WriterT ([Rust.Item], [Rust.ExternItem]) (State EnvState)
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
@@ -136,14 +148,28 @@ haven't seen a declaration for that name yet.
 
 ```haskell
 getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
-getIdent ident = fmap (lookup ident) (lift get)
+getIdent ident = lift $ do
+    env <- gets environment
+    return (lookup ident env)
 ```
 
 `addIdent` saves type information into the environment.
 
 ```haskell
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
-addIdent ident ty = lift (modify ((ident, ty) :))
+addIdent ident ty = lift $ modify $ \ st ->
+    st { environment = (ident, ty) : environment st }
+```
+
+`uniqueName` generates a new name with the given base and a new unique
+number:
+
+```haskell
+uniqueName :: String -> EnvMonad String
+uniqueName base = lift $ do
+    st <- get
+    put (st { unique = unique st + 1 })
+    return (base ++ show (unique st))
 ```
 
 `emitItems` adds a list of Rust items to the output.
@@ -209,7 +235,11 @@ Specifically, we:
   translation.
 
 ```haskell
-    (items, externs) = evalState (execWriterT (mapM perDecl decls)) []
+    initState = EnvState
+        { environment = []
+        , unique = 1
+        }
+    (items, externs) = evalState (execWriterT (mapM perDecl decls)) initState
 ```
 
 With the initial environment set up, we can descend to the next level of
@@ -961,10 +991,10 @@ are kept, though.
 scope :: ReaderT ControlFlow EnvMonad a -> ReaderT ControlFlow EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- lift (lift get)
+    old <- lift (lift (gets environment))
     a <- m
     -- Restore the environment to its state before running m.
-    lift (lift (put old))
+    lift (lift (modify (\ st -> st { environment = old })))
     return a
 ```
 
@@ -1683,7 +1713,7 @@ baseTypeOf specs = do
             Just (_, ty) -> ty
             -- FIXME: treating incomplete types as having no fields, but that's probably wrong
             Nothing -> IsStruct (identToString ident) []
-    go (CSUType s@(CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
+    go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
             -- storage class specifiers are not allowed inside struct definitions
             (Nothing, base) <- baseTypeOf spec
@@ -1695,7 +1725,7 @@ baseTypeOf specs = do
                 let name = identToString ident
                 addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
                 return name
-            Nothing -> error ("anonymous structs not yet implemented: " ++ show s)
+            Nothing -> uniqueName "Struct"
         emitItems [Rust.Item Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
     go (CTypeDef ident _) (mut1, _) = do
