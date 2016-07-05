@@ -27,10 +27,7 @@ useful data structures and control flow abstractions.
 module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.Reader
-import Control.Monad.Trans.State.Lazy
-import Control.Monad.Trans.Writer.Lazy
+import Control.Monad.Trans.RWS.Lazy
 import Data.Foldable
 import Data.Maybe
 import Language.C
@@ -126,9 +123,11 @@ simple operations.
   to query or update the current enviroment.
 - The writer monad has a `tell` operation we use to add new Rust items
   to the output.
-- The two monads are combined by making one a transformer over the
-  other, and they provide a `lift` operation to mark whenever you're
-  trying to use the inner monad. The outer monad is directly accessible.
+
+Actually, we use a combined type, `RWS`, which supports the operations
+of reader, writer, and state monads all in one. We use the reader monad
+for control flow context, which is covered in more detail in the section
+on statements, below.
 
 You probably don't need to read any of the awful monad tutorials out
 there just to use these! The important point is that we have this type
@@ -136,7 +135,7 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad = WriterT ([Rust.Item], [Rust.ExternItem]) (State EnvState)
+type EnvMonad = RWS ControlFlow ([Rust.Item], [Rust.ExternItem]) EnvState
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
@@ -148,7 +147,7 @@ haven't seen a declaration for that name yet.
 
 ```haskell
 getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
-getIdent ident = lift $ do
+getIdent ident = do
     env <- gets environment
     return (lookup ident env)
 ```
@@ -157,7 +156,7 @@ getIdent ident = lift $ do
 
 ```haskell
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
-addIdent ident ty = lift $ modify $ \ st ->
+addIdent ident ty = modify $ \ st ->
     st { environment = (ident, ty) : environment st }
 ```
 
@@ -166,7 +165,7 @@ number:
 
 ```haskell
 uniqueName :: String -> EnvMonad String
-uniqueName base = lift $ do
+uniqueName base = do
     st <- get
     put (st { unique = unique st + 1 })
     return (base ++ show (unique st))
@@ -235,11 +234,16 @@ Specifically, we:
   translation.
 
 ```haskell
+    initFlow = ControlFlow
+        { functionReturnType = error "return statement outside function"
+        , onBreak = error "break statement outside loop"
+        , onContinue = error "continue statement outside loop"
+        }
     initState = EnvState
         { environment = []
         , unique = 1
         }
-    (items, externs) = evalState (execWriterT (mapM perDecl decls)) initState
+    (_, _, (items, externs)) = runRWS (mapM_ perDecl decls) initFlow initState
 ```
 
 With the initial environment set up, we can descend to the next level of
@@ -622,13 +626,8 @@ Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
 ```haskell
-    let noLoop = error ("interpretFunction: break or continue statement outside any loop in " ++ name)
-    let funcFlow m = runReaderT m ControlFlow
-            { functionReturnType = retTy
-            , onBreak = noLoop
-            , onContinue = noLoop
-            }
-    funcFlow $ scope $ do
+    let setRetTy flow = flow { functionReturnType = retTy }
+    local setRetTy $ scope $ do
 ```
 
 Add each formal parameter into the new environment, tagged as
@@ -642,7 +641,7 @@ Add each formal parameter into the new environment, tagged as
 > original program.
 
 ```haskell
-        formals <- lift $ sequence
+        formals <- sequence
             [ do
                 addIdent (SymbolIdent argname) (mut, ty)
                 return (mut, Rust.VarName (identToString argname), toRustType ty)
@@ -744,7 +743,7 @@ a statement in C is almost always an expression instead in Rust. So
 expression.
 
 ```haskell
-interpretStatement :: Show a => CStatement a -> ReaderT ControlFlow EnvMonad Rust.Expr
+interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -757,7 +756,7 @@ expression, the result is discarded, so we pass `False`.
 
 ```haskell
 interpretStatement (CExpr (Just expr) _) = do
-    expr' <- lift (interpretExpr False expr)
+    expr' <- interpretExpr False expr
     return (result expr')
 ```
 
@@ -787,7 +786,7 @@ original program used a compound statement in that branch or not.
 
 ```haskell
 interpretStatement (CIf c t mf _) = do
-    c' <- lift (interpretExpr True c)
+    c' <- interpretExpr True c
     t' <- fmap toBlock (interpretStatement t)
     f' <- maybe (return []) (fmap toBlock . interpretStatement) mf
     return (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
@@ -800,7 +799,7 @@ loop body must be a block.
 
 ```haskell
 interpretStatement (CWhile c b False _) = do
-    c' <- lift (interpretExpr True c)
+    c' <- interpretExpr True c
     b' <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
     return (Rust.While Nothing (toBool c') (Rust.Block (toBlock b') Nothing))
 ```
@@ -814,7 +813,7 @@ of it, and we're good to go.
 
 ```haskell
 interpretStatement (CFor initial mcond mincr b _) = scope $ do
-    pre <- lift $ case initial of
+    pre <- case initial of
         Left Nothing -> return []
         Left (Just expr) -> do
             expr' <- interpretExpr False expr
@@ -851,8 +850,8 @@ so that they refer to the outer loop, not the one we inserted.
 ```haskell
     (lt, b') <- case mincr of
         Just incr -> do
-            breakName <- lift (uniqueName "break")
-            continueName <- lift (uniqueName "continue")
+            breakName <- uniqueName "break"
+            continueName <- uniqueName "continue"
             let breakTo = Just (Rust.Lifetime breakName)
             let continueTo = Just (Rust.Lifetime continueName)
 
@@ -861,7 +860,7 @@ so that they refer to the outer loop, not the one we inserted.
             let innerBlock = Rust.Block (toBlock b' ++ [end]) Nothing
             let inner = Rust.Stmt (Rust.Loop continueTo innerBlock)
 
-            incr' <- lift (interpretExpr False incr)
+            incr' <- interpretExpr False incr
             let outerBlock = Rust.Block [inner, Rust.Stmt (result incr')] Nothing
             return (breakTo, Rust.BlockExpr outerBlock)
 ```
@@ -884,7 +883,7 @@ given condition. In either case, we apply the label selected previously
 to this loop.
 
 ```haskell
-    loop <- lift $ case mcond of
+    loop <- case mcond of
         Nothing -> return (Rust.Loop lt block)
         Just cond -> do
             cond' <- interpretExpr True cond
@@ -919,7 +918,7 @@ type.
 ```haskell
 interpretStatement (CReturn expr _) = do
     retTy <- asks functionReturnType
-    expr' <- lift (mapM (fmap (castTo retTy) . interpretExpr True) expr)
+    expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
     return (Rust.Return expr')
 ```
 
@@ -938,12 +937,8 @@ translation action using an updated pair of `break`/`continue`
 expressions.
 
 ```haskell
-loopScope
-    :: Rust.Expr
-    -> Rust.Expr
-    -> ReaderT ControlFlow EnvMonad a
-    -> ReaderT ControlFlow EnvMonad a
-loopScope b c = withReaderT $ \ flow ->
+loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad a
+loopScope b c = local $ \ flow ->
     flow { onBreak = b, onContinue = c }
 ```
 
@@ -956,11 +951,11 @@ as well as nested statements. `interpretBlockItem` produces a sequence
 of zero or more Rust statements for each compound block item.
 
 ```haskell
-interpretBlockItem :: Show a => CCompoundBlockItem a -> ReaderT ControlFlow EnvMonad [Rust.Stmt]
+interpretBlockItem :: Show a => CCompoundBlockItem a -> EnvMonad [Rust.Stmt]
 interpretBlockItem (CBlockStmt stmt) = do
     stmt' <- interpretStatement stmt
     return [Rust.Stmt stmt']
-interpretBlockItem (CBlockDecl decl) = lift (interpretDeclarations makeLetBinding decl)
+interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem item = error ("interpretBlockItem: unsupported statement " ++ show item)
 ```
 
@@ -982,13 +977,13 @@ changes that `m` made to the environment. Any items added to the output
 are kept, though.
 
 ```haskell
-scope :: ReaderT ControlFlow EnvMonad a -> ReaderT ControlFlow EnvMonad a
+scope :: EnvMonad a -> EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- lift (lift (gets environment))
+    old <- gets environment
     a <- m
     -- Restore the environment to its state before running m.
-    lift (lift (modify (\ st -> st { environment = old })))
+    modify (\ st -> st { environment = old })
     return a
 ```
 
@@ -1374,20 +1369,17 @@ GCC's "statement expression" extension translates pretty directly to
 Rust block expressions.
 
 ```haskell
-interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = noFlow $ scope $ do
+interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
     let (effects, final) = case last stmts of
             CBlockStmt (CExpr expr _) | demand -> (init stmts, expr)
             _ -> (stmts, Nothing)
     effects' <- mapM interpretBlockItem effects
-    final' <- lift (mapM (interpretExpr True) final)
+    final' <- mapM (interpretExpr True) final
     return Result
         { resultType = maybe IsVoid resultType final'
         , isMutable = maybe Rust.Immutable isMutable final'
         , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result final'))
         }
-    where
-    no = error "interpretExpr of GCC statement expressions doesn't support return, break, or continue yet"
-    noFlow m = runReaderT m (ControlFlow no no no)
 ```
 
 Otherwise, we have not yet implemented this kind of expression.
