@@ -446,10 +446,11 @@ only output from this function.
 If there are any declarators, we need to figure out which kind of Rust
 declaration to emit for each one, if any.
 
-> **TODO**: Clean this up, it could be simpler/clearer.
-
 ```haskell
-    case storagespecs of
+    mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
+        (mut, ty) <- derivedTypeOf baseTy derived
+        let name = identToString ident
+        case (derived, storagespecs) of
 ```
 
 Typedefs must have a declarator which must not be abstract, and must not
@@ -465,31 +466,23 @@ environment.
 > always possible, so this requires careful thought.
 
 ```haskell
-        Just (CTypedef _) -> do
-            forM_ decls $ \ (Just (CDeclr (Just ident) derived _ _ _), Nothing, Nothing) -> do
-                ty <- derivedTypeOf baseTy derived
-                addIdent (TypedefIdent ident) ty
-            return []
+            (_, Just (CTypedef _)) -> do
+                addIdent (TypedefIdent ident) (mut, ty)
+                return Nothing
 ```
 
 Non-typedef declarations must have a declarator which must not be
 abstract, and must not have a size. They may have an initializer. Each
 declarator is added to the environment, tagged as a `SymbolIdent`.
 
-```haskell
-        _ -> do
-            mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
-                (mut, ty) <- derivedTypeOf baseTy derived
-                addIdent (SymbolIdent ident) (mut, ty)
-                let name = identToString ident
-                case (derived, storagespecs) of
-```
-
 Static function prototypes don't need to be translated because the
-function definition must be in the same translation unit.
+function definition must be in the same translation unit. We still need
+to have the function's type signature in the environment though.
 
 ```haskell
-                    (CFunDeclr {} : _, Just (CStatic _)) -> return Nothing
+            (CFunDeclr {} : _, Just (CStatic _)) -> do
+                addIdent (SymbolIdent ident) (mut, ty)
+                return Nothing
 ```
 
 Other function prototypes need to be translated unless the function
@@ -497,16 +490,17 @@ definition appears in the same translation unit; do it and prune
 duplicates later.
 
 ```haskell
-                    (CFunDeclr args _ _ : _, _) -> do
-                        (args', variadic) <- functionArgs args
-                        let (IsFunc retTy _ _) = ty
-                            formals =
-                                [ (Rust.VarName argName, toRustType argTy)
-                                | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
-                                , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
-                                ]
-                        emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
-                        return Nothing
+            (CFunDeclr args _ _ : _, _) -> do
+                (args', variadic) <- functionArgs args
+                let (IsFunc retTy _ _) = ty
+                    formals =
+                        [ (Rust.VarName argName, toRustType argTy)
+                        | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
+                        , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
+                        ]
+                addIdent (SymbolIdent ident) (mut, ty)
+                emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
+                return Nothing
 ```
 
 Non-function externs need to be translated unless an identical
@@ -514,9 +508,10 @@ non-extern declaration appears in the same translation unit; do it and
 prune duplicates later.
 
 ```haskell
-                    (_, Just (CExtern _)) -> do
-                        emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
-                        return Nothing
+            (_, Just (CExtern _)) -> do
+                addIdent (SymbolIdent ident) (mut, ty)
+                emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
+                return Nothing
 ```
 
 Anything else is a variable declaration to translate. This is the only
@@ -524,16 +519,17 @@ case where we use `makeBinding`. If there's an initializer, we also need
 to translate that; see below.
 
 ```haskell
-                    _ -> do
-                        mexpr <- mapM (interpretInitializer ty) minit
-                        return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
+            _ -> do
+                addIdent (SymbolIdent ident) (mut, ty)
+                mexpr <- mapM (interpretInitializer ty) minit
+                return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
 ```
 
 Return the bindings produced for any declarator that did not return
 `Nothing`.
 
 ```haskell
-            return (catMaybes mbinds)
+    return (catMaybes mbinds)
 ```
 
 If a declarator had an initializer, we need to translate that to an
