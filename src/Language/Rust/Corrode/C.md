@@ -1683,17 +1683,21 @@ baseTypeOf specs = do
             Just (_, ty) -> ty
             -- FIXME: treating incomplete types as having no fields, but that's probably wrong
             Nothing -> IsStruct (identToString ident) []
-    go (CSUType (CStruct CStructTag (Just ident) (Just declarations) _ _) _) (mut, _) = do
+    go (CSUType s@(CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
             -- storage class specifiers are not allowed inside struct definitions
             (Nothing, base) <- baseTypeOf spec
             forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
                 (_mut, ty) <- derivedTypeOf base fieldDerived
                 return (identToString field, ty)
-        let ty = IsStruct (identToString ident) fields
-        addIdent (StructIdent ident) (Rust.Immutable, ty)
-        emitItems [Rust.Item Rust.Public (Rust.Struct (identToString ident) [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
-        return (mut, ty)
+        name <- case mident of
+            Just ident -> do
+                let name = identToString ident
+                addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
+                return name
+            Nothing -> error ("anonymous structs not yet implemented: " ++ show s)
+        emitItems [Rust.Item Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
+        return (mut, IsStruct name fields)
     go (CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)
         case mty of
