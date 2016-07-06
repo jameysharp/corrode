@@ -486,9 +486,9 @@ declaration to emit for each one, if any.
 
 ```haskell
     mbinds <- forM decls $ \ (Just decl@(CDeclr (Just ident) _ _ _ _), minit, Nothing) -> do
-        (mut, ty) <- derivedTypeOf baseTy decl
+        (mut, isFunc, ty) <- derivedTypeOf baseTy decl
         let name = identToString ident
-        case (storagespecs, ty) of
+        case (storagespecs, isFunc, ty) of
 ```
 
 Typedefs must have a declarator which must not be abstract, and must not
@@ -504,7 +504,7 @@ environment.
 > always possible, so this requires careful thought.
 
 ```haskell
-            (Just (CTypedef _), _) -> do
+            (Just (CTypedef _), False, _) -> do
                 addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
 ```
@@ -518,7 +518,7 @@ function definition must be in the same translation unit. We still need
 to have the function's type signature in the environment though.
 
 ```haskell
-            (Just (CStatic _), IsFunc{}) -> do
+            (Just (CStatic _), True, IsFunc{}) -> do
                 addIdent (SymbolIdent ident) (mut, ty)
                 return Nothing
 ```
@@ -528,7 +528,7 @@ definition appears in the same translation unit; do it and prune
 duplicates later.
 
 ```haskell
-            (_, IsFunc retTy args variadic) -> do
+            (_, True, IsFunc retTy args variadic) -> do
                 let formals =
                         [ (Rust.VarName argName, toRustType argTy)
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
@@ -544,7 +544,7 @@ non-extern declaration appears in the same translation unit; do it and
 prune duplicates later.
 
 ```haskell
-            (Just (CExtern _), _) -> do
+            (Just (CExtern _), _, _) -> do
                 addIdent (SymbolIdent ident) (mut, ty)
                 emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
                 return Nothing
@@ -645,7 +645,8 @@ we can put a `mut` keyword in the generated Rust.
         Just (CStatic _) -> return Rust.Private
         Just s -> badSource s "storage class specifier for function"
     let name = identToString ident
-    (_mut, funTy) <- derivedTypeOf baseTy declr
+    (_mut, isFunc, funTy) <- derivedTypeOf baseTy declr
+    unless isFunc (badSource declr "function definition")
     (retTy, args) <- case funTy of
         IsFunc _ _ True -> unimplemented declr
         IsFunc retTy args False -> return (retTy, args)
@@ -1830,7 +1831,8 @@ baseTypeOf specs = do
                 Nothing -> return ()
             forM decls $ \ decl -> case decl of
                 (Just declr@(CDeclr (Just field) _ _ _ _), Nothing, Nothing) -> do
-                    (_mut, ty) <- derivedTypeOf base declr
+                    (_mut, isFunc, ty) <- derivedTypeOf base declr
+                    when isFunc (badSource declr "function as struct field")
                     return (identToString field, ty)
                 (_, Nothing, Just _size) -> unimplemented declaration
                 _ -> badSource declaration "field in struct"
@@ -1849,9 +1851,27 @@ baseTypeOf specs = do
             Nothing -> badSource spec "undefined type"
     go spec _ = unimplemented spec
 
-derivedTypeOf :: (Rust.Mutable, CType) -> CDeclr -> EnvMonad (Rust.Mutable, CType)
-derivedTypeOf base declr@(CDeclr _ derived _ _ _) = foldrM derive base derived
+derivedTypeOf :: (Rust.Mutable, CType) -> CDeclr -> EnvMonad (Rust.Mutable, Bool, CType)
+derivedTypeOf (basemut, basety) declr@(CDeclr _ derived _ _ _) =
+    foldrM derive (basemut, False, basety) derived
     where
+```
+
+In our internal type representation, `IsFunc` is a function _pointer_.
+So if we see a `CPtrDeclr` followed by a `CFunDeclr`, we should eat the
+pointer.
+
+```haskell
+    derive (CPtrDeclr _ _) (c, True, to) = return (c, False, to)
+```
+
+If we see a `CArrDeclr` or `CFunDeclr` before a `CFunDeclr`, that's an
+error; there must be an intervening pointer.
+
+```haskell
+    derive _ (_, True, _) = badSource declr "use of function type"
+    derive (CPtrDeclr quals _) (c, False, to) = return (mutable quals, False, IsPtr c to)
+    derive (CArrDeclr quals _ _) (c, False, to) = return (mutable quals, False, IsPtr c to)
 ```
 
 > **TODO**: Handling old-style function declarations is probably not
@@ -1859,7 +1879,7 @@ derivedTypeOf base declr@(CDeclr _ derived _ _ _) = foldrM derive base derived
 
 ```haskell
     derive (CFunDeclr (Left _) _ _) _ = unimplemented declr
-    derive (CFunDeclr (Right (args, variadic)) _ _) (c, retTy) = do
+    derive (CFunDeclr (Right (args, variadic)) _ _) (c, False, retTy) = do
         args' <- sequence
             [ do
                 (storage, base') <- baseTypeOf argspecs
@@ -1870,7 +1890,8 @@ derivedTypeOf base declr@(CDeclr _ derived _ _ _) = foldrM derive base derived
                 case declr' of
                     [] -> return (Nothing, snd base')
                     [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
-                        (mut, ty) <- derivedTypeOf base' argdeclr
+                        (mut, isFunc, ty) <- derivedTypeOf base' argdeclr
+                        when isFunc (badSource arg "function as function argument")
                         return (fmap ((,) mut) argname, ty)
                     _ -> badSource arg "function argument"
             | arg@(CDecl argspecs declr' _) <-
@@ -1884,9 +1905,7 @@ mean the function takes no arguments.
                 [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
                 _ -> args
             ]
-        return (c, IsFunc retTy args' variadic)
-    derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
-    derive (CArrDeclr quals _ _) (c, to) = return (mutable quals, IsPtr c to)
+        return (c, True, IsFunc retTy args' variadic)
 
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
@@ -1898,10 +1917,11 @@ typeName decl@(CDecl spec declarators _) = do
         Just s -> badSource s "storage class specifier in type name"
         Nothing -> return ()
     -- Declaration mutability has no effect in type names.
-    (_mut, ty) <- case declarators of
-        [] -> return base
-        [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] ->
-            derivedTypeOf base declr
+    case declarators of
+        [] -> return (snd base)
+        [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] -> do
+            (_mut, isFunc, ty) <- derivedTypeOf base declr
+            when isFunc (badSource decl "use of function type")
+            return ty
         _ -> badSource decl "type name"
-    return ty
 ```
