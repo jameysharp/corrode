@@ -742,6 +742,7 @@ functionArgs _ (Right (args, variadic)) = do
                 Just (CRegister _) -> return ()
                 Just s -> badSource s "storage class specifier on argument"
             case declr of
+                [] -> return (Nothing, snd base)
                 [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
                     (mut, ty) <- derivedTypeOf base argdeclr
                     return (fmap ((,) mut) argname, ty)
