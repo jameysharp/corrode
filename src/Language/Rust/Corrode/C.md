@@ -1804,7 +1804,7 @@ derivedTypeOf = foldrM derive
         (args', variadic) <- functionArgs args
         return (c, IsFunc retTy (map snd args') variadic)
     derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
-    derive d _ = error ("cTypeOf: derived declarator not yet implemented " ++ show d)
+    derive (CArrDeclr quals _ _) (c, to) = return (mutable quals, IsPtr c to)
 
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
