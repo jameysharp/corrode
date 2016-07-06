@@ -212,14 +212,8 @@ file you hand it. See Corrode's `Main.hs` for the driver code.)
 translation unit, and returns a list of Rust AST top-level declaration
 items.
 
-The `a` type parameter is normally instantiated with language-c's
-[`NodeInfo`](http://hackage.haskell.org/package/language-c-0.5.0/docs/Language-C-Data-Node.html#t:NodeInfo)
-type, recording the position in the source file that the AST node came
-from. But we only care that it's something we can use `show` to get a
-string representation of, for debugging purposes.
-
 ```haskell
-interpretTranslationUnit :: Show a => CTranslationUnit a -> [Rust.Item]
+interpretTranslationUnit :: CTranslUnit -> [Rust.Item]
 interpretTranslationUnit (CTranslUnit decls _) = items'
     where
 ```
@@ -431,7 +425,7 @@ declaration. It returns a list of bindings constructed using
 `MakeBinding`, and also updates the environment and output as needed.
 
 ```haskell
-interpretDeclarations :: Show a => MakeBinding b -> CDeclaration a -> EnvMonad [b]
+interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad [b]
 interpretDeclarations makeBinding (CDecl specs decls _) = do
 ```
 
@@ -543,7 +537,7 @@ type of the variable we're initializing in order to figure out how to
 interpret the initializer.
 
 ```haskell
-interpretInitializer :: Show a => CType -> CInitializer a -> EnvMonad Rust.Expr
+interpretInitializer :: CType -> CInit -> EnvMonad Rust.Expr
 ```
 
 Initializers for compound types must be surrounded by braces. If we're
@@ -582,7 +576,7 @@ Function definitions
 A C function definition translates to a single Rust item.
 
 ```haskell
-interpretFunction :: Show a => CFunctionDef a -> EnvMonad Rust.Item
+interpretFunction :: CFunDef -> EnvMonad Rust.Item
 ```
 
 Function definitions can't be anonymous and their derived declarators
@@ -679,8 +673,7 @@ list of the arguments and a flag indicating whether the function is
 
 ```haskell
 functionArgs
-    :: Show a
-    => Either [Ident] ([CDeclaration a], Bool)
+    :: Either [Ident] ([CDecl], Bool)
     -> EnvMonad ([(Maybe (Rust.Mutable, Ident), CType)], Bool)
 ```
 
@@ -744,7 +737,7 @@ a statement in C is almost always an expression instead in Rust. So
 expression.
 
 ```haskell
-interpretStatement :: Show a => CStatement a -> EnvMonad Rust.Expr
+interpretStatement :: CStat -> EnvMonad Rust.Expr
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -952,7 +945,7 @@ as well as nested statements. `interpretBlockItem` produces a sequence
 of zero or more Rust statements for each compound block item.
 
 ```haskell
-interpretBlockItem :: Show a => CCompoundBlockItem a -> EnvMonad [Rust.Stmt]
+interpretBlockItem :: CBlockItem -> EnvMonad [Rust.Stmt]
 interpretBlockItem (CBlockStmt stmt) = do
     stmt' <- interpretStatement stmt
     return [Rust.Stmt stmt']
@@ -1021,7 +1014,7 @@ expressions, we have to generate extra Rust code if the result is
 needed.
 
 ```haskell
-interpretExpr :: Show n => Bool -> CExpression n -> EnvMonad Result
+interpretExpr :: Bool -> CExpr -> EnvMonad Result
 ```
 
 C's comma operator evaluates its left-hand expressions for their side
@@ -1747,7 +1740,7 @@ of Rust's byte literals.
 charType :: CType
 charType = IsInt Unsigned (BitWidth 8)
 
-baseTypeOf :: Show a => [CDeclarationSpecifier a] -> EnvMonad (Maybe (CStorageSpecifier a), (Rust.Mutable, CType))
+baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType))
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
     let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
@@ -1797,7 +1790,7 @@ baseTypeOf specs = do
             Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
     go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
 
-derivedTypeOf :: Show a => (Rust.Mutable, CType) -> [CDerivedDeclarator a] -> EnvMonad (Rust.Mutable, CType)
+derivedTypeOf :: (Rust.Mutable, CType) -> [CDerivedDeclr] -> EnvMonad (Rust.Mutable, CType)
 derivedTypeOf = foldrM derive
     where
     derive (CFunDeclr args _ _) (c, retTy) = do
@@ -1809,7 +1802,7 @@ derivedTypeOf = foldrM derive
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
-typeName :: Show a => CDeclaration a -> EnvMonad CType
+typeName :: CDecl -> EnvMonad CType
 typeName (CDecl spec declarators _) = do
     -- Storage class specifiers are not allowed on type names.
     (Nothing, base) <- baseTypeOf spec
