@@ -1330,7 +1330,6 @@ interpretExpr _ expr@(CCall func args _) = do
                 , isMutable = Rust.Immutable
                 , result = Rust.Call (result func') args'
                 }
-        IsPtr{} -> unimplemented expr
         _ -> badSource expr "function call to non-function"
     where
 ```
