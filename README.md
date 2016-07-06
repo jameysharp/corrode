@@ -15,6 +15,47 @@ Rust syntax. It's intended to be useful for two different purposes:
    warnings and errors that your C compiler misses, or you may be able
    to use a custom Rust linter to detect project-specific problems.
 
+## Quick Start
+
+As of now, there are no pre-built binaries available, so you need to build the
+project yourself, but don't let that scare you away; clone the project, `cd`
+into it and follow along :)
+
+The easiest way to build the project is to use the
+[Haskell Stack](http://haskellstack.org) tool. If you don't have it, head over
+to their website and follow the instructions for installing it on your machine.
+
+Install the Glasgow Haskell Compiler using ```stack setup```. You can skip this
+step if you already have a version of GHC installed your system.
+
+To build and install `corrode`, run:
+
+```
+stack install
+```
+
+Stack will build and install `corrode` to `~/.local/bin`. For ease of use, make
+sure that directory is in your `$PATH`.
+
+You can now run `corrode`, giving the file name as the first argument and
+optionally provide a list of `gcc` options:
+
+```
+corrode filename.c -Wall -lm
+```
+
+To experiment with the project itself, you can build it using
+
+```
+stack build
+```
+
+then run the executable:
+
+```bash
+stack exec -- corrode filename.c -Wall -lm
+```
+
 ## Design principles
 
 Corrode aims to produce Rust source code which behaves exactly the same
