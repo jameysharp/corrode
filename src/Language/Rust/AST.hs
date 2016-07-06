@@ -99,7 +99,7 @@ instance Pretty ExternItem where
             ( [ sep [pPrint v, text ":", pPrint t] | (v, t) <- args ]
             ++ if variadic then [text "..."] else []
             )
-        , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret <> text ";"
+        , text ")" <+> (if ret == TypeName "()" then empty else text "->" <+> pPrint ret) <> text ";"
         ]
     pPrint (ExternStatic mut var ty) = hsep
         [ text "static"
