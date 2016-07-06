@@ -528,9 +528,8 @@ definition appears in the same translation unit; do it and prune
 duplicates later.
 
 ```haskell
-            (CFunDeclr args _ _ : _, _) -> do
-                (args', variadic) <- functionArgs decl args
-                let (IsFunc retTy _ _) = ty
+            (CFunDeclr _ _ _ : _, _) -> do
+                let (IsFunc retTy args' variadic) = ty
                     formals =
                         [ (Rust.VarName argName, toRustType argTy)
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
@@ -627,7 +626,7 @@ must begin with CFunDeclr. Anything else is a syntax error.
 
 ```haskell
 interpretFunction (CFunDef specs
-        declr@(CDeclr (Just ident) (CFunDeclr args _ _ : _) _ _ _)
+        declr@(CDeclr (Just ident) (CFunDeclr _ _ _ : _) _ _ _)
     _ body _) = do
 ```
 
@@ -643,14 +642,14 @@ function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    (args', False) <- functionArgs declr args
     (storage, baseTy) <- baseTypeOf specs
     vis <- case storage of
         Nothing -> return Rust.Public
         Just (CStatic _) -> return Rust.Private
         Just s -> badSource s "storage class specifier for function"
     let name = identToString ident
-    (_mut, funTy@(IsFunc retTy _ _)) <- derivedTypeOf baseTy declr
+    (_mut, funTy@(IsFunc retTy args' variadic)) <- derivedTypeOf baseTy declr
+    when variadic (unimplemented declr)
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -714,52 +713,6 @@ Report a syntax error if the above pattern didn't match.
 
 ```haskell
 interpretFunction (CFunDef _ decl _ _ _) = badSource decl "function definition"
-```
-
-There are several places we need to process function argument lists.
-`functionArgs` distils language-c's represention of the gory details of
-C syntax down to just the information we need. Specifically, we return a
-list of the arguments and a flag indicating whether the function is
-"variadic", meaning that any number of additional arguments are allowed.
-
-```haskell
-functionArgs
-    :: CDeclr
-    -> Either [Ident] ([CDecl], Bool)
-    -> EnvMonad ([(Maybe (Rust.Mutable, Ident), CType)], Bool)
-```
-
-> **TODO**: Handling old-style function declarations is probably not
-> _too_ difficult...
-
-```haskell
-functionArgs decl (Left _) = unimplemented decl
-functionArgs _ (Right (args, variadic)) = do
-    args' <- sequence
-        [ do
-            (storage, base) <- baseTypeOf argspecs
-            case storage of
-                Nothing -> return ()
-                Just (CRegister _) -> return ()
-                Just s -> badSource s "storage class specifier on argument"
-            case declr of
-                [] -> return (Nothing, snd base)
-                [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
-                    (mut, ty) <- derivedTypeOf base argdeclr
-                    return (fmap ((,) mut) argname, ty)
-                _ -> badSource arg "function argument"
-        | arg@(CDecl argspecs declr _) <-
-```
-
-Treat argument lists `(void)` and `()` the same: we'll pretend that both
-mean the function takes no arguments.
-
-```haskell
-            case args of
-            [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
-            _ -> args
-        ]
-    return (args', variadic)
 ```
 
 
@@ -1324,7 +1277,7 @@ interpretExpr _ expr@(CCall func args _) = do
     func' <- interpretExpr True func
     case resultType func' of
         IsFunc retTy argTys variadic -> do
-            args' <- castArgs variadic argTys args
+            args' <- castArgs variadic (map snd argTys) args
             return Result
                 { resultType = retTy
                 , isMutable = Rust.Immutable
@@ -1805,7 +1758,7 @@ data CType
     | IsInt Signed IntWidth
     | IsFloat Int
     | IsVoid
-    | IsFunc CType [CType] Bool
+    | IsFunc CType [(Maybe (Rust.Mutable, Ident), CType)] Bool
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
     deriving (Show, Eq)
@@ -1824,7 +1777,7 @@ toRustType (IsFunc retTy args variadic) = Rust.TypeName $ concat
     where
     typename (toRustType -> Rust.TypeName t) = t
     args' = intercalate ", " (
-            map typename args ++ if variadic then ["..."] else []
+            map (typename . snd) args ++ if variadic then ["..."] else []
         )
 toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeName (rustMut mut ++ to')
     where
@@ -1899,9 +1852,39 @@ baseTypeOf specs = do
 derivedTypeOf :: (Rust.Mutable, CType) -> CDeclr -> EnvMonad (Rust.Mutable, CType)
 derivedTypeOf base declr@(CDeclr _ derived _ _ _) = foldrM derive base derived
     where
-    derive (CFunDeclr args _ _) (c, retTy) = do
-        (args', variadic) <- functionArgs declr args
-        return (c, IsFunc retTy (map snd args') variadic)
+```
+
+> **TODO**: Handling old-style function declarations is probably not
+> _too_ difficult...
+
+```haskell
+    derive (CFunDeclr (Left _) _ _) _ = unimplemented declr
+    derive (CFunDeclr (Right (args, variadic)) _ _) (c, retTy) = do
+        args' <- sequence
+            [ do
+                (storage, base') <- baseTypeOf argspecs
+                case storage of
+                    Nothing -> return ()
+                    Just (CRegister _) -> return ()
+                    Just s -> badSource s "storage class specifier on argument"
+                case declr' of
+                    [] -> return (Nothing, snd base')
+                    [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
+                        (mut, ty) <- derivedTypeOf base' argdeclr
+                        return (fmap ((,) mut) argname, ty)
+                    _ -> badSource arg "function argument"
+            | arg@(CDecl argspecs declr' _) <-
+```
+
+Treat argument lists `(void)` and `()` the same: we'll pretend that both
+mean the function takes no arguments.
+
+```haskell
+                case args of
+                [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
+                _ -> args
+            ]
+        return (c, IsFunc retTy args' variadic)
     derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
     derive (CArrDeclr quals _ _) (c, to) = return (mutable quals, IsPtr c to)
 
