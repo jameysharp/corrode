@@ -485,10 +485,10 @@ If there are any declarators, we need to figure out which kind of Rust
 declaration to emit for each one, if any.
 
 ```haskell
-    mbinds <- forM decls $ \ (Just decl@(CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
+    mbinds <- forM decls $ \ (Just decl@(CDeclr (Just ident) _ _ _ _), minit, Nothing) -> do
         (mut, ty) <- derivedTypeOf baseTy decl
         let name = identToString ident
-        case (derived, storagespecs) of
+        case (storagespecs, ty) of
 ```
 
 Typedefs must have a declarator which must not be abstract, and must not
@@ -504,7 +504,7 @@ environment.
 > always possible, so this requires careful thought.
 
 ```haskell
-            (_, Just (CTypedef _)) -> do
+            (Just (CTypedef _), _) -> do
                 addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
 ```
@@ -518,7 +518,7 @@ function definition must be in the same translation unit. We still need
 to have the function's type signature in the environment though.
 
 ```haskell
-            (CFunDeclr {} : _, Just (CStatic _)) -> do
+            (Just (CStatic _), IsFunc{}) -> do
                 addIdent (SymbolIdent ident) (mut, ty)
                 return Nothing
 ```
@@ -528,11 +528,10 @@ definition appears in the same translation unit; do it and prune
 duplicates later.
 
 ```haskell
-            (CFunDeclr _ _ _ : _, _) -> do
-                let (IsFunc retTy args' variadic) = ty
-                    formals =
+            (_, IsFunc retTy args variadic) -> do
+                let formals =
                         [ (Rust.VarName argName, toRustType argTy)
-                        | (idx, (mname, argTy)) <- zip [1 :: Int ..] args'
+                        | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
                 addIdent (SymbolIdent ident) (mut, ty)
@@ -545,7 +544,7 @@ non-extern declaration appears in the same translation unit; do it and
 prune duplicates later.
 
 ```haskell
-            (_, Just (CExtern _)) -> do
+            (Just (CExtern _), _) -> do
                 addIdent (SymbolIdent ident) (mut, ty)
                 emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
                 return Nothing
@@ -625,9 +624,7 @@ Function definitions can't be anonymous and their derived declarators
 must begin with CFunDeclr. Anything else is a syntax error.
 
 ```haskell
-interpretFunction (CFunDef specs
-        declr@(CDeclr (Just ident) (CFunDeclr _ _ _ : _) _ _ _)
-    _ body _) = do
+interpretFunction (CFunDef specs declr@(CDeclr (Just ident) _ _ _ _) _ body _) = do
 ```
 
 Translate into our internal representation the function's name, formal
@@ -648,8 +645,11 @@ we can put a `mut` keyword in the generated Rust.
         Just (CStatic _) -> return Rust.Private
         Just s -> badSource s "storage class specifier for function"
     let name = identToString ident
-    (_mut, funTy@(IsFunc retTy args' variadic)) <- derivedTypeOf baseTy declr
-    when variadic (unimplemented declr)
+    (_mut, funTy) <- derivedTypeOf baseTy declr
+    (retTy, args) <- case funTy of
+        IsFunc _ _ True -> unimplemented declr
+        IsFunc retTy args False -> return (retTy, args)
+        _ -> badSource declr "function definition"
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -684,7 +684,7 @@ Add each formal parameter into the new environment, tagged as
                     addIdent (SymbolIdent argname) (mut, ty)
                     return (mut, Rust.VarName (identToString argname), toRustType ty)
                 Nothing -> badSource declr "anonymous parameter"
-            | (arg, ty) <- args'
+            | (arg, ty) <- args
             ]
 ```
 
