@@ -27,12 +27,13 @@ useful data structures and control flow abstractions.
 module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
-import Control.Monad.Trans.RWS.Lazy
+import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
 import Data.Maybe
 import Language.C
 import qualified Language.Rust.AST as Rust
+import Text.PrettyPrint
 ```
 
 This translation proceeds in a syntax-directed way. That is, we just
@@ -191,6 +192,43 @@ emitExterns items = tell ([], items)
 ```
 
 
+Reporting errors
+================
+
+There will always be C source code that language-c parses happily but
+Corrode can't translate to Rust, and we should report as much helpful
+explanation as possible when that happens.
+
+```haskell
+noTranslation :: (Pretty node, Pos node) => node -> String -> EnvMonad a
+noTranslation node msg = fail $ concat
+    [ show (posOf node)
+    , ": "
+    , msg
+    , ":\n"
+    , render (nest 4 (pretty node))
+    ]
+```
+
+In some cases, we should be able to translate the given input, but the
+translation just hasn't been implemented yet.
+
+```haskell
+unimplemented :: (Pretty node, Pos node) => node -> EnvMonad a
+unimplemented node = noTranslation node "Corrode doesn't handle this yet"
+```
+
+Some C source is illegal according to the C standard but is nonetheless
+syntactically valid. Corrode does not promise to detect all of these
+cases, but we can call `badSource` when we do detect such an error.
+
+```haskell
+badSource :: (Pretty node, Pos node) => node -> String -> EnvMonad a
+badSource node msg = noTranslation node
+    ("illegal " ++ msg ++ "; check whether a real C compiler accepts this")
+```
+
+
 Top-level translation
 =====================
 
@@ -230,9 +268,9 @@ Specifically, we:
 
 ```haskell
     initFlow = ControlFlow
-        { functionReturnType = error "return statement outside function"
-        , onBreak = error "break statement outside loop"
-        , onContinue = error "continue statement outside loop"
+        { functionReturnType = flip badSource "return statement outside function"
+        , onBreak = flip badSource "break outside loop"
+        , onContinue = flip badSource "continue outside loop"
         }
     initState = EnvState
         { environment = []
@@ -252,7 +290,7 @@ three possible kinds for each declaration:
     perDecl (CDeclExt decl') = do
         binds <- interpretDeclarations makeStaticBinding decl'
         emitItems binds
-    perDecl (CAsmExt _ _) = return () -- FIXME: ignore assembly for now
+    perDecl decl = unimplemented decl
 ```
 
 Next we remove any locally-defined names from the list of external
@@ -446,8 +484,8 @@ If there are any declarators, we need to figure out which kind of Rust
 declaration to emit for each one, if any.
 
 ```haskell
-    mbinds <- forM decls $ \ (Just (CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
-        (mut, ty) <- derivedTypeOf baseTy derived
+    mbinds <- forM decls $ \ (Just decl@(CDeclr (Just ident) derived _ _ _), minit, Nothing) -> do
+        (mut, ty) <- derivedTypeOf baseTy decl
         let name = identToString ident
         case (derived, storagespecs) of
 ```
@@ -490,7 +528,7 @@ duplicates later.
 
 ```haskell
             (CFunDeclr args _ _ : _, _) -> do
-                (args', variadic) <- functionArgs args
+                (args', variadic) <- functionArgs decl args
                 let (IsFunc retTy _ _) = ty
                     formals =
                         [ (Rust.VarName argName, toRustType argTy)
@@ -552,11 +590,14 @@ that's a syntax error.
 > the `struct` type.
 
 ```haskell
-interpretInitializer (IsStruct str fields) ~(CInitList binds _)
-    = Rust.StructExpr str <$> sequence
-    [ (,) field <$> interpretInitializer ty initial
-    | ((field, ty), ~([], initial)) <- zip fields binds
-    ]
+interpretInitializer (IsStruct str fields) initial = case initial of
+    CInitList binds _ -> Rust.StructExpr str <$> sequence
+        [ case bind of
+            ([], v) -> (,) field <$> interpretInitializer ty v
+            _ -> unimplemented initial
+        | ((field, ty), bind) <- zip fields binds
+        ]
+    _ -> badSource initial "struct initializer"
 ```
 
 Initializers for scalar types must either be a bare expression or the
@@ -565,8 +606,9 @@ same surrounded by braces. Anything else is a syntax error.
 ```haskell
 interpretInitializer ty (CInitExpr initial _)
     = fmap (castTo ty) (interpretExpr True initial)
-interpretInitializer ty (CInitList ~[([], CInitExpr initial _)] _)
+interpretInitializer ty (CInitList [([], CInitExpr initial _)] _)
     = fmap (castTo ty) (interpretExpr True initial)
+interpretInitializer _ initial = badSource initial "scalar initializer"
 ```
 
 
@@ -584,7 +626,7 @@ must begin with CFunDeclr. Anything else is a syntax error.
 
 ```haskell
 interpretFunction (CFunDef specs
-        (CDeclr ~(Just ident) ~declarators@(CFunDeclr args _ _ : _) _ _ _)
+        declr@(CDeclr (Just ident) (CFunDeclr args _ _ : _) _ _ _)
     _ body _) = do
 ```
 
@@ -600,14 +642,14 @@ function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    (args', False) <- functionArgs args
+    (args', False) <- functionArgs declr args
     (storage, baseTy) <- baseTypeOf specs
-    let vis = case storage of
-            Nothing -> Rust.Public
-            Just (CStatic _) -> Rust.Private
-            Just s -> error ("interpretFunction: illegal storage specifier " ++ show s)
-        name = identToString ident
-    (_mut, funTy@(IsFunc retTy _ _)) <- derivedTypeOf baseTy declarators
+    vis <- case storage of
+        Nothing -> return Rust.Public
+        Just (CStatic _) -> return Rust.Private
+        Just s -> badSource s "storage class specifier for function"
+    let name = identToString ident
+    (_mut, funTy@(IsFunc retTy _ _)) <- derivedTypeOf baseTy declr
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -621,7 +663,7 @@ Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
 ```haskell
-    let setRetTy flow = flow { functionReturnType = retTy }
+    let setRetTy flow = flow { functionReturnType = const (return retTy) }
     local setRetTy $ scope $ do
 ```
 
@@ -637,10 +679,12 @@ Add each formal parameter into the new environment, tagged as
 
 ```haskell
         formals <- sequence
-            [ do
-                addIdent (SymbolIdent argname) (mut, ty)
-                return (mut, Rust.VarName (identToString argname), toRustType ty)
-            | ~(Just (mut, argname), ty) <- args'
+            [ case arg of
+                Just (mut, argname) -> do
+                    addIdent (SymbolIdent argname) (mut, ty)
+                    return (mut, Rust.VarName (identToString argname), toRustType ty)
+                Nothing -> badSource declr "anonymous parameter"
+            | (arg, ty) <- args'
             ]
 ```
 
@@ -665,6 +709,12 @@ expression.
         return (Rust.Item vis (Rust.Function name formals (toRustType retTy) block))
 ```
 
+Report a syntax error if the above pattern didn't match.
+
+```haskell
+interpretFunction (CFunDef _ decl _ _ _) = badSource decl "function definition"
+```
+
 There are several places we need to process function argument lists.
 `functionArgs` distils language-c's represention of the gory details of
 C syntax down to just the information we need. Specifically, we return a
@@ -673,7 +723,8 @@ list of the arguments and a flag indicating whether the function is
 
 ```haskell
 functionArgs
-    :: Either [Ident] ([CDecl], Bool)
+    :: CDeclr
+    -> Either [Ident] ([CDecl], Bool)
     -> EnvMonad ([(Maybe (Rust.Mutable, Ident), CType)], Bool)
 ```
 
@@ -681,27 +732,21 @@ functionArgs
 > _too_ difficult...
 
 ```haskell
-functionArgs (Left _) = error "old-style function declarations not supported"
-functionArgs (Right (args, variadic)) = do
+functionArgs decl (Left _) = unimplemented decl
+functionArgs _ (Right (args, variadic)) = do
     args' <- sequence
         [ do
-```
-
-> **TODO**: Accept storage class specifier `Just (CRegister _)`, but
-> ignore it unless the "address not taken" semantics let us generate
-> better code.
-
-> **XXX**: Is storage class specifier `Just (CAuto _)` legal? If so I
-> think it should have no effect.
-
-I'm pretty sure no other storage class specifiers are allowed on
-function arguments.
-
-```haskell
-            (Nothing, base) <- baseTypeOf argspecs
-            (mut, ty) <- derivedTypeOf base derived
-            return (fmap ((,) mut) argname, ty)
-        | CDecl argspecs [(Just (CDeclr argname derived _ _ _), Nothing, Nothing)] _ <-
+            (storage, base) <- baseTypeOf argspecs
+            case storage of
+                Nothing -> return ()
+                Just (CRegister _) -> return ()
+                Just s -> badSource s "storage class specifier on argument"
+            case declr of
+                [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
+                    (mut, ty) <- derivedTypeOf base argdeclr
+                    return (fmap ((,) mut) argname, ty)
+                _ -> badSource arg "function argument"
+        | arg@(CDecl argspecs declr _) <-
 ```
 
 Treat argument lists `(void)` and `()` the same: we'll pretend that both
@@ -725,9 +770,9 @@ that context up in a simple data type.
 
 ```haskell
 data ControlFlow = ControlFlow
-    { functionReturnType :: CType
-    , onBreak :: Rust.Expr
-    , onContinue :: Rust.Expr
+    { functionReturnType :: CStat -> EnvMonad CType
+    , onBreak :: CStat -> EnvMonad Rust.Expr
+    , onContinue :: CStat -> EnvMonad Rust.Expr
     }
 ```
 
@@ -898,8 +943,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement (CCont _) = asks onContinue
-interpretStatement (CBreak _) = asks onBreak
+interpretStatement stmt@(CCont _) = getFlow stmt onContinue
+interpretStatement stmt@(CBreak _) = getFlow stmt onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -910,8 +955,8 @@ declared return type, then we need to insert a type-cast to the correct
 type.
 
 ```haskell
-interpretStatement (CReturn expr _) = do
-    retTy <- asks functionReturnType
+interpretStatement stmt@(CReturn expr _) = do
+    retTy <- getFlow stmt functionReturnType
     expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
     return (Rust.Return expr')
 ```
@@ -922,7 +967,19 @@ translation for yet.
 > **TODO**: Translate more kinds of statements. `:-)`
 
 ```haskell
-interpretStatement stmt = error ("interpretStatement: unsupported statement " ++ show stmt)
+interpretStatement stmt = unimplemented stmt
+```
+
+The fields in `ControlFlow` are monadic actions which take a C statement
+as an argument, so that if there's an error we can report which
+statement was at fault. `getFlow` is a helper function to thread
+everything through correctly.
+
+```haskell
+getFlow :: CStat -> (ControlFlow -> CStat -> EnvMonad a) -> EnvMonad a
+getFlow stmt kind = do
+    val <- asks kind
+    val stmt
 ```
 
 Inside loops above, we needed to update the translation to use if either
@@ -933,7 +990,7 @@ expressions.
 ```haskell
 loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad a
 loopScope b c = local $ \ flow ->
-    flow { onBreak = b, onContinue = c }
+    flow { onBreak = const (return b), onContinue = const (return c) }
 ```
 
 
@@ -950,7 +1007,7 @@ interpretBlockItem (CBlockStmt stmt) = do
     stmt' <- interpretStatement stmt
     return [Rust.Stmt stmt']
 interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
-interpretBlockItem item = error ("interpretBlockItem: unsupported statement " ++ show item)
+interpretBlockItem item = unimplemented item
 ```
 
 `toBlock` is a helper function which turns a Rust expression into a list
@@ -1044,8 +1101,10 @@ the left-hand and right-hand sides recursively, we just delegate to the
 `compound` helper function defined below.
 
 ```haskell
-interpretExpr demand (CAssign op lhs rhs _) =
-    compound False demand op <$> interpretExpr True lhs <*> interpretExpr True rhs
+interpretExpr demand expr@(CAssign op lhs rhs _) = do
+    lhs' <- interpretExpr True lhs
+    rhs' <- interpretExpr True rhs
+    compound expr False demand op lhs' rhs'
 ```
 
 C's ternary conditional operator (`c ? t : f`) translates fairly
@@ -1060,13 +1119,13 @@ correct by wrapping the true and false branches in statements rather
 than placing them as block-final expressions.
 
 ```haskell
-interpretExpr demand (CCond c (Just t) f _) = do
+interpretExpr demand expr@(CCond c (Just t) f _) = do
     c' <- fmap toBool (interpretExpr True c)
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
-    return $ if demand
-        then promote (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
-        else Result
+    if demand
+        then promote expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
+        else return Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
             , result = Rust.IfThenElse c' (Rust.Block (toBlock (result t')) Nothing) (Rust.Block (toBlock (result f')) Nothing)
@@ -1078,8 +1137,10 @@ left-hand and right-hand sides recursively, we just delegate to the
 `binop` helper function defined below.
 
 ```haskell
-interpretExpr _ (CBinary op lhs rhs _) =
-    binop op <$> interpretExpr True lhs <*> interpretExpr True rhs
+interpretExpr _ expr@(CBinary op lhs rhs _) = do
+    lhs' <- interpretExpr True lhs
+    rhs' <- interpretExpr True rhs
+    binop expr op lhs' rhs'
 ```
 
 C's cast operator corresponds exactly to Rust's cast operator. The
@@ -1101,11 +1162,11 @@ We de-sugar the pre/post-increment/decrement operators into compound
 assignment operators and call the common assignment helper.
 
 ```haskell
-interpretExpr demand (CUnary op expr _) = case op of
-    CPreIncOp -> compound False demand CAddAssOp <$> interpretExpr True expr <*> one
-    CPreDecOp -> compound False demand CSubAssOp <$> interpretExpr True expr <*> one
-    CPostIncOp -> compound True demand CAddAssOp <$> interpretExpr True expr <*> one
-    CPostDecOp -> compound True demand CSubAssOp <$> interpretExpr True expr <*> one
+interpretExpr demand node@(CUnary op expr _) = case op of
+    CPreIncOp -> incdec False CAddAssOp
+    CPreDecOp -> incdec False CSubAssOp
+    CPostIncOp -> incdec True CAddAssOp
+    CPostDecOp -> incdec True CSubAssOp
 ```
 
 We translate C's address-of operator (unary prefix `&`) to either a
@@ -1139,12 +1200,13 @@ on whether the pointer was to a mutable value.
 ```haskell
     CIndOp -> do
         expr' <- interpretExpr True expr
-        let IsPtr mut' ty' = resultType expr'
-        return Result
-            { resultType = ty'
-            , isMutable = mut'
-            , result = Rust.Deref (result expr')
-            }
+        case resultType expr' of
+            IsPtr mut' ty' -> return Result
+                { resultType = ty'
+                , isMutable = mut'
+                , result = Rust.Deref (result expr')
+                }
+            _ -> badSource node "dereference of non-pointer"
 ```
 
 Ah, unary plus. My favorite. Rust does not have a unary plus operator,
@@ -1209,11 +1271,13 @@ Common helpers for the unary operators:
 
 ```haskell
     where
-    one = return Result
-        { resultType = IsInt Signed (BitWidth 32)
-        , isMutable = Rust.Immutable
-        , result = 1
-        }
+    incdec returnOld assignop = do
+        expr' <- interpretExpr True expr
+        compound node returnOld demand assignop expr' Result
+            { resultType = IsInt Signed (BitWidth 32)
+            , isMutable = Rust.Immutable
+            , result = 1
+            }
     simple f = do
         expr' <- interpretExpr True expr
         let ty' = intPromote (resultType expr')
@@ -1254,14 +1318,18 @@ Function calls first translate the expression which identifies which
 function to call, and any argument expressions.
 
 ```haskell
-interpretExpr _ (CCall func args _) = do
-    Result { resultType = IsFunc retTy argTys variadic, result = func' } <- interpretExpr True func
-    args' <- castArgs variadic argTys args
-    return Result
-        { resultType = retTy
-        , isMutable = Rust.Immutable
-        , result = Rust.Call func' args'
-        }
+interpretExpr _ expr@(CCall func args _) = do
+    func' <- interpretExpr True func
+    case resultType func' of
+        IsFunc retTy argTys variadic -> do
+            args' <- castArgs variadic argTys args
+            return Result
+                { resultType = retTy
+                , isMutable = Rust.Immutable
+                , result = Rust.Call (result func') args'
+                }
+        IsPtr{} -> unimplemented expr
+        _ -> badSource expr "function call to non-function"
     where
 ```
 
@@ -1283,8 +1351,8 @@ type specified, or it's a syntax error.
         args' <- castArgs variadic tys rest
         return (castTo ty arg' : args')
     castArgs True [] rest = mapM (fmap result . interpretExpr True) rest
-    castArgs False [] _ = error "too many arguments in function call"
-    castArgs _ _ [] = error "too few arguments in function call"
+    castArgs False [] _ = badSource expr "arguments (too many)"
+    castArgs _ _ [] = badSource expr "arguments (too few)"
 ```
 
 Structure member access has two forms in C (`.` and `->`), which only
@@ -1295,11 +1363,15 @@ the result is a legal l-value if and only if the larger object was a
 legal l-value.
 
 ```haskell
-interpretExpr _ (CMember obj ident deref node) = do
+interpretExpr _ expr@(CMember obj ident deref node) = do
     obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
-    let IsStruct _ fields = resultType obj'
+    fields <- case resultType obj' of
+        IsStruct _ fields -> return fields
+        _ -> badSource expr "member access of non-struct"
     let field = identToString ident
-    let Just ty = lookup field fields
+    ty <- case lookup field fields of
+        Just ty -> return ty
+        Nothing -> badSource expr "request for non-existent field"
     return Result
         { resultType = ty
         , isMutable = isMutable obj'
@@ -1314,7 +1386,7 @@ and whether taking its address should produce a mutable or immutable
 pointer.
 
 ```haskell
-interpretExpr _ (CVar ident _) = do
+interpretExpr _ expr@(CVar ident _) = do
     sym <- getIdent (SymbolIdent ident)
     case sym of
         Just (mut, ty) -> return Result
@@ -1322,7 +1394,7 @@ interpretExpr _ (CVar ident _) = do
             , isMutable = mut
             , result = Rust.Var (Rust.VarName (identToString ident))
             }
-        Nothing -> error ("interpretExpr: reference to undefined variable " ++ identToString ident)
+        Nothing -> badSource expr "undefined variable"
 ```
 
 C literals (integer, floating-point, character, and string) translate to
@@ -1337,17 +1409,17 @@ similar tokens in Rust.
 > **TODO**: Translate wide character and string literals.
 
 ```haskell
-interpretExpr _ (CConst c) = return $ case c of
+interpretExpr _ expr@(CConst c) = case c of
     CIntConst (CInteger v _repr flags) _ ->
         let s = if testFlag FlagUnsigned flags then Unsigned else Signed
             w = if testFlag FlagLongLong flags || testFlag FlagLong flags
                 then WordWidth
                 else BitWidth 32
-        in literalNumber (IsInt s w) (show v)
+        in return (literalNumber (IsInt s w) (show v))
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> literalNumber (IsFloat 64) v
-        (v, [_]) -> literalNumber (IsFloat 32) v
-        _ -> error ("interpretExpr: failed to parse float " ++ show str)
+        (v, "") -> return (literalNumber (IsFloat 64) v)
+        (v, [_]) -> return (literalNumber (IsFloat 32) v)
+        _ -> badSource expr "float"
 ```
 
 Rust's `char` type is for Unicode characters, so it's quite different
@@ -1357,7 +1429,7 @@ strings need to be translated to Rust's "byte literals" (`b'?'`,
 syntax.
 
 ```haskell
-    CCharConst (CChar ch False) _ -> Result
+    CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
         , isMutable = Rust.Immutable
         , result = Rust.Lit (Rust.LitRep ("b'" ++ rustByteLit ch ++ "'"))
@@ -1375,14 +1447,14 @@ raw pointer for us. Note that since string literals have `'static`
 lifetime, the resulting raw pointer is always safe to use.
 
 ```haskell
-    CStrConst (CString str False) _ -> Result
+    CStrConst (CString str False) _ -> return Result
         { resultType = IsPtr Rust.Immutable charType
         , isMutable = Rust.Immutable
         , result = Rust.MethodCall (Rust.Lit (
                 Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")
             )) (Rust.VarName "as_ptr") []
         }
-    _ -> error "interpretExpr: wide character literals not implemented yet"
+    _ -> unimplemented expr
     where
 ```
 
@@ -1445,7 +1517,7 @@ interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
 Otherwise, we have not yet implemented this kind of expression.
 
 ```haskell
-interpretExpr _ e = error ("interpretExpr: unsupported expression " ++ show e)
+interpretExpr _ expr = unimplemented expr
 ```
 
 > **TODO**: Document these expression helper functions.
@@ -1462,44 +1534,46 @@ wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
     _ -> r
 wrapping r = r
 
-binop :: CBinaryOp -> Result -> Result -> Result
-binop op lhs rhs = wrapping $ case op of
-    CMulOp -> promote Rust.Mul lhs rhs
-    CDivOp -> promote Rust.Div lhs rhs
-    CRmdOp -> promote Rust.Mod lhs rhs
+binop :: CExpr -> CBinaryOp -> Result -> Result -> EnvMonad Result
+binop expr op lhs rhs = fmap wrapping $ case op of
+    CMulOp -> promote expr Rust.Mul lhs rhs
+    CDivOp -> promote expr Rust.Div lhs rhs
+    CRmdOp -> promote expr Rust.Mod lhs rhs
     CAddOp -> case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, _) -> lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs] }
-        (_, IsPtr _ _) -> rhs { result = Rust.MethodCall (result rhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs] }
-        _ -> promote Rust.Add lhs rhs
+        (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs] }
+        (_, IsPtr _ _) -> return rhs { result = Rust.MethodCall (result rhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs] }
+        _ -> promote expr Rust.Add lhs rhs
     CSubOp -> case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> error "not sure how to translate pointer difference to Rust"
-        (IsPtr _ _, _) -> lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
-        _ -> promote Rust.Sub lhs rhs
-    CShlOp -> promote Rust.ShiftL lhs rhs
-    CShrOp -> promote Rust.ShiftR lhs rhs
+        (IsPtr _ _, IsPtr _ _) -> unimplemented expr
+        (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
+        _ -> promote expr Rust.Sub lhs rhs
+    CShlOp -> promote expr Rust.ShiftL lhs rhs
+    CShrOp -> promote expr Rust.ShiftR lhs rhs
     CLeOp -> comparison Rust.CmpLT
     CGrOp -> comparison Rust.CmpGT
     CLeqOp -> comparison Rust.CmpLE
     CGeqOp -> comparison Rust.CmpGE
     CEqOp -> comparison Rust.CmpEQ
     CNeqOp -> comparison Rust.CmpNE
-    CAndOp -> promote Rust.And lhs rhs
-    CXorOp -> promote Rust.Xor lhs rhs
-    COrOp -> promote Rust.Or lhs rhs
-    CLndOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
-    CLorOp -> Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
+    CAndOp -> promote expr Rust.And lhs rhs
+    CXorOp -> promote expr Rust.Xor lhs rhs
+    COrOp -> promote expr Rust.Or lhs rhs
+    CLndOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
+    CLorOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
     where
     comparison op' = case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> promotePtr op' lhs rhs
-        _ -> (promote op' lhs rhs) { resultType = IsBool }
+        (IsPtr _ _, IsPtr _ _) -> return (promotePtr op' lhs rhs)
+        _ -> do
+            res <- promote expr op' lhs rhs
+            return res { resultType = IsBool }
 
 isSimple :: Rust.Expr -> Bool
 isSimple (Rust.Var{}) = True
 isSimple (Rust.Deref p) = isSimple p
 isSimple _ = False
 
-compound :: Bool -> Bool -> CAssignOp -> Result -> Result -> Result
-compound returnOld demand op lhs rhs =
+compound :: CExpr -> Bool -> Bool -> CAssignOp -> Result -> Result -> EnvMonad Result
+compound expr returnOld demand op lhs rhs = do
     let op' = case op of
             CAssignOp -> Nothing
             CMulAssOp -> Just CMulOp
@@ -1520,7 +1594,6 @@ compound returnOld demand op lhs rhs =
                 in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs))
                     , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs)))
                     ], lhs { result = Rust.Deref (Rust.Var lhsvar) }, rhs { result = Rust.Var rhsvar })
-        assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs) (case op' of Just o -> binop o dereflhs boundrhs; Nothing -> boundrhs))
         (bindings2, ret) = if not demand
             then ([], Nothing)
             else if not returnOld
@@ -1528,15 +1601,20 @@ compound returnOld demand op lhs rhs =
             else
                 let oldvar = Rust.VarName "_old"
                 in ([Rust.Let Rust.Immutable oldvar Nothing (Just (result dereflhs))], Just (Rust.Var oldvar))
-    in case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
-    b@(Rust.Block body Nothing) -> Result
-        { resultType = IsVoid
-        , isMutable = Rust.Immutable
-        , result = case body of
-            [Rust.Stmt e] -> e
-            _ -> Rust.BlockExpr b
-        }
-    b -> lhs { result = Rust.BlockExpr b }
+    assignment <- Rust.Assign (result dereflhs) (Rust.:=) <$> fmap (castTo (resultType lhs)) (
+            case op' of
+            Just o -> binop expr o dereflhs boundrhs
+            Nothing -> return boundrhs
+        )
+    return $ case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
+        b@(Rust.Block body Nothing) -> Result
+            { resultType = IsVoid
+            , isMutable = Rust.Immutable
+            , result = case body of
+                [Rust.Stmt e] -> e
+                _ -> Rust.BlockExpr b
+            }
+        b -> lhs { result = Rust.BlockExpr b }
 ```
 
 Implicit type coercions
@@ -1631,16 +1709,16 @@ evaluated at.
 > should get checked.
 
 ```haskell
-usual :: CType -> CType -> CType
-usual (IsFloat aw) (IsFloat bw) = IsFloat (max aw bw)
-usual a@(IsFloat _) _ = a
-usual _ b@(IsFloat _) = b
+usual :: CType -> CType -> Maybe CType
+usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
+usual a@(IsFloat _) _ = Just a
+usual _ b@(IsFloat _) = Just b
 usual a@(intPromote -> IsInt as aw) b@(intPromote -> IsInt bs bw)
-    | a == b = a
-    | as == bs = IsInt as (max aw bw)
-    | as == Unsigned = if aw >= bw then a else b
-    | otherwise      = if bw >= aw then b else a
-usual a b = error ("attempt to apply arithmetic conversions to " ++ show a ++ " and " ++ show b)
+    | a == b = Just a
+    | as == bs = Just (IsInt as (max aw bw))
+    | as == Unsigned = Just (if aw >= bw then a else b)
+    | otherwise      = Just (if bw >= aw then b else a)
+usual _ _ = Nothing
 ```
 
 Here's a helper function to apply the usual arithmetic conversions to
@@ -1648,11 +1726,23 @@ both operands of a binary operator, cast as needed, and then combine the
 operands using an arbitrary Rust binary operator.
 
 ```haskell
-promote :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promote op a b = Result { resultType = rt, isMutable = Rust.Immutable, result = rv }
-    where
-    rt = usual (resultType a) (resultType b)
-    rv = op (castTo rt a) (castTo rt b)
+promote
+    :: (Pretty node, Pos node)
+    => node
+    -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
+    -> Result -> Result -> EnvMonad Result
+promote node op a b = case usual (resultType a) (resultType b) of
+    Just rt -> return Result
+        { resultType = rt
+        , isMutable = Rust.Immutable
+        , result = op (castTo rt a) (castTo rt b)
+        }
+    Nothing -> badSource node $ concat
+        [ "arithmetic combination for "
+        , show (resultType a)
+        , " and "
+        , show (resultType b)
+        ]
 ```
 
 `compatiblePtr` implements the equivalent of the "usual arithmetic
@@ -1744,10 +1834,10 @@ baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType)
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
     let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
-    let mstorage = case storage of
-            [] -> Nothing
-            [spec] -> Just spec
-            _ -> error ("too many storage class specifiers: " ++ show storage)
+    mstorage <- case storage of
+        [] -> return Nothing
+        [spec] -> return (Just spec)
+        _ : excess : _ -> badSource excess "extra storage class specifier"
     base <- foldrM go (mutable basequals, IsInt Signed (BitWidth 32)) basespecs
     return (mstorage, base)
     where
@@ -1769,12 +1859,17 @@ baseTypeOf specs = do
             -- FIXME: treating incomplete types as having no fields, but that's probably wrong
             Nothing -> IsStruct (identToString ident) []
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
-        fields <- fmap concat $ forM declarations $ \ (CDecl spec decls _) -> do
-            -- storage class specifiers are not allowed inside struct definitions
-            (Nothing, base) <- baseTypeOf spec
-            forM decls $ \ (Just (CDeclr (Just field) fieldDerived Nothing [] _), Nothing, Nothing) -> do
-                (_mut, ty) <- derivedTypeOf base fieldDerived
-                return (identToString field, ty)
+        fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
+            (storage, base) <- baseTypeOf spec
+            case storage of
+                Just s -> badSource s "storage class specifier in struct"
+                Nothing -> return ()
+            forM decls $ \ decl -> case decl of
+                (Just declr@(CDeclr (Just field) _ _ _ _), Nothing, Nothing) -> do
+                    (_mut, ty) <- derivedTypeOf base declr
+                    return (identToString field, ty)
+                (_, Nothing, Just _size) -> unimplemented declaration
+                _ -> badSource declaration "field in struct"
         name <- case mident of
             Just ident -> do
                 let name = identToString ident
@@ -1783,18 +1878,18 @@ baseTypeOf specs = do
             Nothing -> uniqueName "Struct"
         emitItems [Rust.Item Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
-    go (CTypeDef ident _) (mut1, _) = do
+    go spec@(CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
-            Nothing -> error ("cTypeOf: reference to undefined type " ++ identToString ident)
-    go spec _ = error ("cTypeOf: unsupported type specifier " ++ show spec)
+            Nothing -> badSource spec "undefined type"
+    go spec _ = unimplemented spec
 
-derivedTypeOf :: (Rust.Mutable, CType) -> [CDerivedDeclr] -> EnvMonad (Rust.Mutable, CType)
-derivedTypeOf = foldrM derive
+derivedTypeOf :: (Rust.Mutable, CType) -> CDeclr -> EnvMonad (Rust.Mutable, CType)
+derivedTypeOf base declr@(CDeclr _ derived _ _ _) = foldrM derive base derived
     where
     derive (CFunDeclr args _ _) (c, retTy) = do
-        (args', variadic) <- functionArgs args
+        (args', variadic) <- functionArgs declr args
         return (c, IsFunc retTy (map snd args') variadic)
     derive (CPtrDeclr quals _) (c, to) = return (mutable quals, IsPtr c to)
     derive (CArrDeclr quals _ _) (c, to) = return (mutable quals, IsPtr c to)
@@ -1803,13 +1898,16 @@ mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
 typeName :: CDecl -> EnvMonad CType
-typeName (CDecl spec declarators _) = do
-    -- Storage class specifiers are not allowed on type names.
-    (Nothing, base) <- baseTypeOf spec
+typeName decl@(CDecl spec declarators _) = do
+    (storage, base) <- baseTypeOf spec
+    case storage of
+        Just s -> badSource s "storage class specifier in type name"
+        Nothing -> return ()
     -- Declaration mutability has no effect in type names.
-    (_mut, ty) <- derivedTypeOf base $ case declarators of
-        [] -> []
-        [(Just (CDeclr Nothing derived _ _ _), Nothing, Nothing)] -> derived
-        _ -> error ("invalid type name " ++ show declarators)
+    (_mut, ty) <- case declarators of
+        [] -> return base
+        [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] ->
+            derivedTypeOf base declr
+        _ -> badSource decl "type name"
     return ty
 ```
