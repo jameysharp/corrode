@@ -28,6 +28,7 @@ module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
 import Control.Monad.Trans.RWS.Lazy
+import Data.Char
 import Data.Foldable
 import Data.Maybe
 import Language.C
@@ -1340,7 +1341,7 @@ similar tokens in Rust.
 > **TODO**: Figure out what to do about floating-point hex literals,
 > which as far as I can tell Rust doesn't support (yet?).
 
-> **TODO**: Translate character and string literals.
+> **TODO**: Translate wide character and string literals.
 
 ```haskell
 interpretExpr _ (CConst c) = return $ case c of
@@ -1349,20 +1350,86 @@ interpretExpr _ (CConst c) = return $ case c of
             w = if testFlag FlagLongLong flags || testFlag FlagLong flags
                 then WordWidth
                 else BitWidth 32
-        in litResult (IsInt s w) (show v)
+        in literalNumber (IsInt s w) (show v)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> litResult (IsFloat 64) v
-        (v, [_]) -> litResult (IsFloat 32) v
+        (v, "") -> literalNumber (IsFloat 64) v
+        (v, [_]) -> literalNumber (IsFloat 32) v
         _ -> error ("interpretExpr: failed to parse float " ++ show str)
-    _ -> error "interpretExpr: non-integer literals not implemented yet"
+```
+
+Rust's `char` type is for Unicode characters, so it's quite different
+from C's 8-bit `char` type. As a result, C character literals and
+strings need to be translated to Rust's "byte literals" (`b'?'`,
+`b"..."`) rather than the more familiar character and string literal
+syntax.
+
+```haskell
+    CCharConst (CChar ch False) _ -> Result
+        { resultType = charType
+        , isMutable = Rust.Immutable
+        , result = Rust.Lit (Rust.LitRep ("b'" ++ rustByteLit ch ++ "'"))
+        }
+```
+
+In C, string literals get a terminating NUL character added at the end.
+Rust byte string literals do not, so we need to append one in the
+translation.
+
+In Rust, the type of a byte string literal of length `n` is `&'static
+[u8; n]`. We need a raw pointer instead to match C's semantics.
+Conveniently, Rust slices have an `.as_ptr()` method which extracts a
+raw pointer for us. Note that since string literals have `'static`
+lifetime, the resulting raw pointer is always safe to use.
+
+```haskell
+    CStrConst (CString str False) _ -> Result
+        { resultType = IsPtr Rust.Immutable charType
+        , isMutable = Rust.Immutable
+        , result = Rust.MethodCall (Rust.Lit (
+                Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")
+            )) (Rust.VarName "as_ptr") []
+        }
+    _ -> error "interpretExpr: wide character literals not implemented yet"
     where
-    litResult ty v =
+```
+
+A number like `42` gives no information about which type it should be.
+In Rust, we can suffix a numeric literal with its type name, so `42i8`
+has type `i8`, while `42f32` has type `f32`. `literalNumber` abuses the
+fact that our Rust AST representation of a type is just a string to get
+the right suffix for these literals.
+
+Rust allows unsuffixed numeric literals, in which case it will try to
+infer from the surrounding context what type the number should have.
+However, we don't want to rely on Rust's inference rules here because we
+need to match C's rules instead.
+
+```haskell
+    literalNumber ty v =
         let Rust.TypeName suffix = toRustType ty
         in Result
             { resultType = ty
             , isMutable = Rust.Immutable
             , result = Rust.Lit (Rust.LitRep (v ++ suffix))
             }
+```
+
+Rust character and string literals have only a few special escape
+sequences, so we can't reuse any functions for escaping Haskell or C
+strings.
+
+```haskell
+    rustByteLit '"' = "\\\""
+    rustByteLit '\'' = "\\'"
+    rustByteLit '\n' = "\\n"
+    rustByteLit '\r' = "\\r"
+    rustByteLit '\t' = "\\t"
+    rustByteLit '\\' = "\\\\"
+    rustByteLit '\NUL' = "\\0"
+    rustByteLit ch | ch >= ' ' && ch <= '~' = [ch]
+    rustByteLit ch = "\\x" ++
+        let (u, l) = ord ch `divMod` 16
+        in map (toUpper . intToDigit) [u, l]
 ```
 
 GCC's "statement expression" extension translates pretty directly to
@@ -1670,6 +1737,15 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
+```
+
+C leaves it up to the implementation to decide whether the base `char`
+type is signed or unsigned. We choose unsigned, because that's the type
+of Rust's byte literals.
+
+```haskell
+charType :: CType
+charType = IsInt Unsigned (BitWidth 8)
 
 baseTypeOf :: Show a => [CDeclarationSpecifier a] -> EnvMonad (Maybe (CStorageSpecifier a), (Rust.Mutable, CType))
 baseTypeOf specs = do
@@ -1684,7 +1760,7 @@ baseTypeOf specs = do
     where
     go (CSignedType _) (mut, IsInt _ width) = return (mut, IsInt Signed width)
     go (CUnsigType _) (mut, IsInt _ width) = return (mut, IsInt Unsigned width)
-    go (CCharType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 8))
+    go (CCharType _) (mut, _) = return (mut, charType)
     go (CShortType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 16))
     go (CIntType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 32))
     go (CLongType _) (mut, IsInt s _) = return (mut, IsInt s WordWidth)
