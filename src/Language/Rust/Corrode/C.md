@@ -31,6 +31,7 @@ import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
 import Data.Maybe
+import Data.List
 import Language.C
 import qualified Language.Rust.AST as Rust
 import Text.PrettyPrint
@@ -1815,7 +1816,17 @@ toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
 toRustType IsVoid = Rust.TypeName "()"
-toRustType (IsFunc _ _ _) = error "toRustType: not implemented for IsFunc"
+toRustType (IsFunc retTy args variadic) = Rust.TypeName $ concat
+    [ "unsafe extern fn("
+    , args'
+    , ")"
+    , if retTy /= IsVoid then " -> " ++ typename retTy else ""
+    ]
+    where
+    typename (toRustType -> Rust.TypeName t) = t
+    args' = intercalate ", " (
+            map typename args ++ if variadic then ["..."] else []
+        )
 toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeName (rustMut mut ++ to')
     where
     rustMut Rust.Mutable = "*mut "
