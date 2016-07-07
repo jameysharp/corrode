@@ -1270,6 +1270,27 @@ interpretExpr _ (CAlignofType decl _) = do
         }
 ```
 
+C's array index or array subscript operator, `e1[e2]`, works just like
+adding the two expressions and dereferencing the result. Note that in
+the C expression `e1[e2]`, although we usually expect `e1` to be a
+pointer and `e2` to be an integer, C permits them to be the other way
+around. Fortunately, C's pointer addition is also commutative so calling
+our `binop` helper here does the right thing.
+
+```haskell
+interpretExpr _ expr@(CIndex lhs rhs _) = do
+    lhs' <- interpretExpr True lhs
+    rhs' <- interpretExpr True rhs
+    ptr <- binop expr CAddOp lhs' rhs'
+    case resultType ptr of
+        IsPtr mut ty -> return Result
+            { resultType = ty
+            , isMutable = mut
+            , result = Rust.Deref (result ptr)
+            }
+        _ -> badSource expr "array subscript of non-pointer"
+```
+
 Function calls first translate the expression which identifies which
 function to call, and any argument expressions.
 
