@@ -302,8 +302,8 @@ for this translation unit it becomes clear.
 ```haskell
     itemNames = catMaybes
         [ case item of
-            Rust.Item _ (Rust.Function name _ _ _) -> Just name
-            Rust.Item _ (Rust.Static _ (Rust.VarName name) _ _) -> Just name
+            Rust.Item _ _ (Rust.Function name _ _ _) -> Just name
+            Rust.Item _ _ (Rust.Static _ (Rust.VarName name) _ _) -> Just name
             _ -> Nothing
         | item <- items
         ]
@@ -320,7 +320,7 @@ items, by convention.
 ```haskell
     items' = if null externs'
         then items
-        else Rust.Item Rust.Private (Rust.Extern externs') : items
+        else Rust.Item [] Rust.Private (Rust.Extern externs') : items
 ```
 
 
@@ -369,8 +369,10 @@ define here for convenient use elsewhere.
 
 ```haskell
 makeStaticBinding :: MakeBinding Rust.Item
-makeStaticBinding mut var ty mexpr = Rust.Item Rust.Private
+makeStaticBinding mut var ty mexpr = Rust.Item attrs Rust.Private
     (Rust.Static mut var ty (fromMaybe 0 mexpr))
+    where
+    attrs = [Rust.Attribute "no_mangle"]
 
 makeLetBinding :: MakeBinding Rust.Stmt
 makeLetBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
@@ -707,7 +709,8 @@ expression.
 
 ```haskell
         let block = Rust.Block (toBlock body') Nothing
-        return (Rust.Item vis (Rust.Function name formals (toRustType retTy) block))
+        let attrs = [Rust.Attribute "no_mangle"]
+        return (Rust.Item attrs vis (Rust.Function name formals (toRustType retTy) block))
 ```
 
 Report a syntax error if the above pattern didn't match.
@@ -1863,7 +1866,8 @@ baseTypeOf specs = do
                 addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
                 return name
             Nothing -> uniqueName "Struct"
-        emitItems [Rust.Item Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
+        let attrs = [Rust.Attribute "derive(Clone, Copy)"]
+        emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
     go spec@(CTypeDef ident _) (mut1, _) = do
         mty <- getIdent (TypedefIdent ident)

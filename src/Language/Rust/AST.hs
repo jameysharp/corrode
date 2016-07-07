@@ -55,10 +55,13 @@ pPrintBlock :: Doc -> Block -> Doc
 pPrintBlock pre (Block [] e) = sep [pre <+> text "{", nest 4 (maybe empty pPrint e), text "}"]
 pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss ++ [maybe empty pPrint e])) $+$ text "}"
 
-data Item = Item Visibility ItemKind
+data Attribute = Attribute String
+data Item = Item [Attribute] Visibility ItemKind
 
 instance Pretty Item where
-    pPrint (Item vis k) = (if vis == Public then zeroWidthText "pub " else empty) <> pPrint k
+    pPrint (Item attrs vis k) = vcat $
+        [ text "#[" <> text attr <> text "]" | Attribute attr <- attrs ] ++
+        [(if vis == Public then zeroWidthText "pub " else empty) <> pPrint k]
 
 data ItemKind
     = Function String [(Mutable, Var, Type)] Type Block
