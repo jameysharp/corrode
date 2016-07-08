@@ -756,7 +756,7 @@ interpretStatement (CExpr Nothing _) = return (Rust.BlockExpr (Rust.Block [] Not
 ```
 
 Otherwise, the first argument to `interpretExpr` indicates whether the
-expression appears in a context where its result matters. In a st
+expression appears in a context where its result matters. In a statement
 expression, the result is discarded, so we pass `False`.
 
 ```haskell
