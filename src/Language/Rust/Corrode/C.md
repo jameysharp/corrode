@@ -748,7 +748,7 @@ A C statement might be as simple as a "statement expression", which
 amounts to a C expression followed by a semicolon. In that case we can
 translate the statement by just translating the expression.
 
-If the statement is empty, as in just a semicolon, we can just produce an empty
+If the statement is empty, as in just a semicolon, we can produce an empty
 block.
 
 ```haskell
@@ -756,7 +756,7 @@ interpretStatement (CExpr Nothing _) = return (Rust.BlockExpr (Rust.Block [] Not
 ```
 
 Otherwise, the first argument to `interpretExpr` indicates whether the
-expression appears in a context where its result matters. In a statement
+expression appears in a context where its result matters. In a st
 expression, the result is discarded, so we pass `False`.
 
 ```haskell
