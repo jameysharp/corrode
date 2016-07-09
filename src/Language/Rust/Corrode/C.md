@@ -113,7 +113,6 @@ our program while translating.
 data EnvState = EnvState
     { environment :: Environment
     , unique :: Int
-    , loopingEscapes :: Maybe LoopTracker
     }
 ```
 
@@ -126,8 +125,8 @@ to its own item in Rust.
 
 Similarly, when inside of a loop, we'd like to keep track of whether a
 break or continue statement was used so we can avoid generating
-unnecessary code to deal with edge cases - see the case of
-`interpretStatemen (CFor ..)`.
+unnecessary code to deal with edge cases &mdash; see the case of
+`interpretStatement (CFor ..)`.
 
 ```haskell
 data Output = Output
@@ -349,7 +348,6 @@ Specifically, we:
     initState = EnvState
         { environment = []
         , unique = 1
-        , loopingEscapes = Nothing
         }
     (_, _, output) = runRWS (mapM_ perDecl decls) initFlow initState
 ```
@@ -935,13 +933,13 @@ so that they refer to the outer loop, not the one we inserted.
             let continueTo = Just (Rust.Lifetime continueName)
 
             (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
-            incr' <- (Rust.Stmt . result) <$> interpretExpr False incr
+            incr' <- (toBlock . result) <$> interpretExpr False incr
             
             let loop = Rust.Loop continueTo $
                          Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
             return ( if getAny br then breakTo else Nothing
-                   , if getAny co then [Rust.Stmt loop] ++ [incr'] else toBlock b' ++ [incr'])
+                   , if getAny co then [Rust.Stmt loop] ++ incr' else [Rust.Stmt b'] ++ incr' )
 ```
 
 We can generate simpler code in the special case that this `for` loop
