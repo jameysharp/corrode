@@ -105,10 +105,22 @@ we want to generate requires a name someplace where C did not require
 one. We'll follow a standard pattern for this and just generate a unique
 number each time we need a new name.
 
+Finally, when inside of a `for` loop, we'd like to keep track of whether a
+break or continue statement was used so we can avoid generating unnecessary
+code to deal with edge cases - see the case of `interpretStatemen (CFor ..)`
+
+```haskell
+data LoopTracker = LoopTracker { break' :: Bool, continue :: Bool }
+```
+
+Then, we can package together all of the state we'd like to thread around
+our program while translating.
+
 ```haskell
 data EnvState = EnvState
     { environment :: Environment
     , unique :: Int
+    , loopingEscapes :: Maybe LoopTracker
     }
 ```
 
@@ -238,6 +250,25 @@ emitExterns :: [Rust.ExternItem] -> EnvMonad ()
 emitExterns items = tell mempty { outputExterns = items }
 ```
 
+`recordBreak`/`recordContinue` take note of the presence of a `break`/
+`continue`:
+
+```haskell
+recordBreak :: CStat -> EnvMonad ()
+recordBreak stmt = do
+  trackers <- gets loopingEscapes
+  case trackers of
+    Nothing -> badSource stmt "break outside of loop"
+    Just t -> modify $ \ env -> env { loopingEscapes = Just(t { break' = True }) }
+
+recordContinue :: CStat -> EnvMonad ()
+recordContinue stmt = do
+  trackers <- gets loopingEscapes
+  case trackers of
+    Nothing -> badSource stmt "continue outside of loop"
+    Just t -> modify $ \ env -> env { loopingEscapes = Just (t { continue = True }) }
+```
+
 
 Reporting errors
 ================
@@ -322,6 +353,7 @@ Specifically, we:
     initState = EnvState
         { environment = []
         , unique = 1
+        , loopingEscapes = Nothing
         }
     (_, _, output) = runRWS (mapM_ perDecl decls) initFlow initState
 ```
@@ -851,7 +883,7 @@ loop body must be a block.
 ```haskell
 interpretStatement (CWhile c b False _) = do
     c' <- interpretExpr True c
-    b' <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
+    (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
     return (Rust.While Nothing (toBool c') (Rust.Block (toBlock b') Nothing))
 ```
 
@@ -906,14 +938,14 @@ so that they refer to the outer loop, not the one we inserted.
             let breakTo = Just (Rust.Lifetime breakName)
             let continueTo = Just (Rust.Lifetime continueName)
 
-            b' <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
+            (b', LoopTracker br co) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
             let end = Rust.Stmt (Rust.Break Nothing)
             let innerBlock = Rust.Block (toBlock b' ++ [end]) Nothing
-            let inner = Rust.Stmt (Rust.Loop continueTo innerBlock)
+            let inner = Rust.Stmt $ if co then Rust.Loop continueTo innerBlock else b'
 
             incr' <- interpretExpr False incr
             let outerBlock = Rust.Block [inner, Rust.Stmt (result incr')] Nothing
-            return (breakTo, Rust.BlockExpr outerBlock)
+            return (if br then breakTo else Nothing, Rust.BlockExpr outerBlock)
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -923,7 +955,7 @@ expressions, with no magic loops inserted into the body.
 
 ```haskell
         Nothing -> do
-            b' <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
+            (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
             return (Nothing, b')
     let block = Rust.Block (toBlock b') Nothing
 ```
@@ -955,8 +987,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = getFlow stmt onContinue
-interpretStatement stmt@(CBreak _) = getFlow stmt onBreak
+interpretStatement stmt@(CCont _) = recordContinue stmt >> getFlow stmt onContinue
+interpretStatement stmt@(CBreak _) = recordBreak stmt >> getFlow stmt onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -997,12 +1029,22 @@ getFlow stmt kind = do
 Inside loops above, we needed to update the translation to use if either
 `break` or `continue` statements show up. `loopScope` runs the provided
 translation action using an updated pair of `break`/`continue`
-expressions.
+expressions. It also keeps track of whether those constructs ended up being
+used.
 
 ```haskell
-loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad a
-loopScope b c = local $ \ flow ->
-    flow { onBreak = const (return b), onContinue = const (return c) }
+loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad (a, LoopTracker)
+loopScope b c a = do
+  parentTracker <- gets loopingEscapes
+  modify $ \ env -> env { loopingEscapes = Just (LoopTracker False False) }
+  
+  a' <- local (\ flow ->
+    flow { onBreak = const (return b), onContinue = const (return c) }) a
+  
+  Just tracker <- gets loopingEscapes
+  modify $ \ env -> env { loopingEscapes = parentTracker }
+  
+  return (a', tracker)
 ```
 
 
