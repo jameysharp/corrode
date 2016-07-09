@@ -1267,7 +1267,9 @@ Bitwise complement translates to Rust's `!` operator.
 ```
 
 Logical "not" also translates to Rust's `!` operator, but we have to
-force the operand to `bool` type first.
+force the operand to `bool` type first. We can avoid introducing silly
+extra "not" operators by creating a special-case `toNotBool` variant of
+`toBool` that returns the opposite value.
 
 ```haskell
     CNegOp -> do
@@ -1275,7 +1277,7 @@ force the operand to `bool` type first.
         return Result
             { resultType = IsBool
             , isMutable = Rust.Immutable
-            , result = Rust.Not (toBool expr')
+            , result = toNotBool expr'
             }
 ```
 
@@ -1696,6 +1698,20 @@ equal to 0.
 
 ```haskell
     _ -> Rust.CmpNE v 0
+```
+
+`toNotBool` works just like `Rust.Not . toBool`, except that it can
+generate simpler expressions. Instead of `!!p.is_null()`, for example,
+it simply generates `p.is_null()`. This approach satisfies our design
+goal of generating Rust which is as structurally close to the input as
+possible.
+
+```haskell
+toNotBool :: Result -> Rust.Expr
+toNotBool (Result { resultType = t, result = v }) = case t of
+    IsBool -> Rust.Not v
+    IsPtr _ _ -> Rust.MethodCall v (Rust.VarName "is_null") []
+    _ -> Rust.CmpEQ v 0
 ```
 
 C defines a set of rules called the "integer promotions" (C99 section
