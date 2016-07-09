@@ -939,13 +939,13 @@ so that they refer to the outer loop, not the one we inserted.
             let continueTo = Just (Rust.Lifetime continueName)
 
             (b', LoopTracker br co) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
-            let end = Rust.Stmt (Rust.Break Nothing)
-            let innerBlock = Rust.Block (toBlock b' ++ [end]) Nothing
-            let inner = Rust.Stmt $ if co then Rust.Loop continueTo innerBlock else b'
+            incr' <- (Rust.Stmt . result) <$> interpretExpr False incr
+            
+            let loop = Rust.Loop continueTo $
+                         Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
-            incr' <- interpretExpr False incr
-            let outerBlock = Rust.Block [inner, Rust.Stmt (result incr')] Nothing
-            return (if br then breakTo else Nothing, Rust.BlockExpr outerBlock)
+            return ( if br then breakTo else Nothing
+                   , if co then [Rust.Stmt loop] ++ [incr'] else toBlock b' ++ [incr'])
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -956,8 +956,7 @@ expressions, with no magic loops inserted into the body.
 ```haskell
         Nothing -> do
             (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-            return (Nothing, b')
-    let block = Rust.Block (toBlock b') Nothing
+            return (Nothing, toBlock b')
 ```
 
 If the condition is empty, the loop should translate to Rust's infinite
@@ -967,10 +966,10 @@ to this loop.
 
 ```haskell
     loop <- case mcond of
-        Nothing -> return (Rust.Loop lt block)
+        Nothing -> return (Rust.Loop lt (Rust.Block b' Nothing))
         Just cond -> do
             cond' <- interpretExpr True cond
-            return (Rust.While lt (toBool cond') block)
+            return (Rust.While lt (toBool cond') (Rust.Block b' Nothing))
 ```
 
 Now we have all the pieces to assemble a Rust equivalent to the original
