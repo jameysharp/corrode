@@ -31,6 +31,7 @@ import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
 import Data.Maybe
+import Data.Monoid
 import Data.List
 import Language.C
 import qualified Language.Rust.AST as Rust
@@ -105,14 +106,6 @@ we want to generate requires a name someplace where C did not require
 one. We'll follow a standard pattern for this and just generate a unique
 number each time we need a new name.
 
-Finally, when inside of a `for` loop, we'd like to keep track of whether a
-break or continue statement was used so we can avoid generating unnecessary
-code to deal with edge cases - see the case of `interpretStatemen (CFor ..)`
-
-```haskell
-data LoopTracker = LoopTracker { break' :: Bool, continue :: Bool }
-```
-
 Then, we can package together all of the state we'd like to thread around
 our program while translating.
 
@@ -131,10 +124,17 @@ For example, a `struct` might be defined inside a declaration that's
 inside a loop that's inside a function. We need to get that struct out
 to its own item in Rust.
 
+Similarly, when inside of a loop, we'd like to keep track of whether a
+break or continue statement was used so we can avoid generating
+unnecessary code to deal with edge cases - see the case of
+`interpretStatemen (CFor ..)`.
+
 ```haskell
 data Output = Output
     { outputItems :: [Rust.Item]
     , outputExterns :: [Rust.ExternItem]
+    , usesBreak :: Any
+    , usesContinue :: Any
     }
 ```
 
@@ -157,6 +157,8 @@ For our output to be a monoid, it needs to specify
         mempty = Output
             { outputItems = mempty
             , outputExterns = mempty
+            , usesBreak = mempty
+            , usesContinue = mempty
             }
     ```
 
@@ -167,6 +169,8 @@ For our output to be a monoid, it needs to specify
         mappend a b = Output
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
+            , usesBreak = usesBreak a `mappend` usesBreak b
+            , usesContinue = usesContinue a `mappend` usesContinue b
             }
     ```
 
@@ -254,19 +258,11 @@ emitExterns items = tell mempty { outputExterns = items }
 `continue`:
 
 ```haskell
-recordBreak :: CStat -> EnvMonad ()
-recordBreak stmt = do
-  trackers <- gets loopingEscapes
-  case trackers of
-    Nothing -> badSource stmt "break outside of loop"
-    Just t -> modify $ \ env -> env { loopingEscapes = Just(t { break' = True }) }
+recordBreak :: EnvMonad ()
+recordBreak = tell mempty { usesBreak = Any True }
 
-recordContinue :: CStat -> EnvMonad ()
-recordContinue stmt = do
-  trackers <- gets loopingEscapes
-  case trackers of
-    Nothing -> badSource stmt "continue outside of loop"
-    Just t -> modify $ \ env -> env { loopingEscapes = Just (t { continue = True }) }
+recordContinue :: EnvMonad ()
+recordContinue = tell mempty { usesContinue = Any True }
 ```
 
 
@@ -938,14 +934,14 @@ so that they refer to the outer loop, not the one we inserted.
             let breakTo = Just (Rust.Lifetime breakName)
             let continueTo = Just (Rust.Lifetime continueName)
 
-            (b', LoopTracker br co) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
+            (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
             incr' <- (Rust.Stmt . result) <$> interpretExpr False incr
             
             let loop = Rust.Loop continueTo $
                          Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
-            return ( if br then breakTo else Nothing
-                   , if co then [Rust.Stmt loop] ++ [incr'] else toBlock b' ++ [incr'])
+            return ( if getAny br then breakTo else Nothing
+                   , if getAny co then [Rust.Stmt loop] ++ [incr'] else toBlock b' ++ [incr'])
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -986,8 +982,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = recordContinue stmt >> getFlow stmt onContinue
-interpretStatement stmt@(CBreak _) = recordBreak stmt >> getFlow stmt onBreak
+interpretStatement stmt@(CCont _) = recordContinue >> getFlow stmt onContinue
+interpretStatement stmt@(CBreak _) = recordBreak >> getFlow stmt onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1032,18 +1028,12 @@ expressions. It also keeps track of whether those constructs ended up being
 used.
 
 ```haskell
-loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad (a, LoopTracker)
-loopScope b c a = do
-  parentTracker <- gets loopingEscapes
-  modify $ \ env -> env { loopingEscapes = Just (LoopTracker False False) }
-  
-  a' <- local (\ flow ->
-    flow { onBreak = const (return b), onContinue = const (return c) }) a
-  
-  Just tracker <- gets loopingEscapes
-  modify $ \ env -> env { loopingEscapes = parentTracker }
-  
-  return (a', tracker)
+loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad (a, (Any, Any))
+loopScope b c =
+    censor (\ output -> output { usesBreak = mempty, usesContinue = mempty }) .
+    listens (\ output -> (usesBreak output, usesContinue output)) .
+    local (\ flow ->
+        flow { onBreak = const (return b), onContinue = const (return c) })
 ```
 
 
