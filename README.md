@@ -37,12 +37,23 @@ stack install
 Stack will build and install `corrode` to `~/.local/bin`. For ease of use, make
 sure that directory is in your `$PATH`.
 
-You can now run `corrode`, giving the file name as the first argument and
-optionally provide a list of `gcc` options:
+You can now run `corrode`, giving it any options that `gcc` would
+accept.
 
 ```
-corrode filename.c -Wall -lm
+corrode -Wall filename.c -I/usr/local/include -lm
 ```
+
+It will only use the options that are relevant to the C pre-processor,
+like `-I` or `-D`, but since it accepts and ignores any other options,
+you can usually hack it into existing build systems just by setting
+`CC=corrode`.
+
+However, unlike a real C compiler, Corrode does not produce an object
+file or executable! Instead, if you ask it to process `filename.c`, it
+generates equivalent Rust source code in `filename.rs`. At the moment,
+it's up to you to invoke `rustc` on the output with appropriate options
+to finish compilation.
 
 To experiment with the project itself, you can build it using
 
@@ -53,7 +64,7 @@ stack build
 then run the executable:
 
 ```bash
-stack exec -- corrode filename.c -Wall -lm
+stack exec -- corrode -Wall filename.c -I/usr/local/include -lm
 ```
 
 ## Design principles
