@@ -112,6 +112,52 @@ data EnvState = EnvState
     }
 ```
 
+As we proceed through the C source, we'll accumulate Rust definitions
+that we want to include in the final output. This type simply holds any
+data that we want to have bubble up from further down the parse tree.
+For example, a `struct` might be defined inside a declaration that's
+inside a loop that's inside a function. We need to get that struct out
+to its own item in Rust.
+
+```haskell
+data Output = Output
+    { outputItems :: [Rust.Item]
+    , outputExterns :: [Rust.ExternItem]
+    }
+```
+
+As we generate output from translating each piece of C syntax, we need a
+way to combine the output from different pieces. There's a standard
+Haskell typeclass (which is like a Rust trait) called
+[`Monoid`](https://hackage.haskell.org/package/base-4.9.0.0/docs/Data-Monoid.html)
+which encapsulates this idea of combining pieces of output.
+
+```haskell
+instance Monoid Output where
+```
+
+For our output to be a monoid, it needs to specify
+
+- what empty output looks like (which is just output where every field
+  is empty),
+
+    ```haskell
+        mempty = Output
+            { outputItems = mempty
+            , outputExterns = mempty
+            }
+    ```
+
+- and how to combine two different pieces of output (which we do by
+  pairwise combining each field).
+
+    ```haskell
+        mappend a b = Output
+            { outputItems = outputItems a `mappend` outputItems b
+            , outputExterns = outputExterns a `mappend` outputExterns b
+            }
+    ```
+
 The C language is defined such that a compiler can generate code in a
 single top-to-bottom pass through a translation unit. That is, any uses
 of a name must come after the point in the translation unit where that
@@ -138,7 +184,7 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad = RWS ControlFlow ([Rust.Item], [Rust.ExternItem]) EnvState
+type EnvMonad = RWS ControlFlow Output EnvState
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
@@ -178,7 +224,7 @@ uniqueName base = do
 
 ```haskell
 emitItems :: [Rust.Item] -> EnvMonad ()
-emitItems items = tell (items, [])
+emitItems items = tell mempty { outputItems = items }
 ```
 
 `emitExterns` adds to the output a list of functions or global variables
@@ -189,7 +235,7 @@ there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 
 ```haskell
 emitExterns :: [Rust.ExternItem] -> EnvMonad ()
-emitExterns items = tell ([], items)
+emitExterns items = tell mempty { outputExterns = items }
 ```
 
 
@@ -277,7 +323,7 @@ Specifically, we:
         { environment = []
         , unique = 1
         }
-    (_, _, (items, externs)) = runRWS (mapM_ perDecl decls) initFlow initState
+    (_, _, output) = runRWS (mapM_ perDecl decls) initFlow initState
 ```
 
 With the initial environment set up, we can descend to the next level of
@@ -305,12 +351,12 @@ for this translation unit it becomes clear.
             Rust.Item _ _ (Rust.Function name _ _ _) -> Just name
             Rust.Item _ _ (Rust.Static _ (Rust.VarName name) _ _) -> Just name
             _ -> Nothing
-        | item <- items
+        | item <- outputItems output
         ]
 
     externName (Rust.ExternFn name _ _ _) = name
     externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
-    externs' = filter (\ item -> externName item `notElem` itemNames) externs
+    externs' = filter (\ item -> externName item `notElem` itemNames) (outputExterns output)
 ```
 
 If there are any external declarations after filtering, then we need to
@@ -319,8 +365,8 @@ items, by convention.
 
 ```haskell
     items' = if null externs'
-        then items
-        else Rust.Item [] Rust.Private (Rust.Extern externs') : items
+        then outputItems output
+        else Rust.Item [] Rust.Private (Rust.Extern externs') : outputItems output
 ```
 
 
