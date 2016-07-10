@@ -692,25 +692,11 @@ A C function definition translates to a single Rust item.
 
 ```haskell
 interpretFunction :: CFunDef -> EnvMonad Rust.Item
+interpretFunction (CFunDef specs declr@(CDeclr mident _ _ _ _) _ body _) = do
 ```
 
-Function definitions can't be anonymous and their derived declarators
-must begin with CFunDeclr. Anything else is a syntax error.
-
-```haskell
-interpretFunction (CFunDef specs declr@(CDeclr (Just ident) _ _ _ _) _ body _) = do
-```
-
-Translate into our internal representation the function's name, formal
-parameters, and return type. Determine whether the function should be
-visible outside this module based on whether it is declared `static`.
-
-Definitions of variadic functions are not allowed because Rust does not
-support them.
-
-Note that `const` is legal but meaningless on the return type of a
-function in C. We just ignore whether it was present; there's no place
-we can put a `mut` keyword in the generated Rust.
+Determine whether the function should be visible outside this module
+based on whether it is declared `static`.
 
 ```haskell
     (storage, baseTy) <- baseTypeOf specs
@@ -718,8 +704,21 @@ we can put a `mut` keyword in the generated Rust.
         Nothing -> return Rust.Public
         Just (CStatic _) -> return Rust.Private
         Just s -> badSource s "storage class specifier for function"
-    let name = identToString ident
+```
+
+Note that `const` is legal but meaningless on the return type of a
+function in C. We just ignore whether it was present; there's no place
+we can put a `mut` keyword in the generated Rust.
+
+```haskell
     (_mut, isFunc, funTy) <- derivedTypeOf baseTy declr
+```
+
+This must be a function type, not a function pointer or a non-function.
+Definitions of variadic functions are not allowed because Rust does not
+support them.
+
+```haskell
     unless isFunc (badSource declr "function definition")
     (retTy, args) <- case funTy of
         IsFunc _ _ True -> unimplemented declr
@@ -728,10 +727,14 @@ we can put a `mut` keyword in the generated Rust.
 ```
 
 Add this function to the globals before evaluating its body so recursive
-calls work.
+calls work. (Note that function definitions can't be anonymous.)
 
 ```haskell
-    addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
+    name <- case mident of
+        Nothing -> badSource declr "anonymous function definition"
+        Just ident -> do
+            addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
+            return (identToString ident)
 ```
 
 Open a new scope for the body of this function, while making the return
@@ -783,12 +786,6 @@ expression.
         let block = Rust.Block (toBlock body') Nothing
         let attrs = [Rust.Attribute "no_mangle"]
         return (Rust.Item attrs vis (Rust.Function name formals (toRustType retTy) block))
-```
-
-Report a syntax error if the above pattern didn't match.
-
-```haskell
-interpretFunction (CFunDef _ decl _ _ _) = badSource decl "function definition"
 ```
 
 
