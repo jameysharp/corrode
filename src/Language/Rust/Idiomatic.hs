@@ -8,9 +8,9 @@ import qualified Language.Rust.AST as Rust
 
 unsnoc :: [a] -> Maybe ([a], a)
 unsnoc [] = Nothing
-unsnoc [x] = Just ([], x)
-unsnoc (x:xs) = Just (x:a, b)
-    where Just (a,b) = unsnoc xs
+unsnoc (x:xs) = case unsnoc xs of
+    Just (a, b) -> Just (x:a, b)
+    Nothing -> Just ([], x)
 
 tailExpr :: Rust.Expr -> Maybe (Maybe Rust.Expr)
 -- If the last statement in this block is a return statement, extract

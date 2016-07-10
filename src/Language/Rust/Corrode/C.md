@@ -539,7 +539,7 @@ declaration. It returns a list of bindings constructed using
 
 ```haskell
 interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad [b]
-interpretDeclarations makeBinding (CDecl specs decls _) = do
+interpretDeclarations makeBinding declaration@(CDecl specs decls _) = do
 ```
 
 First, we call `baseTypeOf` to get our internal representation of the
@@ -559,15 +559,32 @@ If there are any declarators, we need to figure out which kind of Rust
 declaration to emit for each one, if any.
 
 ```haskell
-    mbinds <- forM decls $ \ (Just decl@(CDeclr (Just ident) _ _ _ _), minit, Nothing) -> do
-        (mut, isFunc, ty) <- derivedTypeOf baseTy decl
+    mbinds <- forM decls $ \ declarator -> do
+```
+
+This function is only used for what `language-c` calls "toplevel
+declarations", and as such, "the elements of the non-empty
+`init-declarator-list` are of the form `(Just declr, init?, Nothing)`.
+The declarator `declr` has to be present and non-abstract and the
+initialization expression is optional."
+
+```haskell
+        (decl, minit) <- case declarator of
+            (Just decl, minit, Nothing) -> return (decl, minit)
+            (Nothing, _, _) -> badSource declaration "absent declarator"
+            (_, _, Just _) -> badSource declaration "bitfield declarator"
+
+        ident <- case decl of
+            CDeclr (Just ident) _ _ _ _ -> return ident
+            _ -> badSource decl "abstract declarator"
         let name = identToString ident
+
+        (mut, isFunc, ty) <- derivedTypeOf baseTy decl
         case (storagespecs, isFunc, ty) of
 ```
 
-Typedefs must have a declarator which must not be abstract, and must not
-have an initializer or size. Each declarator is added to the
-environment, tagged as a `TypedefIdent`. They do not return any
+Each `typedef` declarator is added to the environment, tagged as a
+`TypedefIdent`. They must not have an initializer and do not return any
 declarations, so the only effect of a `typedef` is to update the
 environment.
 
@@ -579,13 +596,13 @@ environment.
 
 ```haskell
             (Just (CTypedef _), False, _) -> do
+                when (isJust minit) (badSource decl "initializer on typedef")
                 addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
 ```
 
-Non-typedef declarations must have a declarator which must not be
-abstract, and must not have a size. They may have an initializer. Each
-declarator is added to the environment, tagged as a `SymbolIdent`.
+Non-`typedef` declarations may have an initializer. Each declarator is
+added to the environment, tagged as a `SymbolIdent`.
 
 Static function prototypes don't need to be translated because the
 function definition must be in the same translation unit. We still need
