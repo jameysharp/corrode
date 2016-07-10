@@ -125,7 +125,7 @@ to its own item in Rust.
 
 Similarly, when inside of a loop, we'd like to keep track of whether a
 break or continue statement was used so we can avoid generating
-unnecessary code to deal with edge cases &mdash; see the case of
+unnecessary code to deal with edge cases&mdash;see the case of
 `interpretStatement (CFor ..)`.
 
 ```haskell
@@ -934,7 +934,7 @@ so that they refer to the outer loop, not the one we inserted.
 
             (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
             incr' <- (toBlock . result) <$> interpretExpr False incr
-            
+
             let loop = Rust.Loop continueTo $
                          Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
 
