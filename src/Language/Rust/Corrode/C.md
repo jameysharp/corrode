@@ -842,17 +842,16 @@ Interpret the body of the function.
 The body's Haskell type is `CStatement`, but language-c guarantees that
 it is specifically a compound statement (the `CCompound` constructor).
 Rather than relying on that, we allow it to be any kind of statement and
-use `toBlock` to coerce the resulting Rust expression into a list of
-Rust statements, and wrap that up in a Rust block.
+use `statementsToBlock` to coerce the resulting Rust statement into a Rust
+block.
 
 Since C doesn't have Rust's syntax allowing the last expression to be
 the result of the function, this generated block never has a final
 expression.
 
 ```haskell
-        let block = Rust.Block (toBlock body') Nothing
         let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) block))
+        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) (statementsToBlock body')))
 ```
 
 
@@ -871,24 +870,25 @@ data ControlFlow = ControlFlow
     }
 ```
 
-Inside a function, we find C statements. Interestingly, syntax which is
-a statement in C is almost always an expression instead in Rust. So
-`interpretStatement` transforms one `CStatement` into one Rust
-expression.
+Inside a function, we find C statements. Unlike C syntax which is oriented
+around statements, Rust syntax is mostly just expressions. Nonetheless, by
+having `interpretStatement` return a list of Rust statements (instead of
+just a Rust expression), we end up being able to get rid of superfluous
+curly braces.
 
 ```haskell
-interpretStatement :: CStat -> EnvMonad Rust.Expr
+interpretStatement :: CStat -> EnvMonad [Rust.Stmt]
 ```
 
 A C statement might be as simple as a "statement expression", which
 amounts to a C expression followed by a semicolon. In that case we can
 translate the statement by just translating the expression.
 
-If the statement is empty, as in just a semicolon, we can produce an empty
-block.
+If the statement is empty, as in just a semicolon, we don't need to
+produce any statements.
 
 ```haskell
-interpretStatement (CExpr Nothing _) = return (Rust.BlockExpr (Rust.Block [] Nothing))
+interpretStatement (CExpr Nothing _) = return []
 ```
 
 Otherwise, the first argument to `interpretExpr` indicates whether the
@@ -898,17 +898,22 @@ expression, the result is discarded, so we pass `False`.
 ```haskell
 interpretStatement (CExpr (Just expr) _) = do
     expr' <- interpretExpr False expr
-    return (result expr')
+    return [Rust.Stmt (result expr')]
 ```
 
 We could have a "compound statement", also known as a "block". A
 compound statement contains a sequence of zero or more statements or
 declarations; see `interpretBlockItem` below for details.
 
+In the case of an empty compound statement, we make an exception of our
+usual rule of not simplifying the generated Rust and simply ignore the
+"statement".
+
 ```haskell
+interpretStatement (CCompound [] [] _) = return []
 interpretStatement (CCompound [] items _) = scope $ do
-    stmts <- mapM interpretBlockItem items
-    return (Rust.BlockExpr (Rust.Block (concat stmts) Nothing))
+    stmts <- concat <$> mapM interpretBlockItem items
+    return [Rust.Stmt (Rust.BlockExpr (statementsToBlock stmts))]
 ```
 
 This statement could be an `if` statement, with its conditional
@@ -921,16 +926,17 @@ if necessary.
 In C, the "then" and "else" branches are each statements (which may be
 compound statements, if they're surrounded by curly braces), but in Rust
 they must each be blocks (so they're always surrounded by curly braces).
-Here we use `toBlock` to coerce both branches into lists of statements,
-and wrap those lists up into blocks, so we don't care whether the
-original program used a compound statement in that branch or not.
+
+Here we use `statementsToBlock` to coerce both branches into blocks,
+so we don't care whether the original program used a compound statement in
+that branch or not.
 
 ```haskell
 interpretStatement (CIf c t mf _) = do
     c' <- interpretExpr True c
-    t' <- fmap toBlock (interpretStatement t)
-    f' <- maybe (return []) (fmap toBlock . interpretStatement) mf
-    return (Rust.IfThenElse (toBool c') (Rust.Block t' Nothing) (Rust.Block f' Nothing))
+    t' <- interpretStatement t
+    f' <- maybe (return []) interpretStatement mf
+    return [Rust.Stmt (Rust.IfThenElse (toBool c') (statementsToBlock t') (statementsToBlock f'))]
 ```
 
 `while` loops are easy to translate from C to Rust. They have identical
@@ -942,7 +948,7 @@ loop body must be a block.
 interpretStatement (CWhile c b False _) = do
     c' <- interpretExpr True c
     (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-    return (Rust.While Nothing (toBool c') (Rust.Block (toBlock b') Nothing))
+    return [Rust.Stmt (Rust.While Nothing (toBool c') (statementsToBlock b'))]
 ```
 
 C's `for` loops can be tricky to translate to Rust, which doesn't have
@@ -997,13 +1003,12 @@ so that they refer to the outer loop, not the one we inserted.
             let continueTo = Just (Rust.Lifetime continueName)
 
             (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
-            incr' <- (toBlock . result) <$> interpretExpr False incr
+            incr' <- exprToStatements <$> interpretExpr False incr
 
-            let loop = Rust.Loop continueTo $
-                         Rust.Block (toBlock b' ++ [ Rust.Stmt (Rust.Break Nothing) ]) Nothing
+            let loop = Rust.Loop continueTo (statementsToBlock (b' ++ [ Rust.Stmt (Rust.Break Nothing) ]))
 
             return ( if getAny br then breakTo else Nothing
-                   , if getAny co then [Rust.Stmt loop] ++ incr' else [Rust.Stmt b'] ++ incr' )
+                   , if getAny co then [Rust.Stmt loop] ++ incr' else b' ++ incr' )
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -1014,7 +1019,7 @@ expressions, with no magic loops inserted into the body.
 ```haskell
         Nothing -> do
             (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-            return (Nothing, toBlock b')
+            return (Nothing, b')
 ```
 
 If the condition is empty, the loop should translate to Rust's infinite
@@ -1024,18 +1029,23 @@ to this loop.
 
 ```haskell
     loop <- case mcond of
-        Nothing -> return (Rust.Loop lt (Rust.Block b' Nothing))
+        Nothing -> return (Rust.Loop lt (statementsToBlock b'))
         Just cond -> do
             cond' <- interpretExpr True cond
-            return (Rust.While lt (toBool cond') (Rust.Block b' Nothing))
+            return (Rust.While lt (toBool cond') (statementsToBlock b'))
 ```
 
 Now we have all the pieces to assemble a Rust equivalent to the original
 `for` loop. Create a block, beginning with any initialization and ending
-with the selected variety of loop.
+with the selected variety of loop. Furthermore, if we didn't even have to
+generate any bindings before the loop, we can even avoid having to wrap
+everything in an extra brace block.
 
 ```haskell
-    return (Rust.BlockExpr (Rust.Block pre (Just loop)))
+    let stmts = pre ++ [Rust.Stmt loop]
+    return $ case initial of
+        Left _ -> stmts
+        Right _ -> [Rust.Stmt (Rust.BlockExpr (statementsToBlock stmts))]
 ```
 
 `continue` and `break` statements translate to whatever expression we
@@ -1044,8 +1054,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = recordContinue >> getFlow stmt onContinue
-interpretStatement stmt@(CBreak _) = recordBreak >> getFlow stmt onBreak
+interpretStatement stmt@(CCont _) = recordContinue >> pure . Rust.Stmt <$> getFlow stmt onContinue
+interpretStatement stmt@(CBreak _) = recordBreak >> pure . Rust.Stmt <$> getFlow stmt onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1059,7 +1069,7 @@ type.
 interpretStatement stmt@(CReturn expr _) = do
     retTy <- getFlow stmt functionReturnType
     expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-    return (Rust.Return expr')
+    return [Rust.Stmt (Rust.Return expr')]
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -1108,24 +1118,33 @@ of zero or more Rust statements for each compound block item.
 
 ```haskell
 interpretBlockItem :: CBlockItem -> EnvMonad [Rust.Stmt]
-interpretBlockItem (CBlockStmt stmt) = do
-    stmt' <- interpretStatement stmt
-    return [Rust.Stmt stmt']
+interpretBlockItem (CBlockStmt stmt) = interpretStatement stmt
 interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem item = unimplemented item
 ```
 
-`toBlock` is a helper function which turns a Rust expression into a list
-of Rust statements. It's always possible to do this by wrapping the
-expression in the `Rust.Stmt` constructor, but there are a bunch of
-places in this translation where we don't want to have to think about
-whether the expression is already a block expression to avoid inserting
-excess pairs of curly braces everywhere.
+`exprToStatements` is a helper function which turns a Rust expression
+result into a list of Rust statements. It's always possible to do this by
+extracting the expression and wrapping it in the `Rust.Stmt` constructor,
+but there are a bunch of places in this translation where we don't want to
+have to think about whether the expression is already a block expression to
+avoid inserting excess pairs of curly braces everywhere.
 
 ```haskell
-toBlock :: Rust.Expr -> [Rust.Stmt]
-toBlock (Rust.BlockExpr (Rust.Block stmts Nothing)) = stmts
-toBlock e = [Rust.Stmt e]
+exprToStatements :: Result -> [Rust.Stmt]
+exprToStatements Result{ result = Rust.BlockExpr (Rust.Block stmts Nothing) } = stmts
+exprToStatements Result{ result = e } = [Rust.Stmt e]
+```
+
+`statementsToBlock` is a similar helper function which turns a list of
+Rust statements into a block. As before, this can always be done with the
+`Rust.Block` constructor, but again this is a convenient way to avoid
+inserting excess pairs of curly braces everywhere.
+
+```haskell
+statementsToBlock :: [Rust.Stmt] -> Rust.Block
+statementsToBlock [Rust.Stmt (Rust.BlockExpr block)] = block
+statementsToBlock stmts = Rust.Block stmts Nothing
 ```
 
 `scope` runs the translation steps in `m`, but then throws away any
@@ -1233,7 +1252,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
         else return Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
-            , result = Rust.IfThenElse c' (Rust.Block (toBlock (result t')) Nothing) (Rust.Block (toBlock (result f')) Nothing)
+            , result = Rust.IfThenElse c' (Rust.Block (exprToStatements t') Nothing) (Rust.Block (exprToStatements f') Nothing)
             }
 ```
 
