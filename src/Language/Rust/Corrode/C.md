@@ -95,9 +95,9 @@ to label identifiers with their namespace.
 
 ```haskell
 data IdentKind
-    = SymbolIdent Ident
-    | TypedefIdent Ident
-    | StructIdent Ident
+    = SymbolIdent { identOfKind :: Ident }
+    | TypedefIdent { identOfKind :: Ident }
+    | StructIdent { identOfKind :: Ident }
     deriving Eq
 ```
 
@@ -219,9 +219,10 @@ getIdent ident = do
 `addIdent` saves type information into the environment.
 
 ```haskell
-addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad ()
-addIdent ident ty = modify $ \ st ->
-    st { environment = (ident, ty) : environment st }
+addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad String
+addIdent ident ty = do
+    modify $ \ st -> st { environment = (ident, ty) : environment st }
+    return (identToString (identOfKind ident))
 ```
 
 `uniqueName` generates a new name with the given base and a new unique
@@ -577,7 +578,6 @@ initialization expression is optional."
         ident <- case decl of
             CDeclr (Just ident) _ _ _ _ -> return ident
             _ -> badSource decl "abstract declarator"
-        let name = identToString ident
 
         (mut, isFunc, ty) <- derivedTypeOf baseTy decl
         case (storagespecs, isFunc, ty) of
@@ -597,7 +597,7 @@ environment.
 ```haskell
             (Just (CTypedef _), False, _) -> do
                 when (isJust minit) (badSource decl "initializer on typedef")
-                addIdent (TypedefIdent ident) (mut, ty)
+                _ <- addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
 ```
 
@@ -610,7 +610,7 @@ to have the function's type signature in the environment though.
 
 ```haskell
             (Just (CStatic _), True, IsFunc{}) -> do
-                addIdent (SymbolIdent ident) (mut, ty)
+                _ <- addIdent (SymbolIdent ident) (mut, ty)
                 return Nothing
 ```
 
@@ -625,7 +625,7 @@ duplicates later.
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
-                addIdent (SymbolIdent ident) (mut, ty)
+                name <- addIdent (SymbolIdent ident) (mut, ty)
                 emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
                 return Nothing
 ```
@@ -636,7 +636,7 @@ prune duplicates later.
 
 ```haskell
             (Just (CExtern _), _, _) -> do
-                addIdent (SymbolIdent ident) (mut, ty)
+                name <- addIdent (SymbolIdent ident) (mut, ty)
                 emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
                 return Nothing
 ```
@@ -647,7 +647,7 @@ to translate that; see below.
 
 ```haskell
             _ -> do
-                addIdent (SymbolIdent ident) (mut, ty)
+                name <- addIdent (SymbolIdent ident) (mut, ty)
                 mexpr <- mapM (interpretInitializer ty) minit
                 return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
 ```
@@ -749,9 +749,7 @@ calls work. (Note that function definitions can't be anonymous.)
 ```haskell
     name <- case mident of
         Nothing -> badSource declr "anonymous function definition"
-        Just ident -> do
-            addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
-            return (identToString ident)
+        Just ident -> addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
 ```
 
 Open a new scope for the body of this function, while making the return
@@ -775,9 +773,9 @@ Add each formal parameter into the new environment, tagged as
 ```haskell
         formals <- sequence
             [ case arg of
-                Just (mut, argname) -> do
-                    addIdent (SymbolIdent argname) (mut, ty)
-                    return (mut, Rust.VarName (identToString argname), toRustType ty)
+                Just (mut, argident) -> do
+                    argname <- addIdent (SymbolIdent argident) (mut, ty)
+                    return (mut, Rust.VarName argname, toRustType ty)
                 Nothing -> badSource declr "anonymous parameter"
             | (arg, ty) <- args
             ]
@@ -1976,7 +1974,6 @@ baseTypeOf specs = do
             Just ident -> do
                 let name = identToString ident
                 addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
-                return name
             Nothing -> uniqueName "Struct"
         let attrs = [Rust.Attribute "derive(Clone, Copy)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
