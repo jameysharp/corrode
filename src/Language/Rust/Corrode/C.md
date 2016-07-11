@@ -27,6 +27,8 @@ useful data structures and control flow abstractions.
 module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
@@ -199,7 +201,7 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad = RWS ControlFlow Output EnvState
+type EnvMonad = ExceptT String (RWS ControlFlow Output EnvState)
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
@@ -211,7 +213,7 @@ haven't seen a declaration for that name yet.
 
 ```haskell
 getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
-getIdent ident = do
+getIdent ident = lift $ do
     env <- gets environment
     return (lookup ident env)
 ```
@@ -220,7 +222,7 @@ getIdent ident = do
 
 ```haskell
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad String
-addIdent ident ty = do
+addIdent ident ty = lift $ do
     modify $ \ st -> st { environment = (ident, ty) : environment st }
     return (identToString (identOfKind ident))
 ```
@@ -230,7 +232,7 @@ number:
 
 ```haskell
 uniqueName :: String -> EnvMonad String
-uniqueName base = do
+uniqueName base = lift $ do
     st <- get
     put (st { unique = unique st + 1 })
     return (base ++ show (unique st))
@@ -240,7 +242,7 @@ uniqueName base = do
 
 ```haskell
 emitItems :: [Rust.Item] -> EnvMonad ()
-emitItems items = tell mempty { outputItems = items }
+emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
 `emitExterns` adds to the output a list of functions or global variables
@@ -251,7 +253,7 @@ there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 
 ```haskell
 emitExterns :: [Rust.ExternItem] -> EnvMonad ()
-emitExterns items = tell mempty { outputExterns = items }
+emitExterns items = lift $ tell mempty { outputExterns = items }
 ```
 
 `recordBreak`/`recordContinue` take note of the presence of a `break`/
@@ -259,10 +261,10 @@ emitExterns items = tell mempty { outputExterns = items }
 
 ```haskell
 recordBreak :: EnvMonad ()
-recordBreak = tell mempty { usesBreak = Any True }
+recordBreak = lift $ tell mempty { usesBreak = Any True }
 
 recordContinue :: EnvMonad ()
-recordContinue = tell mempty { usesContinue = Any True }
+recordContinue = lift $ tell mempty { usesContinue = Any True }
 ```
 
 
@@ -275,7 +277,7 @@ explanation as possible when that happens.
 
 ```haskell
 noTranslation :: (Pretty node, Pos node) => node -> String -> EnvMonad a
-noTranslation node msg = fail $ concat
+noTranslation node msg = throwE $ concat
     [ show (posOf node)
     , ": "
     , msg
@@ -325,8 +327,10 @@ translation unit, and returns a list of Rust AST top-level declaration
 items.
 
 ```haskell
-interpretTranslationUnit :: CTranslUnit -> [Rust.Item]
-interpretTranslationUnit (CTranslUnit decls _) = items'
+interpretTranslationUnit :: CTranslUnit -> Either String [Rust.Item]
+interpretTranslationUnit (CTranslUnit decls _) = case err of
+    Left msg -> Left msg
+    Right _ -> Right items'
     where
 ```
 
@@ -350,7 +354,7 @@ Specifically, we:
         { environment = []
         , unique = 1
         }
-    (_, _, output) = runRWS (mapM_ perDecl decls) initFlow initState
+    (err, _, output) = runRWS (runExceptT (mapM_ perDecl decls)) initFlow initState
 ```
 
 With the initial environment set up, we can descend to the next level of
@@ -757,7 +761,7 @@ type available so we can correctly translate `return` statements.
 
 ```haskell
     let setRetTy flow = flow { functionReturnType = const (return retTy) }
-    local setRetTy $ scope $ do
+    mapExceptT (local setRetTy) $ scope $ do
 ```
 
 Add each formal parameter into the new environment, tagged as
@@ -1027,7 +1031,7 @@ everything through correctly.
 ```haskell
 getFlow :: CStat -> (ControlFlow -> CStat -> EnvMonad a) -> EnvMonad a
 getFlow stmt kind = do
-    val <- asks kind
+    val <- lift (asks kind)
     val stmt
 ```
 
@@ -1040,10 +1044,10 @@ used.
 ```haskell
 loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad (a, (Any, Any))
 loopScope b c =
-    censor (\ output -> output { usesBreak = mempty, usesContinue = mempty }) .
-    listens (\ output -> (usesBreak output, usesContinue output)) .
-    local (\ flow ->
-        flow { onBreak = const (return b), onContinue = const (return c) })
+    mapExceptT (censor (\ output -> output { usesBreak = mempty, usesContinue = mempty })) .
+    liftListen (listens (\ output -> (usesBreak output, usesContinue output))) .
+    mapExceptT (local (\ flow ->
+        flow { onBreak = const (return b), onContinue = const (return c) }))
 ```
 
 
@@ -1084,10 +1088,10 @@ are kept, though.
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- gets environment
+    old <- lift (gets environment)
     a <- m
     -- Restore the environment to its state before running m.
-    modify (\ st -> st { environment = old })
+    lift (modify (\ st -> st { environment = old }))
     return a
 ```
 
