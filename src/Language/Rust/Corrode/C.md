@@ -207,15 +207,25 @@ type EnvMonad = ExceptT String (RWS ControlFlow Output EnvState)
 In fact, we're going to wrap up the monad operations in some helper
 functions, and then only use these helpers everywhere else.
 
+Some names are special in C or special in Rust, or both. We rename those
+as we encounter them. At the moment, only `main` gets this special
+treatment.
+
+```haskell
+applyRenames :: IdentKind -> String
+applyRenames (SymbolIdent (identToString -> "main")) = "_c_main"
+applyRenames ident = identToString (identOfKind ident)
+```
+
 `getIdent` looks up a name from the given namespace in the environment,
 and returns the type information we have for it, or `Nothing` if we
 haven't seen a declaration for that name yet.
 
 ```haskell
-getIdent :: IdentKind -> EnvMonad (Maybe (Rust.Mutable, CType))
+getIdent :: IdentKind -> EnvMonad (String, Maybe (Rust.Mutable, CType))
 getIdent ident = lift $ do
     env <- gets environment
-    return (lookup ident env)
+    return (applyRenames ident, lookup ident env)
 ```
 
 `addIdent` saves type information into the environment.
@@ -224,7 +234,7 @@ getIdent ident = lift $ do
 addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad String
 addIdent ident ty = lift $ do
     modify $ \ st -> st { environment = (ident, ty) : environment st }
-    return (identToString (identOfKind ident))
+    return (applyRenames ident)
 ```
 
 `uniqueName` generates a new name with the given base and a new unique
@@ -1466,13 +1476,14 @@ pointer.
 
 ```haskell
 interpretExpr _ expr@(CVar ident _) = do
-    sym <- getIdent (SymbolIdent ident)
+    (name, sym) <- getIdent (SymbolIdent ident)
     case sym of
-        Just (mut, ty) -> return Result
-            { resultType = ty
-            , isMutable = mut
-            , result = Rust.Var (Rust.VarName (identToString ident))
-            }
+        Just (mut, ty) -> do
+            return Result
+                { resultType = ty
+                , isMutable = mut
+                , result = Rust.Var (Rust.VarName name)
+                }
         Nothing -> badSource expr "undefined variable"
 ```
 
@@ -1956,11 +1967,11 @@ baseTypeOf specs = do
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        mty <- getIdent (StructIdent ident)
+        (name, mty) <- getIdent (StructIdent ident)
         return $ (,) mut $ case mty of
             Just (_, ty) -> ty
             -- FIXME: treating incomplete types as having no fields, but that's probably wrong
-            Nothing -> IsStruct (identToString ident) []
+            Nothing -> IsStruct name []
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
             (storage, base) <- baseTypeOf spec
@@ -1983,7 +1994,7 @@ baseTypeOf specs = do
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
     go spec@(CTypeDef ident _) (mut1, _) = do
-        mty <- getIdent (TypedefIdent ident)
+        (_, mty) <- getIdent (TypedefIdent ident)
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing -> badSource spec "undefined type"
