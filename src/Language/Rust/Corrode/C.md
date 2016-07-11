@@ -766,6 +766,44 @@ calls work. (Note that function definitions can't be anonymous.)
         Just ident -> addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
 ```
 
+In C, `main` should be a function with one of these types:
+
+```c
+int main(void);
+int main(int argc, char *argv[]);
+int main(int argc, char *argv[], char *envp[]);
+```
+
+In Rust, `main` must be declared like this (though the return type
+should usually be left off as it's implied):
+
+```rust
+fn main() -> () { }
+```
+
+So when we encounter a C function named `main`, we can't translate it
+as-is or Rust will reject it. Instead we rename it (see `applyRenames`
+above) and emit a wrapper function that gets the command line arguments
+and environment and passes them to the renamed `main`.
+
+```haskell
+    when (name == "_c_main") $ do
+        (pre, mainargs) <- case args of
+            [] -> return ([], [])
+            _ -> unimplemented declr
+        let call = Rust.Call (Rust.Var (Rust.VarName name)) mainargs
+        let unsafe = Rust.UnsafeExpr (Rust.Block [] (Just call))
+        let retvar = Rust.VarName "ret"
+        let exitfn = Rust.Var (Rust.VarName "std::process::exit")
+        emitItems [Rust.Item [] Rust.Private (
+            Rust.Function [] "main" [] (Rust.TypeName "()") (Rust.Block (
+                pre ++
+                [ Rust.Let Rust.Immutable retvar Nothing (Just unsafe)
+                , Rust.Stmt (Rust.Call exitfn [Rust.Var retvar])
+                ]
+            ) Nothing))]
+```
+
 Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
