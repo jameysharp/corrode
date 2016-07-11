@@ -389,7 +389,7 @@ for this translation unit it becomes clear.
 ```haskell
     itemNames = catMaybes
         [ case item of
-            Rust.Item _ _ (Rust.Function name _ _ _) -> Just name
+            Rust.Item _ _ (Rust.Function _ name _ _ _) -> Just name
             Rust.Item _ _ (Rust.Static _ (Rust.VarName name) _ _) -> Just name
             _ -> Nothing
         | item <- outputItems output
@@ -814,7 +814,7 @@ expression.
 ```haskell
         let block = Rust.Block (toBlock body') Nothing
         let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis (Rust.Function name formals (toRustType retTy) block))
+        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) block))
 ```
 
 

@@ -63,15 +63,23 @@ instance Pretty Item where
         [ text "#[" <> text attr <> text "]" | Attribute attr <- attrs ] ++
         [(if vis == Public then zeroWidthText "pub " else empty) <> pPrint k]
 
+data FunctionAttribute
+    = UnsafeFn
+    | ExternABI (Maybe String)
+
+instance Pretty FunctionAttribute where
+    pPrint UnsafeFn = text "unsafe"
+    pPrint (ExternABI mabi) = text "extern" <+> maybe empty (text . show) mabi
+
 data ItemKind
-    = Function String [(Mutable, Var, Type)] Type Block
+    = Function [FunctionAttribute] String [(Mutable, Var, Type)] Type Block
     | Static Mutable Var Type Expr
     | Struct String [(String, Type)]
     | Extern [ExternItem]
 
 instance Pretty ItemKind where
-    pPrint (Function nm args ret body) = pPrintBlock (cat
-        [ text "unsafe fn" <+> text nm <> text "("
+    pPrint (Function attrs nm args ret body) = pPrintBlock (cat
+        [ hsep (map pPrint attrs) <+> text "fn" <+> text nm <> text "("
         , nest 4 $ sep $ punctuate (text ",")
             [ sep [case mut of Mutable -> text "mut"; Immutable -> empty, pPrint v, text ":", pPrint t] | (mut, v, t) <- args ]
         , text ")" <+> if ret == TypeName "()" then empty else text "->" <+> pPrint ret
