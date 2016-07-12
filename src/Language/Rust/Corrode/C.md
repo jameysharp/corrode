@@ -1817,6 +1817,20 @@ strings.
         in map (toUpper . intToDigit) [u, l]
 ```
 
+C99 compound literals are really not much different than an initializer
+list with the type of the thing we are initializing included.
+
+```haskell
+interpretExpr _ (CCompoundLit decl initials info) = do
+    ty <- typeName decl
+    final <- interpretInitializer ty (CInitList initials info)
+    return Result
+        { resultType = ty
+        , isMutable = Rust.Immutable
+        , result = final
+        }
+```
+
 GCC's "statement expression" extension translates pretty directly to
 Rust block expressions.
 
