@@ -2028,7 +2028,7 @@ baseTypeOf specs = do
                 let name = identToString ident
                 addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
             Nothing -> uniqueName "Struct"
-        let attrs = [Rust.Attribute "derive(Clone, Copy)"]
+        let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
     go spec@(CTypeDef ident _) (mut1, _) = do
