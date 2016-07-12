@@ -766,42 +766,10 @@ calls work. (Note that function definitions can't be anonymous.)
         Just ident -> addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
 ```
 
-In C, `main` should be a function with one of these types:
-
-```c
-int main(void);
-int main(int argc, char *argv[]);
-int main(int argc, char *argv[], char *envp[]);
-```
-
-In Rust, `main` must be declared like this (though the return type
-should usually be left off as it's implied):
-
-```rust
-fn main() -> () { }
-```
-
-So when we encounter a C function named `main`, we can't translate it
-as-is or Rust will reject it. Instead we rename it (see `applyRenames`
-above) and emit a wrapper function that gets the command line arguments
-and environment and passes them to the renamed `main`.
+Translating `main` requires special care; see `wrapMain` below.
 
 ```haskell
-    when (name == "_c_main") $ do
-        (pre, mainargs) <- case args of
-            [] -> return ([], [])
-            _ -> unimplemented declr
-        let call = Rust.Call (Rust.Var (Rust.VarName name)) mainargs
-        let unsafe = Rust.UnsafeExpr (Rust.Block [] (Just call))
-        let retvar = Rust.VarName "ret"
-        let exitfn = Rust.Var (Rust.VarName "std::process::exit")
-        emitItems [Rust.Item [] Rust.Private (
-            Rust.Function [] "main" [] (Rust.TypeName "()") (Rust.Block (
-                pre ++
-                [ Rust.Let Rust.Immutable retvar Nothing (Just unsafe)
-                , Rust.Stmt (Rust.Call exitfn [Rust.Var retvar])
-                ]
-            ) Nothing))]
+    when (name == "_c_main") (wrapMain declr name (map snd args))
 ```
 
 Open a new scope for the body of this function, while making the return
@@ -852,6 +820,192 @@ expression.
 ```haskell
         let attrs = [Rust.Attribute "no_mangle"]
         return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) (statementsToBlock body')))
+```
+
+
+Special-case translation for `main`
+===================================
+
+In C, `main` should be a function with one of these types:
+
+```c
+int main(void);
+int main(int argc, char *argv[]);
+int main(int argc, char *argv[], char *envp[]);
+```
+
+In Rust, `main` must be declared like this (though the return type
+should usually be left off as it's implied):
+
+```rust
+fn main() -> () { }
+```
+
+So when we encounter a C function named `main`, we can't translate it
+as-is or Rust will reject it. Instead we rename it (see `applyRenames`
+above) and emit a wrapper function that gets the command line arguments
+and environment and passes them to the renamed `main`.
+
+```haskell
+wrapMain :: CDeclr -> String -> [CType] -> EnvMonad ()
+wrapMain declr realName argTypes = do
+```
+
+We decide what the wrapper should do based on what argument types the C
+`main` expects. The code for different cases is divided into two parts:
+some setup statements which `let`-bind some variables; and a list of
+expressions to be passed as arguments to the real `main` function, which
+presumably use those `let`-bound variables.
+
+```haskell
+    (setup, args) <- wrapArgv argTypes
+```
+
+The real `main` will have been translated as an `unsafe fn`, like every
+function we translate, so we need to wrap the call to it in an `unsafe`
+block. And we need to pass the exit status code that it returns to
+Rust's `std::process::exit` function, because Rust programs don't return
+exit status from `main`.
+
+```haskell
+    let ret = Rust.VarName "ret"
+    emitItems [Rust.Item [] Rust.Private (
+        Rust.Function [] "main" [] (Rust.TypeName "()") (Rust.Block (
+            setup ++
+            [ bind Rust.Immutable ret $
+                Rust.UnsafeExpr $ Rust.Block [] $ Just $
+                call realName args
+            , Rust.Stmt (call "std::process::exit" [Rust.Var ret])
+            ]
+        ) Nothing))]
+    where
+```
+
+Writing AST constructors by hand is tedious. Here are some helper
+functions that allow us to write shorter code. Each one is specialized
+for this function's needs.
+
+- `bind` creates a `let`-binding with an inferred type and an initial
+  value.
+
+    ```haskell
+        bind mut var val = Rust.Let mut var Nothing (Just val)
+    ```
+
+- `call` can only call statically-known functions, not function
+  pointers.
+
+    ```haskell
+        call fn args = Rust.Call (Rust.Var (Rust.VarName fn)) args
+    ```
+
+- `chain` produces method calls, but takes the object as its last
+  argument, so it reads in reverse.
+
+    ```haskell
+        chain method args obj = Rust.MethodCall obj (Rust.VarName method) args
+    ```
+
+    `a().b().c()` is written as:
+
+    ``` { .haskell .ignore }
+    chain "c" [] $ chain "b" [] $ call "a" []
+    ```
+
+Now let's examine the argument types. If `main` is declared `(void)`,
+then we don't need to pass it any arguments or do any setup.
+
+```haskell
+    wrapArgv [] = return ([], [])
+```
+
+But if it's declared `(int, char *argv[])`, then we need to call
+`std::env::args_os()` and convert the argument strings to C-style
+strings.
+
+```haskell
+    wrapArgv (argcType@(IsInt Signed (BitWidth 32))
+            : IsPtr Rust.Mutable (IsPtr Rust.Mutable ty)
+            : []) | ty == charType
+        = return (setup, args)
+        where
+        argv_storage = Rust.VarName "argv_storage"
+        argv = Rust.VarName "argv"
+        str = Rust.VarName "str"
+        vec = Rust.VarName "vec"
+        setup =
+```
+
+Convert each argument string to a vector of bytes, append a terminating
+NUL character, and save a reference to the vector so it is not
+deallocated until after the real `main` returns.
+
+Converting an `OsString` to a `Vec<u8>` is only allowed if we bring the
+Unix-specific `OsStringExt` trait into scope.
+
+```haskell
+            [ Rust.StmtItem [] (Rust.Use "std::os::unix::ffi::OsStringExt")
+            , bind Rust.Mutable argv_storage $
+                chain "collect::<Vec<_>>" [] $
+                chain "map" [
+                    Rust.Lambda [str] (Rust.BlockExpr (Rust.Block
+                        [ bind Rust.Mutable vec (chain "into_vec" [] (Rust.Var str))
+                        , Rust.Stmt (chain "push" [
+                                Rust.Lit (Rust.LitRep "b'\\0'")
+                            ] (Rust.Var vec))
+                        ] (Just (Rust.Var vec))))
+                ] $
+                call "std::env::args_os" []
+```
+
+In C, `argv` is required to be a modifiable NULL-terminated array of
+modifiable strings. We have modifiable strings as array-backed vectors
+in `argv_storage`, so now we need to construct an array-backed vector of
+pointers to those strings.
+
+Once we save these pointers, we _must not_ do anything that might change
+the length of the vectors we got them from, as that could re-allocate
+the backing array and invalidate our pointer.
+
+[`Iterator.chain`](https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html#method.chain)
+produces a new iterator which yields all the elements of the original
+iterator, followed by anything in the second iterable. We just want to
+add one thing at the end of the array&mdash;namely, a NULL
+pointer&mdash;and conveniently, the `Option` type is iterable.
+
+```haskell
+            , bind Rust.Mutable argv $
+                chain "collect::<Vec<_>>" [] $
+                chain "chain" [call "Some" [call "std::ptr::null_mut" []]] $
+                chain "map" [
+                    Rust.Lambda [vec] (chain "as_mut_ptr" [] (Rust.Var vec))
+                ] $
+                chain "iter_mut" [] $
+                Rust.Var argv_storage
+            ]
+```
+
+In C, `argc` is the number of elements in the `argv` array, but not
+counting the terminating NULL pointer. So we pass the number of items
+that are in `argv_storage` instead.
+
+For `main`'s second argument, we pass a pointer to the array that backs
+`argv`. After this we _must not_ do anything that might change the
+length of `argv`, and we must ensure that `argv` is not deallocated
+until after the real `main` returns.
+
+```haskell
+        args =
+            [ Rust.Cast (chain "len" [] (Rust.Var argv_storage)) (toRustType argcType)
+            , chain "as_mut_ptr" [] (Rust.Var argv)
+            ]
+```
+
+We can't translate a program containing a `main` function unless we know
+how to construct all of the arguments it expects.
+
+```haskell
+    wrapArgv _ = unimplemented declr
 ```
 
 

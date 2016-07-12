@@ -32,6 +32,7 @@ data Mutable = Immutable | Mutable
 data Stmt
     = Stmt Expr
     | Let Mutable Var (Maybe Type) (Maybe Expr)
+    | StmtItem [Attribute] ItemKind
 
 instance Pretty Stmt where
     -- Any statement consisting of an expression whose syntax ends with
@@ -48,6 +49,8 @@ instance Pretty Stmt where
         , nest 4 $ maybe empty (\ ty -> text ":" <+> pPrint ty) mty
         , nest 4 $ maybe empty (\ initial -> text "=" <+> pPrint initial) minit
         ] <> text ";"
+    pPrint (StmtItem attrs k) = vcat $
+        [ text "#[" <> text attr <> text "]" | Attribute attr <- attrs ] ++ [pPrint k]
 
 data Block = Block [Stmt] (Maybe Expr)
 
@@ -76,6 +79,7 @@ data ItemKind
     | Static Mutable Var Type Expr
     | Struct String [(String, Type)]
     | Extern [ExternItem]
+    | Use String
 
 instance Pretty ItemKind where
     pPrint (Function attrs nm args ret body) = pPrintBlock (cat
@@ -98,6 +102,7 @@ instance Pretty ItemKind where
         : map (nest 4 . pPrint) defs
         ++ [text "}"]
         )
+    pPrint (Use path) = text "use" <+> text path <> text ";"
 
 data ExternItem
     = ExternFn String [(Var, Type)] Bool Type
@@ -126,6 +131,7 @@ data Expr
     | StructExpr String [(String, Expr)]
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
+    | Lambda [Var] Expr
     | Member Expr Var
     | BlockExpr Block
     | UnsafeExpr Block
@@ -208,6 +214,9 @@ instance Pretty Expr where
             : punctuate (text ",") (map (nest 4 . pPrint) args)
             ++ [text ")"]
             )
+        Lambda args body ->
+            let args' = sep (punctuate (text ",") (map pPrint args))
+            in text "|" <> args' <> text "|" <+> pPrint body
         Member obj field -> pPrintPrec l 13 obj <> text "." <> pPrint field
         -- If a block is at the beginning of a statement, Rust parses it
         -- as if it were followed by a semicolon. Parenthesizing all
