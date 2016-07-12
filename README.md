@@ -21,14 +21,26 @@ As of now, there are no pre-built binaries available, so you need to build the
 project yourself, but don't let that scare you away; clone the project, `cd`
 into it and follow along :)
 
-The easiest way to build the project is to use the
-[Haskell Stack](http://haskellstack.org) tool. If you don't have it, head over
-to their website and follow the instructions for installing it on your machine.
+Ensure that you have GHC and the `cabal-install` tool installed by following
+the [directions on haskell.org](https://www.haskell.org/downloads#minimal).
+After that, you can build `corrode` by navigating to the `corrode` directory
+and typing
+
+```
+cabal install
+```
+
+This puts the `corrode` executable in `~/.cabal/bin`, so ensure that that
+location is in your `$PATH`.
+
+Alternately, you can use the [Haskell Stack](http://haskellstack.org) tool
+for Haskell development. If you don't have it, head over to their website
+and follow the instructions for installing it on your machine.
 
 Install the Glasgow Haskell Compiler using ```stack setup```. You can skip this
-step if you already have a version of GHC installed your system.
-
-To build and install `corrode`, run:
+step if you already have a version of GHC installed on your system.
+You can then build and install `corrode` by navigating to the `corrode`
+directory and running:
 
 ```
 stack install
