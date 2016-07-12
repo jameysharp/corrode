@@ -926,8 +926,9 @@ strings.
 ```haskell
     wrapArgv (argcType@(IsInt Signed (BitWidth 32))
             : IsPtr Rust.Mutable (IsPtr Rust.Mutable ty)
-            : []) | ty == charType
-        = return (setup, args)
+            : rest) | ty == charType = do
+        (envSetup, envArgs) <- wrapEnvp rest
+        return (setup ++ envSetup, args ++ envArgs)
         where
         argv_storage = Rust.VarName "argv_storage"
         argv = Rust.VarName "argv"
@@ -1006,6 +1007,24 @@ how to construct all of the arguments it expects.
 
 ```haskell
     wrapArgv _ = unimplemented declr
+```
+
+After handling `argc` and `argv`, we might see a third argument,
+conventionally called `envp`. On POSIX systems, we can just pass the
+pointer stored in a global variable named `environ` for this argument.
+
+```haskell
+    wrapEnvp [] = return ([], [])
+    wrapEnvp [arg@(IsPtr Rust.Mutable (IsPtr Rust.Mutable ty))] | ty == charType
+        = return (setup, args)
+        where
+        environ = Rust.VarName "environ"
+        setup =
+            [ Rust.StmtItem [] $
+                Rust.Extern [Rust.ExternStatic Rust.Immutable environ (toRustType arg)]
+            ]
+        args = [Rust.Var environ]
+    wrapEnvp _ = unimplemented declr
 ```
 
 
