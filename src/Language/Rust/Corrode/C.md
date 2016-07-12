@@ -947,7 +947,9 @@ loop body must be a block.
 ```haskell
 interpretStatement (CWhile c b False _) = do
     c' <- interpretExpr True c
-    (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
+    (b', _) <- loopScope
+        (Rust.Break Nothing) (Rust.Continue Nothing)
+        (interpretStatement b)
     return [Rust.Stmt (Rust.While Nothing (toBool c') (statementsToBlock b'))]
 ```
 
@@ -956,16 +958,33 @@ anything quite like them.
 
 Oh, the initialization/declaration part of the loop is easy enough. Open
 a new scope, insert any assignments and `let`-bindings at the beginning
-of it, and we're good to go.
+of it, and we're good to go. Note that we need to wrap everything in a
+block if we have `let`-bindings, but not otherwise.
 
 ```haskell
-interpretStatement (CFor initial mcond mincr b _) = scope $ do
-    pre <- case initial of
-        Left Nothing -> return []
-        Left (Just expr) -> do
-            expr' <- interpretExpr False expr
-            return [Rust.Stmt (result expr')]
-        Right decls -> interpretDeclarations makeLetBinding decls
+interpretStatement (CFor initial mcond mincr b _) = scope $ case initial of
+    Left Nothing -> generateLoop
+    Left (Just expr) -> do
+        expr' <- interpretExpr False expr
+        loop <- generateLoop
+        return (Rust.Stmt (result expr') : loop)
+    Right decls -> do
+        decls' <- interpretDeclarations makeLetBinding decls
+        loop <- generateLoop
+        return [Rust.Stmt (Rust.BlockExpr (Rust.Block (decls' ++ loop) Nothing))]
+    where
+```
+
+If the condition is empty, the loop should translate to Rust's infinite
+`loop` expression. Otherwise it translates to a `while` loop with the
+given condition. In either case, we may apply a label to this loop.
+
+```haskell
+    loopHead lt b' = case mcond of
+        Nothing -> return [Rust.Stmt (Rust.Loop lt (statementsToBlock b'))]
+        Just cond -> do
+            cond' <- interpretExpr True cond
+            return [Rust.Stmt (Rust.While lt (toBool cond') (statementsToBlock b'))]
 ```
 
 The challenge is that Rust doesn't have a loop form that updates
@@ -995,20 +1014,25 @@ statements into
 so that they refer to the outer loop, not the one we inserted.
 
 ```haskell
-    (lt, b') <- case mincr of
+    generateLoop = case mincr of
         Just incr -> do
             breakName <- uniqueName "break"
             continueName <- uniqueName "continue"
             let breakTo = Just (Rust.Lifetime breakName)
             let continueTo = Just (Rust.Lifetime continueName)
 
-            (b', (br,co)) <- loopScope (Rust.Break breakTo) (Rust.Break continueTo) (interpretStatement b)
-            incr' <- exprToStatements <$> interpretExpr False incr
+            (b', (Any sawBreak, Any sawContinue)) <- loopScope
+                (Rust.Break breakTo) (Rust.Break continueTo)
+                (interpretStatement b)
+            let inner = if sawContinue
+                    then [Rust.Stmt (Rust.Loop continueTo (Rust.Block
+                            (b' ++ [Rust.Stmt (Rust.Break Nothing)])
+                        Nothing))]
+                    else b'
 
-            let loop = Rust.Loop continueTo (statementsToBlock (b' ++ [ Rust.Stmt (Rust.Break Nothing) ]))
-
-            return ( if getAny br then breakTo else Nothing
-                   , if getAny co then [Rust.Stmt loop] ++ incr' else b' ++ incr' )
+            incr' <- interpretExpr False incr
+            loopHead (if sawBreak then breakTo else Nothing)
+                (inner ++ exprToStatements incr')
 ```
 
 We can generate simpler code in the special case that this `for` loop
@@ -1018,34 +1042,10 @@ expressions, with no magic loops inserted into the body.
 
 ```haskell
         Nothing -> do
-            (b', _) <- loopScope (Rust.Break Nothing) (Rust.Continue Nothing) (interpretStatement b)
-            return (Nothing, b')
-```
-
-If the condition is empty, the loop should translate to Rust's infinite
-`loop` expression. Otherwise it translates to a `while` loop with the
-given condition. In either case, we apply the label selected previously
-to this loop.
-
-```haskell
-    loop <- case mcond of
-        Nothing -> return (Rust.Loop lt (statementsToBlock b'))
-        Just cond -> do
-            cond' <- interpretExpr True cond
-            return (Rust.While lt (toBool cond') (statementsToBlock b'))
-```
-
-Now we have all the pieces to assemble a Rust equivalent to the original
-`for` loop. Create a block, beginning with any initialization and ending
-with the selected variety of loop. Furthermore, if we didn't even have to
-generate any bindings before the loop, we can even avoid having to wrap
-everything in an extra brace block.
-
-```haskell
-    let stmts = pre ++ [Rust.Stmt loop]
-    return $ case initial of
-        Left _ -> stmts
-        Right _ -> [Rust.Stmt (Rust.BlockExpr (statementsToBlock stmts))]
+            (b', _) <- loopScope
+                (Rust.Break Nothing) (Rust.Continue Nothing)
+                (interpretStatement b)
+            loopHead Nothing b'
 ```
 
 `continue` and `break` statements translate to whatever expression we
