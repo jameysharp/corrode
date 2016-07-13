@@ -1446,7 +1446,7 @@ result of a cast is never a legal l-value.
 
 ```haskell
 interpretExpr _ (CCast decl expr _) = do
-    ty <- typeName decl
+    (_mut, ty) <- typeName decl
     expr' <- interpretExpr True expr
     return Result
         { resultType = ty
@@ -1596,7 +1596,7 @@ C's `sizeof` and `alignof` operators translate to calls to Rust's
 
 ```haskell
 interpretExpr _ (CSizeofType decl _) = do
-    ty <- typeName decl
+    (_mut, ty) <- typeName decl
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
@@ -1604,7 +1604,7 @@ interpretExpr _ (CSizeofType decl _) = do
         , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty' ++ ">"))) []
         }
 interpretExpr _ (CAlignofType decl _) = do
-    ty <- typeName decl
+    (_mut, ty) <- typeName decl
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
@@ -1822,11 +1822,11 @@ list with the type of the thing we are initializing included.
 
 ```haskell
 interpretExpr _ (CCompoundLit decl initials info) = do
-    ty <- typeName decl
+    (mut, ty) <- typeName decl
     final <- interpretInitializer ty (CInitList initials info)
     return Result
         { resultType = ty
-        , isMutable = Rust.Immutable
+        , isMutable = mut
         , result = final
         }
 ```
@@ -2303,7 +2303,7 @@ mean the function takes no arguments.
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
-typeName :: CDecl -> EnvMonad CType
+typeName :: CDecl -> EnvMonad (Rust.Mutable, CType)
 typeName decl@(CDecl spec declarators _) = do
     (storage, base) <- baseTypeOf spec
     case storage of
@@ -2311,10 +2311,10 @@ typeName decl@(CDecl spec declarators _) = do
         Nothing -> return ()
     -- Declaration mutability has no effect in type names.
     case declarators of
-        [] -> return (snd base)
+        [] -> return base
         [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] -> do
-            (_mut, isFunc, ty) <- derivedTypeOf base declr
+            (mut, isFunc, ty) <- derivedTypeOf base declr
             when isFunc (badSource decl "use of function type")
-            return ty
+            return (mut, ty)
         _ -> badSource decl "type name"
 ```
