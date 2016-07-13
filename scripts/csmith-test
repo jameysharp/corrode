@@ -1,98 +1,191 @@
-#!/bin/sh
+#!/usr/bin/env python3
 
-# Stop if any command fails.
-set -e
+# Run this script from an empty temporary directory; it places all of
+# its output in the current working directory.
+#
+# You probably need to run this program with the include path for
+# csmith.h; for example:
+#   -I/usr/local/include/csmith-2.3.0
+#
+# You may pass -D or -U flags for the C pre-processor as well.
+#
+# In addition, you may pass flags for csmith. This is especially useful
+# if you have the random seed from a previous run and you want to retry
+# it:
+#    --seed <seed>
 
-CFLAGS='-I/usr/local/include/csmith-2.3.0 -DCSMITH_MINIMAL -DUSE_MATH_MACROS'
+import os
+import re
+import subprocess
+import sys
 
+# How long to wait, in seconds, for various subprocesses to finish.
+csmith_timeout = 90
+compiler_timeout = 120
+prog_timeout = 8
+
+# Disable operations Corrode can't handle yet.
+#
+# NOTE: Although Corrode supports pointers, we can't use them together
+# with global variables because Rust doesn't allow storing the address
+# of one static variable in another. Given the choice between globals or
+# pointers, we currently have to pick globals because otherwise csmith's
+# generated test harness doesn't report anything meaningful.
+CSMITH_FLAGS = [
+    '--no-arrays',
+    '--no-bitfields',
+    '--no-jumps',
+    '--no-packed-struct',
+    '--no-pointers',
+    '--no-unions',
+    '--no-volatiles',
+    '--no-builtins',
+]
+
+# Disable all warnings from the compilers, using `-w` for gcc/clang and
+# `-A warnings` for rustc. csmith-generated programs trigger plenty of
+# warnings and that's OK. We only care that the program can be compiled
+# without errors.
+#
+# When pre-processing the C source with either the C compiler or
+# Corrode, we also define macros that make `csmith.h` use fewer features
+# of standard C, so Corrode has a better shot at translating it.
+CFLAGS = ['-w', '-DCSMITH_MINIMAL', '-DUSE_MATH_MACROS']
+RUSTFLAGS = ['-A', 'warnings']
+
+compiler_env = os.environ.copy()
 # If ccache is installed, there's no point caching the builds of these
 # randomly generated C files.
-export CCACHE_DISABLE=1
+compiler_env['CCACHE_DISABLE'] = '1'
 
-# Place the generated files in a temporary directory.
-outdir="`mktemp --tmpdir -d corrode-csmith-XXXX`"
-cd "$outdir"
-echo " *** Test directory: $outdir" >&2
+def test():
+    cfile = 'random.c'
+    rsfile = 'random.rs'
+    cprog = './via-c'
+    rsprog = './via-rust'
 
-(
-    # In case the various programs display error messages, print each
-    # command we're about to run before running it.
-    set -x
+    try:
+        # Generate a new random C program. Pass --output last so the
+        # user can't accidentally override it.
+        subprocess.run(['csmith'] + CSMITH_FLAGS + ['--output', cfile],
+            check=True, timeout=csmith_timeout, env=compiler_env)
 
-    # Generate a random C program which uses operations we expect
-    # Corrode to be able to handle.
-    #
-    # NOTE: Although Corrode supports pointers, we can't use them
-    # together with global variables because Rust doesn't allow storing
-    # the address of one static variable in another. Given the choice
-    # between globals or pointers, we currently have to pick globals
-    # because otherwise csmith's generated test harness doesn't report
-    # anything meaningful.
-    csmith \
-        --no-arrays \
-        --no-bitfields \
-        --no-jumps \
-        --no-packed-struct \
-        --no-pointers \
-        --no-unions \
-        --no-volatiles \
-        --no-builtins \
-        "$@" --output random.c
+        # If csmith didn't generate any variables that it could update
+        # the CRC with, this program is boring and we shouldn't bother
+        # testing it.
+        with open(cfile) as f:
+            crc_count = sum('transparent_crc(' in line for line in f)
+        if not crc_count:
+            return
 
-    # We disable all warnings from the compilers, using `-w` for GCC and
-    # `-A warnings` for rustc. csmith-generated programs trigger plenty
-    # of warnings and that's OK. We only care that the program can be
-    # compiled without errors.
+        # Compile with a real C compiler for reference.
+        subprocess.run([
+            'gcc',
+            '-o', cprog,
+            cfile
+        ] + CFLAGS, check=True, timeout=compiler_timeout, env=compiler_env)
+    except subprocess.SubprocessError:
+        # If either csmith or the C compiler failed, we won't find any
+        # interesting Corrode or Rust bugs with this program.
+        return
 
-    # Compile to a binary named `via-c` using GCC.
-    gcc -w $CFLAGS -o via-c random.c
+    try:
+        # Translate this C program to Rust.
+        subprocess.run([
+            'corrode',
+            cfile
+        ] + CFLAGS, check=True, timeout=compiler_timeout, env=compiler_env)
 
-    # Compile to a binary named `via-rust` by translating to Rust using
-    # Corrode and then compiling that source using rustc.
-    corrode $CFLAGS random.c
-    rustc -A warnings -o via-rust random.rs
-)
+        # Compile the generated Rust program.
+        subprocess.run([
+            'rustc',
+            '-o', rsprog,
+            rsfile
+        ] + RUSTFLAGS, check=True, timeout=compiler_timeout, env=compiler_env)
+    except subprocess.SubprocessError as e:
+        # Found a compile-time bug!
+        return "compiling via Rust failed: {}".format(e)
 
-# Test both versions of the random program.
-pids=""
-for lang in c rust
-do
-    mkdir out-$lang
-    # Test in both normal and verbose modes.
-    for arg in '' 1
-    do
-        # Run in parallel.
-        ./via-$lang $arg > out-$lang/out$arg 2>&1 &
-        pids="$pids $!"
-    done
-done
+    # Get reference output from the version compiled with a native C
+    # compiler. If any of the reference output looks wrong, comparing to
+    # the output from the Rust version won't be interesting.
+    try:
+        ref_long = subprocess.run(
+            [cprog, '1'], check=True, timeout=prog_timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-# Kill all variants after a timeout.
-(
-    sleep 1
-    echo " *** Timeout!" >&2
-    kill -9 $pids 2>/dev/null
-) & timeoutpid=$!
+        # Long output must have one line per call to `transparent_crc`.
+        if ref_long.stderr or ref_long.stdout.count(b'\n') != crc_count:
+            return
 
-# Wait for all variants to finish.
-wait $pids || true
+        ref_short = subprocess.run(
+            [cprog], check=True, timeout=prog_timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-# Abort the timeout if it hasn't tripped already.
-kill $timeoutpid 2>/dev/null || true
+        # Short output must have one checksum line.
+        if ref_short.stderr or not re.match(b'checksum = [0-9a-fA-F]+\n$', ref_short.stdout):
+            return
+    except subprocess.SubprocessError:
+        # Give up if either mode of the reference version timed out or
+        # exited unsuccessfully.
+        return
 
-# Compare the outputs and fail if they're different.
-diff -r out-c out-rust
+    # Report any differences between the reference output and the Rust
+    # version, for both short and long output; don't stop at the first
+    # failure.
+    return '\n'.join(filter(None, (
+        result_differences([rsprog], ref_short),
+        result_differences([rsprog, '1'], ref_long),
+    )))
 
-# Also fail if any outputs are empty.
-empty=`find out-c out-rust -type f -empty`
-if test -n "$empty"
-then
-    echo " *** Empty outputs:" $empty >&2
-    false
-fi
+def result_differences(cmd, ref):
+    cmdstr = ' '.join(cmd)
 
-# If everything went well, delete the temporary directory. If anything
-# went wrong, we exited earlier due to `set -e`, so we won't have
-# deleted the temporary files, so you can go investigate.
-cd - >/dev/null
-rm -rf "$outdir"
+    # Get output from the Rust version. If the command fails in any way,
+    # return a message rather than propagating an exception.
+    try:
+        test = subprocess.run(
+            cmd, timeout=prog_timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.TimeoutExpired:
+        return "'{}' timeout after {} seconds".format(cmdstr, test.timeout)
+
+    if test.stderr:
+        return "'{}' error:\n{}".format(cmdstr, test.stderr.decode())
+
+    if test.returncode != 0:
+        return "'{}' failed with status {}".format(cmdstr, test.returncode)
+
+    if not test.stdout:
+        return "'{}' produced no output".format(cmdstr)
+
+    ref_lines = ref.stdout.splitlines()
+    test_lines = test.stdout.splitlines()
+
+    if len(ref_lines) != len(test_lines):
+        return "'{}' produced wrong output:\n{}".format(cmdstr, test.stdout.decode())
+
+    differences = [
+        "expected '{}', got '{}'".format(r.decode(), t.decode())
+        for (r,t) in zip(ref_lines, test_lines)
+        if r != t
+    ]
+    if differences:
+        return "'{}' produced wrong output:\n{}".format(cmdstr, '\n'.join(differences))
+
+    # Otherwise, the test output matched the reference output. Hooray!
+    return None
+
+if __name__ == "__main__":
+    for arg in sys.argv[1:]:
+        # Put include-path and macro definitions in CFLAGS.
+        if arg.startswith(('-I', '-D', '-U')):
+            CFLAGS.append(arg)
+        # Pass anything else through to csmith.
+        else:
+            CSMITH_FLAGS.append(arg)
+
+    result = test()
+    if result:
+        print(result)
+        exit(1)
