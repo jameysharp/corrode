@@ -15,7 +15,9 @@
 #    --seed <seed>
 
 import os
+import os.path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -58,26 +60,33 @@ compiler_env = os.environ.copy()
 # randomly generated C files.
 compiler_env['CCACHE_DISABLE'] = '1'
 
-def test():
-    cfile = 'random.c'
-    rsfile = 'random.rs'
-    cprog = './via-c'
-    rsprog = './via-rust'
-
+def test(cfile):
     try:
         # Generate a new random C program. Pass --output last so the
         # user can't accidentally override it.
         subprocess.run(['csmith'] + CSMITH_FLAGS + ['--output', cfile],
             check=True, timeout=csmith_timeout, env=compiler_env)
+    except subprocess.SubprocessError:
+        # If csmith failed, we won't find any interesting Corrode or
+        # Rust bugs with this program.
+        return
 
-        # If csmith didn't generate any variables that it could update
-        # the CRC with, this program is boring and we shouldn't bother
-        # testing it.
-        with open(cfile) as f:
-            crc_count = sum('transparent_crc(' in line for line in f)
-        if not crc_count:
-            return
+    return check(cfile)
 
+def check(cfile):
+    rsfile = os.path.splitext(cfile)[0] + '.rs'
+    cprog = './via-c'
+    rsprog = './via-rust'
+
+    # If csmith didn't generate any variables that it could update the
+    # CRC with, this program is boring and we shouldn't bother testing
+    # it.
+    with open(cfile) as f:
+        crc_count = sum('transparent_crc(' in line for line in f)
+    if not crc_count:
+        return
+
+    try:
         # Compile with a real C compiler for reference.
         subprocess.run([
             'gcc',
@@ -85,8 +94,8 @@ def test():
             cfile
         ] + CFLAGS, check=True, timeout=compiler_timeout, env=compiler_env)
     except subprocess.SubprocessError:
-        # If either csmith or the C compiler failed, we won't find any
-        # interesting Corrode or Rust bugs with this program.
+        # If the C compiler failed, we won't find any interesting
+        # Corrode or Rust bugs with this program.
         return
 
     try:
@@ -176,16 +185,61 @@ def result_differences(cmd, ref):
     # Otherwise, the test output matched the reference output. Hooray!
     return None
 
+def creduce(origfile, errorfile):
+    reduced = 'reduced.c'
+
+    # Strip comments so creduce doesn't have to.
+    subprocess.run(['gcc',
+        '-P', '-fpreprocessed', '-dD', '-E',
+        '-o', reduced, origfile
+    ], check=True)
+
+    # Package up a recursive call to the current script into a temporary
+    # shell script, preserving all the options we were passed.
+    script = "test.sh"
+    extra_arg = '--reduce-check={},{}'.format(reduced,
+        os.path.abspath(errorfile))
+    with open(script, 'w') as f:
+        f.write('#!/bin/sh\n')
+        f.write(' '.join(
+            shlex.quote(arg)
+            for arg in ['exec'] + sys.argv + [extra_arg]
+        ) + ' > /dev/null 2>&1\n')
+    os.chmod(script, 0o755)
+
+    # Run creduce using the generated shell script.
+    subprocess.run(['creduce', script, reduced], check=True)
+
 if __name__ == "__main__":
+    checkpath = None
+
     for arg in sys.argv[1:]:
         # Put include-path and macro definitions in CFLAGS.
         if arg.startswith(('-I', '-D', '-U')):
             CFLAGS.append(arg)
+        # Check if we're being called recursively under creduce.
+        elif arg.startswith("--reduce-check="):
+            checkpath = arg.split('=', 1)[1].split(',', 1)
         # Pass anything else through to csmith.
         else:
             CSMITH_FLAGS.append(arg)
 
-    result = test()
+    if checkpath is not None:
+        # This input is "interesting" if `check` returned the same error
+        # message that we started with.
+        with open(checkpath[1]) as f:
+            expected_error = f.read()
+        if check(checkpath[0]) == expected_error:
+            exit(0)
+        # Otherwise it's boring and creduce should backtrack.
+        exit(1)
+
+    cfile = 'random.c'
+    result = test(cfile)
     if result:
         print(result)
+        with open('error', 'w') as f:
+            f.write(result)
+        print("reducing to a minimal test case...")
+        creduce(cfile, 'error')
         exit(1)
