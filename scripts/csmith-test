@@ -1,0 +1,98 @@
+#!/bin/sh
+
+# Stop if any command fails.
+set -e
+
+CFLAGS='-I/usr/local/include/csmith-2.3.0 -DCSMITH_MINIMAL -DUSE_MATH_MACROS'
+
+# If ccache is installed, there's no point caching the builds of these
+# randomly generated C files.
+export CCACHE_DISABLE=1
+
+# Place the generated files in a temporary directory.
+outdir="`mktemp --tmpdir -d corrode-csmith-XXXX`"
+cd "$outdir"
+echo " *** Test directory: $outdir" >&2
+
+(
+    # In case the various programs display error messages, print each
+    # command we're about to run before running it.
+    set -x
+
+    # Generate a random C program which uses operations we expect
+    # Corrode to be able to handle.
+    #
+    # NOTE: Although Corrode supports pointers, we can't use them
+    # together with global variables because Rust doesn't allow storing
+    # the address of one static variable in another. Given the choice
+    # between globals or pointers, we currently have to pick globals
+    # because otherwise csmith's generated test harness doesn't report
+    # anything meaningful.
+    csmith \
+        --no-arrays \
+        --no-bitfields \
+        --no-jumps \
+        --no-packed-struct \
+        --no-pointers \
+        --no-unions \
+        --no-volatiles \
+        --no-builtins \
+        "$@" --output random.c
+
+    # We disable all warnings from the compilers, using `-w` for GCC and
+    # `-A warnings` for rustc. csmith-generated programs trigger plenty
+    # of warnings and that's OK. We only care that the program can be
+    # compiled without errors.
+
+    # Compile to a binary named `via-c` using GCC.
+    gcc -w $CFLAGS -o via-c random.c
+
+    # Compile to a binary named `via-rust` by translating to Rust using
+    # Corrode and then compiling that source using rustc.
+    corrode $CFLAGS random.c
+    rustc -A warnings -o via-rust random.rs
+)
+
+# Test both versions of the random program.
+pids=""
+for lang in c rust
+do
+    mkdir out-$lang
+    # Test in both normal and verbose modes.
+    for arg in '' 1
+    do
+        # Run in parallel.
+        ./via-$lang $arg > out-$lang/out$arg 2>&1 &
+        pids="$pids $!"
+    done
+done
+
+# Kill all variants after a timeout.
+(
+    sleep 1
+    echo " *** Timeout!" >&2
+    kill -9 $pids 2>/dev/null
+) & timeoutpid=$!
+
+# Wait for all variants to finish.
+wait $pids || true
+
+# Abort the timeout if it hasn't tripped already.
+kill $timeoutpid 2>/dev/null || true
+
+# Compare the outputs and fail if they're different.
+diff -r out-c out-rust
+
+# Also fail if any outputs are empty.
+empty=`find out-c out-rust -type f -empty`
+if test -n "$empty"
+then
+    echo " *** Empty outputs:" $empty >&2
+    false
+fi
+
+# If everything went well, delete the temporary directory. If anything
+# went wrong, we exited earlier due to `set -e`, so we won't have
+# deleted the temporary files, so you can go investigate.
+cd - >/dev/null
+rm -rf "$outdir"
