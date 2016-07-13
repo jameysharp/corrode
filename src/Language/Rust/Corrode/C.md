@@ -689,19 +689,38 @@ that's a syntax error.
 > **FIXME**: This is particularly hard due to C99's semantics around
 > partial initialization! And the current implementation is woefully
 > incomplete. This version will throw a runtime exception if any labeled
-> initializers (e.g. `.field = 12`) are used, and it will generate
-> invalid Rust if there are fewer initializers than there are fields in
-> the `struct` type.
+> initializers (e.g. `.field = 12`) are used in an order different from
+> the one they were declared in.
 
 ```haskell
 interpretInitializer (IsStruct str fields) initial = case initial of
-    CInitList binds _ -> Rust.StructExpr str <$> sequence
-        [ case bind of
-            ([], v) -> (,) field <$> interpretInitializer ty v
-            _ -> unimplemented initial
-        | ((field, ty), bind) <- zip fields binds
-        ]
+    CInitList binds _ -> Rust.StructExpr str <$> processInits binds fields
     _ -> badSource initial "struct initializer"
+    where
+```
+
+Given that the list of initializers is already in the same order as the
+fields, we process the two lists similtaneously. If the next initializer
+has no designator, we just assume it is for the next field. If it
+has a member designator but it doesn't correspond to the next field,
+we zero-initialize the next field. Finally, if it has a member
+designator that corresponds to the next field, we use the initializer
+on the said next field.
+
+```haskell
+    processInits :: CInitList -> [(String, CType)] -> EnvMonad [(String, Rust.Expr)]
+    processInits [] fs = pure (fmap zeroInitializer <$> fs)
+    processInits _ [] = badSource initial "too many initializers"
+    processInits (([],v):vs) ((field,ty):fs) = do
+        v' <- interpretInitializer ty v
+        (:) (field,v') <$> processInits vs fs
+    processInits c@(([CMemberDesig ident _],v):vs) ((field,ty):fs)
+      | identToString ident /= field = (:) (field, zeroInitializer ty) <$> processInits c fs
+      | otherwise = do
+            v' <- interpretInitializer ty v
+            (:) (field,v') <$> processInits vs fs
+    processInits _ _ = unimplemented initial
+
 ```
 
 Initializers for scalar types must either be a bare expression or the
@@ -715,6 +734,20 @@ interpretInitializer ty (CInitList [([], CInitExpr initial _)] _)
 interpretInitializer _ initial = badSource initial "scalar initializer"
 ```
 
+Depending on the type, zero-initilization means something different. For
+pointers, since Rust has no NULL literal, we resort to casting 0 as a
+pointer (which is exactly what `std::ptr::null` does).
+
+```haskell
+zeroInitializer :: CType -> Rust.Expr
+zeroInitializer IsBool{} = Rust.Lit (Rust.LitRep "false")
+zeroInitializer IsInt{} = Rust.Lit (Rust.LitRep "0")
+zeroInitializer IsFloat{} = Rust.Lit (Rust.LitRep "0")
+zeroInitializer IsVoid{} = Rust.Lit (Rust.LitRep "()")
+zeroInitializer t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
+zeroInitializer t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
+zeroInitializer (IsStruct str fields) = Rust.StructExpr str (fmap (fmap zeroInitializer) fields)
+```
 
 Function definitions
 ====================
