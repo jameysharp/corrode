@@ -140,12 +140,14 @@ def check(cfile):
         return
 
     # Report any differences between the reference output and the Rust
-    # version, for both short and long output; don't stop at the first
-    # failure.
-    return '\n'.join(filter(None, (
-        result_differences([rsprog], ref_short),
-        result_differences([rsprog, '1'], ref_long),
-    )))
+    # version, for both short and long output. Prefer long-output
+    # differences as they allow reducing smaller test cases, but if the
+    # long output is the same we should still catch differences in the
+    # short output.
+    return (
+        result_differences([rsprog, '1'], ref_long) or
+        result_differences([rsprog], ref_short)
+    )
 
 def result_differences(cmd, ref):
     cmdstr = ' '.join(cmd)
