@@ -686,39 +686,66 @@ Initializers for compound types must be surrounded by braces. If we're
 initializing a compound type and see an initializer expression instead,
 that's a syntax error.
 
-> **FIXME**: This is particularly hard due to C99's semantics around
-> partial initialization! And the current implementation is woefully
-> incomplete. This version will throw a runtime exception if any labeled
-> initializers (e.g. `.field = 12`) are used in an order different from
-> the one they were declared in.
-
 ```haskell
 interpretInitializer (IsStruct str fields) initial = case initial of
-    CInitList binds _ -> Rust.StructExpr str <$> processInits binds fields
+    CInitList binds _ -> Rust.StructExpr str <$> (processInits fields =<< orderInits binds)
     _ -> badSource initial "struct initializer"
     where
+
+    fieldNames = map fst fields
 ```
 
-Given that the list of initializers is already in the same order as the
-fields, we process the two lists similtaneously. If the next initializer
-has no designator, we just assume it is for the next field. If it
-has a member designator but it doesn't correspond to the next field,
-we zero-initialize the next field. Finally, if it has a member
-designator that corresponds to the next field, we use the initializer
-on the said next field.
+In structs, the only valid lists of designators we tolerate are those with
+exactly one designator and with that designator correspoinding to a field.
+We return index of the field if there is a valid designator.
 
 ```haskell
-    processInits :: CInitList -> [(String, CType)] -> EnvMonad [(String, Rust.Expr)]
-    processInits [] fs = pure (fmap zeroInitializer <$> fs)
-    processInits _ [] = badSource initial "too many initializers"
-    processInits (([],v):vs) ((field,ty):fs) = do
+    memberDesig :: [CDesignator] -> EnvMonad (Maybe Int)
+    memberDesig [CMemberDesig ident _] = case elemIndex (identToString ident) fieldNames of
+                                           Nothing -> badSource initial "field in initializer"
+                                           index -> pure index
+    memberDesig [] = return Nothing
+    memberDesig _ = badSource initial "initializers in a struct can have at most one member designator"
+```
+
+The processing of the fields will be a lot easier if the designators
+inside the initializer are in order. Here, we can make use of
+`memberDesig` to similtaneously verify the designators make sense and get
+their order in the struct. Then, we cut up the list of initializers into
+chunks that start with designators and reassemble these chunks in order.
+
+```haskell
+    orderInits :: CInitList -> EnvMonad CInitList
+    orderInits list = do
+        list' <- sequence $ map (\i@(d,_) -> (,) i <$> memberDesig d) list
+        let (prefix,rest) = span (null . snd) list'
+
+            chunks [] = []
+            chunks (desig:cinits) = let (cinits',others) = span (null . snd) cinits
+                                    in (desig:cinits') : chunks others
+
+        return $! map fst (prefix ++ concat (sortOn (fromJust . snd . head) (chunks rest)))
+```
+
+Now, with a list of already ordered initializers, we process the
+initializers and fields similtaneously. If the next initializer has no
+designator, we just assume it is for the next field. If it has a member
+designator but it doesn't correspond to the next field, we zero-initialize
+the next field. Finally, if it has a member designator that corresponds to
+the next field, we use the initializer on the said next field.
+
+```haskell
+    processInits :: [(String, CType)] -> CInitList -> EnvMonad [(String, Rust.Expr)]
+    processInits fs [] = pure (fmap zeroInitializer <$> fs)
+    processInits [] _ = badSource initial "initializer"
+    processInits ((field,ty):fs) (([],v):vs) = do
         v' <- interpretInitializer ty v
-        (:) (field,v') <$> processInits vs fs
-    processInits c@(([CMemberDesig ident _],v):vs) ((field,ty):fs)
-      | identToString ident /= field = (:) (field, zeroInitializer ty) <$> processInits c fs
+        (:) (field,v') <$> processInits fs vs
+    processInits ((field,ty):fs) c@(([CMemberDesig ident _],v):vs)
+      | identToString ident /= field = (:) (field, zeroInitializer ty) <$> processInits fs c
       | otherwise = do
             v' <- interpretInitializer ty v
-            (:) (field,v') <$> processInits vs fs
+            (:) (field,v') <$> processInits fs vs
     processInits _ _ = unimplemented initial
 
 ```
