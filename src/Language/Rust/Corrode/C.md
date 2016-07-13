@@ -768,9 +768,9 @@ pointer (which is exactly what `std::ptr::null` does).
 ```haskell
 zeroInitializer :: CType -> Rust.Expr
 zeroInitializer IsBool{} = Rust.Lit (Rust.LitRep "false")
-zeroInitializer t@IsInt{} = let Rust.TypeName suffix = toRustType ty in Rust.Lit (Rust.LitRep ("0" ++ suffix))
-zeroInitializer t@IsFloat{} = let Rust.TypeName suffix = toRustType ty in Rust.Lit (Rust.LitRep ("0" ++ suffix))
-zeroInitializer t@IsVoid{} = let Rust.TypeName suffix = toRustType ty in Rust.Lit (Rust.LitRep ("0" ++ suffix))
+zeroInitializer IsInt{} = Rust.Lit (Rust.LitRep "0")
+zeroInitializer IsFloat{} = Rust.Lit (Rust.LitRep "0")
+zeroInitializer IsVoid{} = Rust.Lit (Rust.LitRep "()")
 zeroInitializer t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
 zeroInitializer t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
 zeroInitializer (IsStruct str fields) = Rust.StructExpr str (fmap (fmap zeroInitializer) fields)
