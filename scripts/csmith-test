@@ -80,11 +80,22 @@ wait $pids || true
 # Abort the timeout if it hasn't tripped already.
 kill $timeoutpid 2>/dev/null || true
 
+# The verbose outputs should have one line per call to transparent_crc
+# in the generated source.
+expected_crcs=`grep -cFw transparent_crc random.c` || true
+wrong_crcs=`wc -l out-*/out1 | sed '$d' | grep -v "^ *$expected_crcs "` || true
+if test -n "$wrong_crcs"
+then
+    echo " *** Wrong number of CRC outputs:" >&2
+    echo "$wrong_crcs"
+    false
+fi
+
 # Compare the outputs and fail if they're different.
 diff -r out-c out-rust
 
-# Also fail if any outputs are empty.
-empty=`find out-c out-rust -type f -empty`
+# Also fail if the normal outputs are empty.
+empty=`find out-*/out -empty`
 if test -n "$empty"
 then
     echo " *** Empty outputs:" $empty >&2
