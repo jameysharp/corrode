@@ -737,7 +737,7 @@ the next field, we use the initializer on the said next field.
 ```haskell
     processInits :: [(String, CType)] -> CInitList -> EnvMonad [(String, Rust.Expr)]
     processInits fs [] = pure (fmap zeroInitializer <$> fs)
-    processInits [] _ = badSource initial "initializer"
+    processInits [] _ = badSource initial "initializer list overflow"
     processInits ((field,ty):fs) (([],v):vs) = do
         v' <- interpretInitializer ty v
         (:) (field,v') <$> processInits fs vs
@@ -768,9 +768,9 @@ pointer (which is exactly what `std::ptr::null` does).
 ```haskell
 zeroInitializer :: CType -> Rust.Expr
 zeroInitializer IsBool{} = Rust.Lit (Rust.LitRep "false")
-zeroInitializer IsInt{} = Rust.Lit (Rust.LitRep "0")
-zeroInitializer IsFloat{} = Rust.Lit (Rust.LitRep "0")
 zeroInitializer IsVoid{} = Rust.Lit (Rust.LitRep "()")
+zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
+zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
 zeroInitializer t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
 zeroInitializer t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
 zeroInitializer (IsStruct str fields) = Rust.StructExpr str (fmap (fmap zeroInitializer) fields)
