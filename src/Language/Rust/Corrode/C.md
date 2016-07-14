@@ -37,6 +37,7 @@ import Data.Monoid
 import Data.List
 import Language.C
 import qualified Language.Rust.AST as Rust
+import Numeric
 import Text.PrettyPrint
 ```
 
@@ -1720,9 +1721,6 @@ interpretExpr _ expr@(CVar ident _) = do
 C literals (integer, floating-point, character, and string) translate to
 similar tokens in Rust.
 
-> **TODO**: If the integer literal was written in hex or octal, emit a
-> hex or octal literal in the generated Rust.
-
 > **TODO**: Figure out what to do about floating-point hex literals,
 > which as far as I can tell Rust doesn't support (yet?).
 
@@ -1730,12 +1728,16 @@ similar tokens in Rust.
 
 ```haskell
 interpretExpr _ expr@(CConst c) = case c of
-    CIntConst (CInteger v _repr flags) _ ->
+    CIntConst (CInteger v repr flags) _ ->
         let s = if testFlag FlagUnsigned flags then Unsigned else Signed
             w = if testFlag FlagLongLong flags || testFlag FlagLong flags
                 then WordWidth
                 else BitWidth 32
-        in return (literalNumber (IsInt s w) (show v))
+            str = case repr of
+                DecRepr -> show v
+                OctalRepr -> "0o" ++ showOct v ""
+                HexRepr -> "0x" ++ showHex v ""
+        in return (literalNumber (IsInt s w) str)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
         (v, "") -> return (literalNumber (IsFloat 64) v)
         (v, [_]) -> return (literalNumber (IsFloat 32) v)
