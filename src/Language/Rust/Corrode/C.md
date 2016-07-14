@@ -2096,7 +2096,7 @@ usual :: CType -> CType -> Maybe CType
 usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
 usual a@(IsFloat _) _ = Just a
 usual _ b@(IsFloat _) = Just b
-usual a@(intPromote -> IsInt as aw) b@(intPromote -> IsInt bs bw)
+usual (intPromote -> a@(IsInt as aw)) (intPromote -> b@(IsInt bs bw))
     | a == b = Just a
     | as == bs = Just (IsInt as (max aw bw))
     | as == Unsigned = Just (if aw >= bw then a else b)
