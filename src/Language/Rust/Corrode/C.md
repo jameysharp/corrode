@@ -1728,16 +1728,41 @@ similar tokens in Rust.
 
 ```haskell
 interpretExpr _ expr@(CConst c) = case c of
+```
+
+In C, the type of an integer literal depends on which types its value
+will fit in, constrained by its suffixes (`U` or `L`) and whether its
+representation is decimal or another base. See C99 6.4.4.1 paragraph 5
+and its subsequent table.
+
+For the purposes of deciding whether a literal will fit within the
+bounds of a type, we choose to pretend that `long` is 32 bits, but the
+Rust type we give it is `isize`. If a constant does not fit in 32 bits,
+we always give it type `i64`.
+
+```haskell
     CIntConst (CInteger v repr flags) _ ->
-        let s = if testFlag FlagUnsigned flags then Unsigned else Signed
-            w = if testFlag FlagLongLong flags || testFlag FlagLong flags
-                then WordWidth
-                else BitWidth 32
+        let allow_signed = not (testFlag FlagUnsigned flags)
+            allow_unsigned = not allow_signed || repr /= DecRepr
+            widths =
+                [ (32 :: Int,
+                    if any (`testFlag` flags) [FlagLongLong, FlagLong]
+                    then WordWidth else BitWidth 32)
+                , (64, BitWidth 64)
+                ]
+            allowed_types =
+                [ IsInt s w
+                | (bits, w) <- widths
+                , (True, s) <- [(allow_signed, Signed), (allow_unsigned, Unsigned)]
+                , v < 2 ^ (bits - if s == Signed then 1 else 0)
+                ]
             str = case repr of
                 DecRepr -> show v
                 OctalRepr -> "0o" ++ showOct v ""
                 HexRepr -> "0x" ++ showHex v ""
-        in return (literalNumber (IsInt s w) str)
+        in case allowed_types of
+        [] -> badSource expr "integer (too big)"
+        ty : _ -> return (literalNumber ty str)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
         (v, "") -> return (literalNumber (IsFloat 64) v)
         (v, [_]) -> return (literalNumber (IsFloat 32) v)
