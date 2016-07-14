@@ -190,11 +190,12 @@ def result_differences(cmd, ref):
 def creduce(origfile, errorfile):
     reduced = 'reduced.c'
 
-    # Strip comments so creduce doesn't have to.
+    # Preprocess the source. C-Reduce seems to be able to produce
+    # smaller output if the input was already pre-processed.
     subprocess.run(['gcc',
-        '-P', '-fpreprocessed', '-dD', '-E',
+        '-P', '-E',
         '-o', reduced, origfile
-    ], check=True)
+    ] + CFLAGS, check=True)
 
     # Package up a recursive call to the current script into a temporary
     # shell script, preserving all the options we were passed.
