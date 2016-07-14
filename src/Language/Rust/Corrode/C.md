@@ -1881,8 +1881,8 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         (IsPtr _ _, IsPtr _ _) -> unimplemented expr
         (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
         _ -> promote expr Rust.Sub lhs rhs
-    CShlOp -> promote expr Rust.ShiftL lhs rhs
-    CShrOp -> promote expr Rust.ShiftR lhs rhs
+    CShlOp -> shift Rust.ShiftL
+    CShrOp -> shift Rust.ShiftR
     CLeOp -> comparison Rust.CmpLT
     CGrOp -> comparison Rust.CmpGT
     CLeqOp -> comparison Rust.CmpLE
@@ -1895,6 +1895,14 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     CLndOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
     CLorOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
     where
+    shift op' = return Result
+        { resultType = lhsTy
+        , isMutable = Rust.Immutable
+        , result = op' (castTo lhsTy lhs) (castTo rhsTy rhs)
+        }
+        where
+        lhsTy = intPromote (resultType lhs)
+        rhsTy = intPromote (resultType rhs)
     comparison op' = case (resultType lhs, resultType rhs) of
         (IsPtr _ _, IsPtr _ _) -> return (promotePtr op' lhs rhs)
         _ -> do
