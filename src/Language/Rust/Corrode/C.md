@@ -2088,21 +2088,89 @@ C also defines a set of rules called the "usual arithmetic conversions"
 (C99 section 6.3.1.8) to determine what type binary operators should be
 evaluated at.
 
-> **XXX**: I'm not sure this correctly implements the standard. It
-> should get checked.
-
 ```haskell
 usual :: CType -> CType -> Maybe CType
 usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
 usual a@(IsFloat _) _ = Just a
 usual _ b@(IsFloat _) = Just b
-usual (intPromote -> a@(IsInt as aw)) (intPromote -> b@(IsInt bs bw))
-    | a == b = Just a
-    | as == bs = Just (IsInt as (max aw bw))
-    | as == Unsigned = Just (if aw >= bw then a else b)
-    | otherwise      = Just (if bw >= aw then b else a)
-usual _ _ = Nothing
 ```
+
+"Otherwise, the integer promotions are performed on both operands."
+
+```haskell
+usual origA origB = case (intPromote origA, intPromote origB) of
+```
+
+"Then the following rules are applied to the promoted operands:"
+
+- "If both operands have the same type, then no further conversion is
+  needed."
+
+    ```haskell
+        (a, b) | a == b -> Just a
+    ```
+
+- "Otherwise, if both operands have signed integer types or both have
+  unsigned integer types, the operand with the type of lesser integer
+  conversion rank is converted to the type of the operand with greater
+  rank."
+
+    ```haskell
+        (IsInt Signed sw, IsInt Unsigned uw) -> mixedSign sw uw
+        (IsInt Unsigned uw, IsInt Signed sw) -> mixedSign sw uw
+        (IsInt as aw, IsInt _bs bw) -> Just (IsInt as (max aw bw))
+        _ -> Nothing
+    ```
+
+At this point we have one signed and one unsigned operand. The usual
+arithmetic conversions don't care which order the operands are in, so
+`mixedSign` is a helper function where the signed width is always the
+first argument and the unsigned width is always the second.
+
+```haskell
+    where
+    mixedSign sw uw
+```
+
+- "Otherwise, if the operand that has unsigned integer type has rank
+  greater or equal to the rank of the type of the other operand, then
+  the operand with signed integer type is converted to the type of the
+  operand with unsigned integer type."
+
+    Section 6.3.1.1 says `long`, which we call `WordWidth`, has a higher
+    rank than `int`, which we call `BitWidth 32`.
+
+    ```haskell
+            | bitWidth 32 uw >= bitWidth 32 sw = Just (IsInt Unsigned uw)
+    ```
+
+- "Otherwise, if the type of the operand with signed integer type can
+  represent all of the values of the type of the operand with unsigned
+  integer type, then the operand with unsigned integer type is converted
+  to the type of the operand with signed integer type."
+
+    A signed type can represent all the values of an unsigned type if
+    the unsigned type's bit-width is strictly smaller than the signed
+    type's bit-width.
+
+    For our purposes, `long` can only represent the values of `unsigned`
+    types smaller than `int` (because `long` and `int` might be the same
+    size). But `unsigned long` values can only be represented by signed
+    types bigger than 64 bits (because `long` might be 64 bits instead).
+
+    ```haskell
+            | bitWidth 64 uw < bitWidth 32 sw = Just (IsInt Signed sw)
+    ```
+
+- "Otherwise, both operands are converted to the unsigned integer type
+  corresponding to the type of the operand with signed integer type."
+
+    Given the above definitions, this only happens for `unsigned long`
+    and `int64_t`, where we want to choose `uint64_t`.
+
+    ```haskell
+            | otherwise = Just (IsInt Unsigned sw)
+    ```
 
 Here's a helper function to apply the usual arithmetic conversions to
 both operands of a binary operator, cast as needed, and then combine the
@@ -2181,7 +2249,21 @@ data Signed = Signed | Unsigned
 
 data IntWidth = BitWidth Int | WordWidth
     deriving (Show, Eq, Ord)
+```
 
+Sometimes we want to treat `WordWidth` as being equivalent to a
+particular number of bits, but the choice depends on whether we want it
+to be its smallest width or its largest. (We choose to define the
+machine's word size as always either 32 or 64, because those are the
+only sizes Rust currently targets.)
+
+```haskell
+bitWidth :: Int -> IntWidth -> Int
+bitWidth wordWidth WordWidth = wordWidth
+bitWidth _ (BitWidth w) = w
+```
+
+```haskell
 data CType
     = IsBool
     | IsInt Signed IntWidth
