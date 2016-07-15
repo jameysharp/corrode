@@ -2103,6 +2103,13 @@ usual origA origB = case (intPromote origA, intPromote origB) of
 
 "Then the following rules are applied to the promoted operands:"
 
+Note that we refuse to translate this expression if either promoted type
+is not an integer type, or if the integer conversion ranks are
+incomparable according to `integerConversionRank`. The latter is not due
+to anything in the C standard, which describes a total order for integer
+conversion ranks. Rather, we refuse to translate these programs due to
+non-portable code complicating the translation.
+
 - "If both operands have the same type, then no further conversion is
   needed."
 
@@ -2118,8 +2125,11 @@ usual origA origB = case (intPromote origA, intPromote origB) of
     ```haskell
         (IsInt Signed sw, IsInt Unsigned uw) -> mixedSign sw uw
         (IsInt Unsigned uw, IsInt Signed sw) -> mixedSign sw uw
-        (IsInt as aw, IsInt _bs bw) -> Just (IsInt as (max aw bw))
+        (IsInt as aw, IsInt _bs bw) -> do
+            rank <- integerConversionRank aw bw
+            Just (IsInt as (if rank == GT then aw else bw))
         _ -> Nothing
+        where
     ```
 
 At this point we have one signed and one unsigned operand. The usual
@@ -2127,21 +2137,17 @@ arithmetic conversions don't care which order the operands are in, so
 `mixedSign` is a helper function where the signed width is always the
 first argument and the unsigned width is always the second.
 
-```haskell
-    where
-    mixedSign sw uw
-```
-
 - "Otherwise, if the operand that has unsigned integer type has rank
   greater or equal to the rank of the type of the other operand, then
   the operand with signed integer type is converted to the type of the
   operand with unsigned integer type."
 
-    Section 6.3.1.1 says `long`, which we call `WordWidth`, has a higher
-    rank than `int`, which we call `BitWidth 32`.
-
     ```haskell
-            | bitWidth 32 uw >= bitWidth 32 sw = Just (IsInt Unsigned uw)
+        mixedSign sw uw = do
+            rank <- integerConversionRank uw sw
+            Just $ case rank of
+                GT -> IsInt Unsigned uw
+                EQ -> IsInt Unsigned uw
     ```
 
 - "Otherwise, if the type of the operand with signed integer type can
@@ -2159,7 +2165,7 @@ first argument and the unsigned width is always the second.
     types bigger than 64 bits (because `long` might be 64 bits instead).
 
     ```haskell
-            | bitWidth 64 uw < bitWidth 32 sw = Just (IsInt Signed sw)
+                _ | bitWidth 64 uw < bitWidth 32 sw -> IsInt Signed sw
     ```
 
 - "Otherwise, both operands are converted to the unsigned integer type
@@ -2169,8 +2175,38 @@ first argument and the unsigned width is always the second.
     and `int64_t`, where we want to choose `uint64_t`.
 
     ```haskell
-            | otherwise = Just (IsInt Unsigned sw)
+                _ -> IsInt Unsigned sw
     ```
+
+The usual arithmetic conversions refer to a definition called "integer
+conversion rank" from C99 6.3.1.1. We want these widths to have strictly
+increasing integer conversion rank:
+
+- `BitWidth 32` (our representation of `int`)
+- `WordWidth` (our representation of `long`)
+- `BitWidth 64`
+
+The first two come from C99 6.3.1.1 which says `long` has a higher rank
+than `int`. We add the last as an implementation choice. Since `isize`
+could be either `i32` or `i64`, when combining `isize` with another type
+we'll bump up to whichever type is definitely bigger.
+
+We disallow comparing bit-widths between 32 and 64 bits, exclusive,
+against word-size. Since word-size is platform-dependent, we can't be
+sure which is larger.
+
+```haskell
+integerConversionRank :: IntWidth -> IntWidth -> Maybe Ordering
+integerConversionRank (BitWidth a) (BitWidth b) = Just (compare a b)
+integerConversionRank WordWidth WordWidth = Just EQ
+integerConversionRank (BitWidth a) WordWidth
+    | a <= 32 = Just LT
+    | a >= 64 = Just GT
+integerConversionRank WordWidth (BitWidth b)
+    | b <= 32 = Just GT
+    | b >= 64 = Just LT
+integerConversionRank _ _ = Nothing
+```
 
 Here's a helper function to apply the usual arithmetic conversions to
 both operands of a binary operator, cast as needed, and then combine the
@@ -2248,7 +2284,7 @@ data Signed = Signed | Unsigned
     deriving (Show, Eq)
 
 data IntWidth = BitWidth Int | WordWidth
-    deriving (Show, Eq, Ord)
+    deriving (Show, Eq)
 ```
 
 Sometimes we want to treat `WordWidth` as being equivalent to a
