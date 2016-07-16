@@ -128,7 +128,7 @@ instance Pretty ExternItem where
 data Expr
     = Lit Lit
     | Var Var
-    | StructExpr String [(String, Expr)]
+    | StructExpr String [(String, Expr)] (Maybe Expr)
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
     | Lambda [Var] Expr
@@ -199,9 +199,9 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
-        StructExpr str fields -> sep
+        StructExpr str fields base -> sep
             ( text str <+> text "{"
-            : punctuate (text ",") [ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ]
+            : punctuate (text ",") ([ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ] ++ maybe [] (\b -> [ text ".." <> pPrint b ]) base)
             ++ [text "}"]
             )
         Call f args -> cat

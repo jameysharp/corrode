@@ -19,6 +19,7 @@ library
   build-depends:       base >=4.8 && <4.9,
                        language-c >=0.4 && <0.6,
                        markdown-unlit,
+                       containers,
                        pretty,
                        transformers
 

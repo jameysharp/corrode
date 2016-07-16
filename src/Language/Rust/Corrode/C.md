@@ -37,6 +37,7 @@ import Data.Monoid
 import Data.List
 import Language.C
 import qualified Language.Rust.AST as Rust
+import qualified Data.IntMap.Strict as IntMap
 import Text.PrettyPrint
 ```
 
@@ -673,108 +674,224 @@ Return the bindings produced for any declarator that did not return
     return (catMaybes mbinds)
 ```
 
-If a declarator had an initializer, we need to translate that to an
-equivalent Rust expression. `interpretInitializer` needs to know the
-type of the variable we're initializing in order to figure out how to
-interpret the initializer.
+
+Initialization
+==============
+
+The simplest type of initialization in C is zero-initialization. It
+initializes in a way that the underlying memory of the target is just
+zeroed out.
+
+```haskell
+zeroInitialize :: CType -> Rust.Expr
+zeroInitialize IsBool{} = Rust.Lit (Rust.LitRep "false")
+zeroInitialize IsVoid{} = Rust.Lit (Rust.LitRep "()")
+zeroInitialize t@IsInt{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
+zeroInitialize t@IsFloat{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
+zeroInitialize t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
+zeroInitialize t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
+zeroInitialize (IsStruct str fields) = Rust.StructExpr str (map (fmap zeroInitialize) fields) Nothing
+```
+
+The general form of initialization, described in section 6.7.8, involves
+an initializer construct. The interface we want to expose for translating
+C initializers is fairly simple: given the type of the thing we are trying
+to initialize and the C initializer, produce a Rust expression that
+corresponds to the C expression that would have been initialized:
 
 ```haskell
 interpretInitializer :: CType -> CInit -> EnvMonad Rust.Expr
 ```
 
-Initializers for compound types must be surrounded by braces. If we're
-initializing a compound type and see an initializer expression instead,
-that's a syntax error.
+Unfortunately, we have to delay the actually implementation of this
+function until the end of this section when we will have all the necessary
+pieces.
+
+The problem is that in C, there are just too many ways of expressing the
+same initializations. Take, for example, the following struct definitions
+
+```c
+struct Foo { struct Bar b; int z; }
+struct Bar { int x; int y; }
+```
+
+Then, the following are all equivalent
+
+```c
+struct Foo s = { 1, 2, 3 }
+struct Foo s = { .b = { .x = 1, .y = 2 }, .z = 3 }
+struct Foo s = { .b.y = 1, .b = { 1, 2 }, 3 }
+```
+
+We need some canonical form for manipulating and composing initializer
+expressions. Then, we can deal with C initialization expressions in
+several steps: start be converting them to a canonical form, compose them
+together accordingly, and finally convert them to Rust expressions.
 
 ```haskell
-interpretInitializer (IsStruct str fields) initial = case initial of
-    CInitList binds _ -> Rust.StructExpr str <$> (processInits fields =<< orderInits binds)
-    _ -> badSource initial "struct initializer"
+data Initializer
+    = Scalar Rust.Expr (IntMap.IntMap Initializer)
+```
+* either a scalar expression or a compound expression with certain
+  fields' initialization overriden.
+```haskell
+    | Aggregate (IntMap.IntMap Initializer)
+
+instance Show Initializer where
+    show (Scalar _ i) = "Scalar .." ++ show i 
+    show (Aggregate i) = "Aggregate " ++ show i 
+```
+* compound expression with only the corresponding fields initialized
+  (remaining fields will be zero-initialized)
+
+Notice that combining initializers is an associative binary operation.
+This motivates us to use the `Monoid` typeclass again to represent the
+operation for combining two initializers.
+
+```haskell
+instance Monoid Initializer where
+```
+- The identity element in this case will be the empty initializer. This is
+  because whenever it is combined with another initializer (either from
+  the left or the right), the result is just the other initializer.
+
+    ```haskell
+        mempty = Aggregate IntMap.empty
+    ```
+
+- When combining two intializers, the one on the right overrides/shadows
+  definitions made by the one on the left.
+
+    ```haskell
+        mappend _ b@(Scalar{}) = b
+        mappend (Aggregate a) (Aggregate b) = Aggregate (IntMap.unionWith mappend a b)
+        mappend (Scalar s a) (Aggregate b) = Scalar s (IntMap.unionWith mappend a b)
+    ```
+
+Once we have translated all the C initializer(s) to one of our
+initializers, we can produce a corresponding Rust expression. (We still
+need type information about what we are initializing since our
+Initializer type doesn't keep track of things like field or struct names.)
+
+```haskell
+interpretInitializer' :: CType -> Initializer -> Maybe Rust.Expr
+interpretInitializer' _ (Scalar expr initials) | IntMap.null initials = Just expr
+interpretInitializer' (IsStruct str fields) initializer = Rust.StructExpr str <$> fields' <*> pure expr
     where
 
-    fieldNames = map fst fields
+    (expr,initials) = case initializer of
+        Scalar e i -> (Just e, i)
+        Aggregate i -> (Nothing, i)
+
+    fields' = sequence $ do
+        ((field,ty),i) <- zip fields [0..]
+        case IntMap.lookup i initials of
+            Just initial -> case interpretInitializer' ty initial of
+                Nothing -> pure $ Nothing
+                Just initial' -> pure $ Just (field, initial')
+            Nothing -> case initializer of
+                Scalar{} -> mzero
+                Aggregate{} -> pure $ Just (field, zeroInitialize ty)
+
+
+interpretInitializer' _ _ = Nothing
 ```
 
-In structs, the only valid lists of designators we tolerate are those with
-exactly one designator and with that designator correspoinding to a field.
-We return index of the field if there is a valid designator.
+Now, we need to concern ourselves with constructing these initializers in
+the first place. We will need to keep track of the current object (see
+point 17 of section 6.7.8). This object is represented as a list,
+representing a path through the nested hierarchy the initializer implies.
+At each point in this path we keep track of
+
+    * `Int`: the position in the parent structure
+    * `CType`: the type of the structure
+    * `[CType]`: the type of fields (if any) of the structure
 
 ```haskell
-    memberDesig :: [CDesignator] -> EnvMonad (Maybe Int)
-    memberDesig [CMemberDesig ident _] = case elemIndex (identToString ident) fieldNames of
-                                           Nothing -> badSource initial "field in initializer"
-                                           index -> pure index
-    memberDesig [] = return Nothing
-    memberDesig _ = badSource initial "initializers in a struct can have at most one member designator"
+type CurrentObject = [(Int, CType, [CType])]
 ```
 
-The processing of the fields will be a lot easier if the designators
-inside the initializer are in order. Here, we can make use of
-`memberDesig` to similtaneously verify the designators make sense and get
-their order in the struct. Then, we cut up the list of initializers into
-chunks that start with designators and reassemble these chunks in order.
+Then, given a list of designators and the type we are currently in, we can
+compute the current object.
 
 ```haskell
-    orderInits :: CInitList -> EnvMonad CInitList
-    orderInits list = do
-        list' <- sequence $ map (\i@(d,_) -> (,) i <$> memberDesig d) list
-        let (prefix,rest) = span (null . snd) list'
-
-            chunks [] = []
-            chunks (desig:cinits) = let (cinits',others) = span (null . snd) cinits
-                                    in (desig:cinits') : chunks others
-
-        return $! map fst (prefix ++ concat (sortOn (fromJust . snd . head) (chunks rest)))
+objectFromDesignators :: CType -> [CDesignator] -> EnvMonad CurrentObject
+objectFromDesignators _ [] = return []
+objectFromDesignators (IsStruct name fields) (d@(CMemberDesig ident _) : ds) =
+    case span (\ (field, _) -> identToString ident /= field) fields of
+        (earlier, (_, ty) : rest) -> do
+            sub <- objectFromDesignators ty ds
+            return ((length earlier, ty, map snd rest) : sub)
+        (_, []) -> badSource d ("designator for field not in struct " ++ name)
+objectFromDesignators ty (d : _) = badSource d ("designator for " ++ show ty)
 ```
 
-Now, with a list of already ordered initializers, we process the
-initializers and fields similtaneously. If the next initializer has no
-designator, we just assume it is for the next field. If it has a member
-designator but it doesn't correspond to the next field, we zero-initialize
-the next field. Finally, if it has a member designator that corresponds to
-the next field, we use the initializer on the said next field.
+However, since it is possible for some entries in an initializer to have
+no designators (in which case the initializer implicitly applies to the
+next object), we need a way to calculate the next object from the current
+one (provided we haven't reach the end of the struct/array).
 
 ```haskell
-    processInits :: [(String, CType)] -> CInitList -> EnvMonad [(String, Rust.Expr)]
-    processInits fs [] = pure (fmap zeroInitializer <$> fs)
-    processInits [] _ = badSource initial "initializer list overflow"
-    processInits ((field,ty):fs) (([],v):vs) = do
-        v' <- interpretInitializer ty v
-        (:) (field,v') <$> processInits fs vs
-    processInits ((field,ty):fs) c@(([CMemberDesig ident _],v):vs)
-      | identToString ident /= field = (:) (field, zeroInitializer ty) <$> processInits fs c
-      | otherwise = do
-            v' <- interpretInitializer ty v
-            (:) (field,v') <$> processInits fs vs
-    processInits _ _ = unimplemented initial
-
+nextObject :: CurrentObject -> CurrentObject
+nextObject [] = []
+nextObject (cur : sub) = case nextObject sub of
+    [] -> case cur of
+        (_, _, []) -> []
+        (idx, _, next : fields) -> [(idx + 1, next, fields)]
+    rest -> cur : rest
 ```
 
-Initializers for scalar types must either be a bare expression or the
-same surrounded by braces. Anything else is a syntax error.
+Given these helpers, we are now in a position to translate C initializers
+to our initializers.
 
 ```haskell
-interpretInitializer ty (CInitExpr initial _)
-    = fmap (castTo ty) (interpretExpr True initial)
-interpretInitializer ty (CInitList [([], CInitExpr initial _)] _)
-    = fmap (castTo ty) (interpretExpr True initial)
-interpretInitializer _ initial = badSource initial "scalar initializer"
+translateInitializer :: CType -> CInit -> EnvMonad Initializer
+translateInitializer ty (CInitExpr expr _) = Scalar <$> (castTo ty <$> interpretExpr True expr) <*> pure IntMap.empty
+translateInitializer ty (CInitList list _) = do
+
+    -- go through C initializers and bind them to the current objects
+    -- objectsAndInitializers :: [(CurrentObject, CInit)]
+    objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
+        obj <- objectFromDesignators ty desigs
+        pure (obj, initial)
+
+    -- map through the C initializers to convert them to our form of initializers while threading through the current object
+    let (_, initializers) = mapAccumL resolveCurrentObject [(0, ty, children ty)] objectsAndInitializers
+
+    -- merge our initializers together
+    mconcat <$> sequence initializers
+
+    where
+
+    children :: CType -> [CType]
+    children (IsStruct _ fields) = map snd fields
+    children _ = []
 ```
 
-Depending on the type, zero-initilization means something different. For
-pointers, since Rust has no NULL literal, we resort to casting 0 as a
-pointer (which is exactly what `std::ptr::null` does).
+Resolution takes a current object to use if no designator is specified. It
+returns the new current object for the next element to use, and the above
+Initializer type representing the part of the object that this element
+initialized.
 
 ```haskell
-zeroInitializer :: CType -> Rust.Expr
-zeroInitializer IsBool{} = Rust.Lit (Rust.LitRep "false")
-zeroInitializer IsVoid{} = Rust.Lit (Rust.LitRep "()")
-zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
-zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
-zeroInitializer t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
-zeroInitializer t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
-zeroInitializer (IsStruct str fields) = Rust.StructExpr str (fmap (fmap zeroInitializer) fields)
+    resolveCurrentObject :: CurrentObject -> (CurrentObject, CInit) -> (CurrentObject, EnvMonad Initializer)
+    resolveCurrentObject [] ([], _) = ([], pure (Aggregate IntMap.empty))
+    resolveCurrentObject _  (obj@((_, ty', _):_), initial) = (nextObject obj, foldl (\a i -> Aggregate <$> IntMap.singleton i <$> a) (translateInitializer (let (_, ty',_) = last obj in ty') initial) (map (\(i,_,_) -> i) obj))
+    resolveCurrentObject obj@((_, ty', _):_) ([], initial) = (nextObject obj, foldl (\a i -> Aggregate <$> IntMap.singleton i <$> a) (translateInitializer (let (_, ty',_) = last obj in ty') initial) (map (\(i,_,_) -> i) obj))
+
 ```
+
+Finally, we can implement the full `interpretInitializer` function we
+declared near the beginning of this section.
+
+```haskell
+interpretInitializer ty initial = do
+    initial' <- translateInitializer ty initial
+    case interpretInitializer' ty initial' of
+        Nothing -> badSource initial "initializer"
+        Just expr -> pure expr
+```
+
 
 Function definitions
 ====================
