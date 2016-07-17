@@ -2419,8 +2419,8 @@ baseTypeOf specs = do
                 Just expr -> do
                     expr' <- interpretExpr True expr
                     return (Rust.EnumeratorExpr enumName (castTo reprTy expr'))
-        let attrs = [Rust.Attribute "derive(Clone, Copy)",
-                     Rust.Attribute (concat [ "repr(", repr, ")" ])
+        let attrs = [ Rust.Attribute "derive(Clone, Copy)"
+                    , Rust.Attribute (concat [ "repr(", repr, ")" ])
                     ]
         emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
         return (mut, IsEnum name)
