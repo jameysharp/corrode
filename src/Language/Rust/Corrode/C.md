@@ -2100,6 +2100,8 @@ usual :: CType -> CType -> Maybe CType
 usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
 usual a@(IsFloat _) _ = Just a
 usual _ b@(IsFloat _) = Just b
+usual (IsEnum _) b = usual (IsInt Signed (BitWidth 32)) b
+usual a (IsEnum _) = usual a (IsInt Signed (BitWidth 32))
 ```
 
 "Otherwise, the integer promotions are performed on both operands."
