@@ -788,11 +788,11 @@ interpretInitializer' (IsStruct str fields) initializer = Rust.StructExpr str <$
         ((field,ty),i) <- zip fields [0..]
         case IntMap.lookup i initials of
             Just initial -> case interpretInitializer' ty initial of
-                Nothing -> pure $ Nothing
-                Just initial' -> pure $ Just (field, initial')
+                Nothing -> pure Nothing
+                Just initial' -> pure (Just (field, initial'))
             Nothing -> case initializer of
                 Scalar{} -> mzero
-                Aggregate{} -> pure $ Just (field, zeroInitialize ty)
+                Aggregate{} -> pure (Just (field, zeroInitialize ty))
 
 
 interpretInitializer' _ _ = Nothing
@@ -809,14 +809,14 @@ type CurrentObject = Maybe Designator
 data Designator
   = Base CType 
 ```
-* represents the base object pointed to and carries its type
+* encodes the type of the base object pointed to
 
 ```haskell
   | From CType Int [CType] Designator
   deriving(Show)
 ```
 * encodes the type of the object pointed to, its index in the parent,
-  remaining fields in the parent, and the parent pointer
+  remaining fields in the parent, and the parent designator
 
 Then, given a list of designators and the type we are currently in, we can
 compute the most general possible current object.
@@ -851,14 +851,14 @@ nextObject (From _ _ [] base) = nextObject base
 
 We've used the expression "the most general (object)" several times. This
 is because designators alone aren't actually enough to determine exactly
-what gets initialized - we also need the type of the thing initialized.
-For example, if a designator points to a struct, the initializer that
-follows might be for the first field of the struct (and not the struct
-itself).
+what gets initialized &mdash; we also need the type of the thing
+initialized. For example, if a designator points to a struct, the
+initializer that follows might be for the first field of the struct (and
+not the struct itself).
 
 We need a function that takes a most general designator and returns all
 the possible more specific designators (from most general to most
-specific). 
+specific).
 
 ```haskell
 possibleCasts :: Designator -> [Designator]
