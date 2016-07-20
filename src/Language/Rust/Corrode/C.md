@@ -42,7 +42,6 @@ import Language.C
 import qualified Language.Rust.AST as Rust
 import qualified Data.IntMap.Strict as IntMap
 import Text.PrettyPrint
-import Debug.Trace
 ```
 
 This translation proceeds in a syntax-directed way. That is, we just
@@ -725,6 +724,7 @@ Then, the following are all equivalent
 struct Foo s = { 1, 2, 3 }
 struct Foo s = { .b = { .x = 1, .y = 2 }, .z = 3 }
 struct Foo s = { .b.y = 1, .b = { 1, 2 }, 3 }
+struct Foo s = { (struct Bar) { 1, 2 }, 3 }
 ```
 
 We need some canonical form for manipulating and composing initializer
@@ -738,12 +738,9 @@ data Initializer
 ```
 * either a scalar expression or a compound expression with certain
   fields' initialization overriden.
+
 ```haskell
     | Aggregate (IntMap.IntMap Initializer)
-
-instance Show Initializer where
-    show (Scalar _ i) = "Scalar .." ++ show i 
-    show (Aggregate i) = "Aggregate " ++ show i 
 ```
 * compound expression with only the corresponding fields initialized
   (remaining fields will be zero-initialized)
@@ -803,104 +800,72 @@ interpretInitializer' _ _ = Nothing
 
 Now, we need to concern ourselves with constructing these initializers in
 the first place. We will need to keep track of the current object (see
-point 17 of section 6.7.8). This object is represented as a list,
-representing a path through the nested hierarchy the initializer implies.
-At each point in this path we keep track of
-
-    * `Int`: the position in the parent structure
-    * `CType`: the type of the structure
-    * `[CType]`: the type of fields (if any) of the structure
+point 17 of section 6.7.8). A `Designator` describes a position inside a
+type. 
 
 ```haskell
--- type CurrentObject = [(Int, CType, [CType])]
 type CurrentObject = Maybe Designator
 
 data Designator
-  = Base CType -- ^ represents the base object pointed to and carries its type
-  | From CType Int [CType] Designator -- ^ encodes the type of the object pointed to, its index in the parent, remaining fields in the parent, and the parent pointer
-  deriving (Show)
-
-designatorType :: Designator -> CType
-designatorType (Base ty) = ty
-designatorType (From ty _ _ _) = ty
+  = Base CType 
 ```
+* represents the base object pointed to and carries its type
 
-For
-
-```c
-struct grade { 
-  float percentage;
-  int failing;
-};
-struct student {
-  struct student *friends;
-  int age;
-  struct grade marks;
-};
+```haskell
+  | From CType Int [CType] Designator
+  deriving(Show)
 ```
-
-([],[(IsStruct "student", [IsPtr .., IsInt .., IsStruct "grade"])])
-  ([0],[(IsStruct "student", [IsPtr .., IsInt .., IsStruct "grade"])])
-
+* encodes the type of the object pointed to, its index in the parent,
+  remaining fields in the parent, and the parent pointer
 
 Then, given a list of designators and the type we are currently in, we can
 compute the most general possible current object.
 
 ```haskell
--- objectFromDesignators :: CType -> [CDesignator] -> Maybe CurrentObject
--- objectFromDesignators _ [] = return []
--- objectFromDesignators (IsStruct name fields) (d@(CMemberDesig ident _) : ds) =
---     case span (\ (field, _) -> identToString ident /= field) fields of
---         (earlier, (_, ty) : rest) -> do
---             sub <- objectFromDesignators ty ds
---             return ((length earlier, ty, map snd rest) : sub)
---         (_, []) -> Nothing
--- objectFromDesignators ty (d : _) = Nothing
-
-children :: CType -> [CType]
-children (IsStruct _ fields) = map snd fields
-children _ = []
-
-objectFromDesignators :: CType -> [CDesignator] -> CurrentObject
-objectFromDesignators ty [] = Nothing
-objectFromDesignators ty ds = snd <$> foldM getDesig (ty, Base ty) ds
+objectFromDesignators :: CType -> [CDesignator] -> EnvMonad CurrentObject
+objectFromDesignators _ [] = pure Nothing
+objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
     where
 
-    getDesig :: (CType, Designator) -> CDesignator -> Maybe (CType, Designator)
-    getDesig (IsStruct name fields, obj) (CMemberDesig ident _) =
+    go :: CType -> [CDesignator] -> Designator -> EnvMonad Designator
+    go _ [] obj = pure obj
+    go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
         case span (\ (field, _) -> identToString ident /= field) fields of
-            (earlier, (_, ty) : rest) -> Just (ty, From ty (length earlier) (map snd rest) obj)
-            (_, []) -> Nothing
-    getDesig _ _ = Nothing
+            (_, []) -> badSource d ("designator for field not in struct " ++ name)
+            (earlier, (_, ty') : rest) ->
+                go ty' ds (From ty' (length earlier) (map snd rest) obj)
+    go ty' (d : _) _ = badSource d ("designator for " ++ show ty') 
 ```
 
 However, since it is possible for some entries in an initializer to have
 no designators (in which case the initializer implicitly applies to the
-next object), we need a way to calculate the next object from the current
-one (provided we haven't reach the end of the struct/array).
-
-Gives us the most general next object.
+next object), we need a way to calculate the most general next object from
+the current one (provided we haven't reach the end of the struct/array).
 
 ```haskell
--- nextObject :: CurrentObject -> CurrentObject
--- nextObject [] = []
--- nextObject (cur : sub) = case nextObject sub of
---     [] -> case cur of
---         (_, _, []) -> []
---         (idx, _, next : fields) -> [(idx + 1, next, fields)]
---     rest -> cur : rest
-
-
--- | Return most general next object
 nextObject :: Designator -> CurrentObject
 nextObject Base{} = Nothing
-nextObject (From _ i (ty : remaining) base) = Just $ From ty (i+1) remaining base
-nextObject (From _ i [] base) = nextObject base
+nextObject (From _ i (ty : remaining) base) = Just (From ty (i+1) remaining base)
+nextObject (From _ _ [] base) = nextObject base
+```
 
--- | Take a current object and return all more specific current objects it could be implicitly pointing to, from most general to most specific
+We've used the expression "the most general (object)" several times. This
+is because designators alone aren't actually enough to determine exactly
+what gets initialized - we also need the type of the thing initialized.
+For example, if a designator points to a struct, the initializer that
+follows might be for the first field of the struct (and not the struct
+itself).
+
+We need a function that takes a most general designator and returns all
+the possible more specific designators (from most general to most
+specific). 
+
+```haskell
 possibleCasts :: Designator -> [Designator]
-possibleCasts b@(Base (IsStruct name ((_,ty):fields))) = let c = (From ty 0 (map snd fields) b) in b : possibleCasts c
-possibleCasts f@(From (IsStruct name ((_,ty):fields)) _ _ _) = let c = (From ty 0 (map snd fields) f) in f : possibleCasts c
+possibleCasts b@(Base (IsStruct _ ((_,ty'):fields))) =
+    let c = (From ty' 0 (map snd fields) b) in b : possibleCasts c
+possibleCasts f@(From (IsStruct _ ((_,ty'):fields)) _ _ _) =
+    let c = (From ty' 0 (map snd fields) f) in f : possibleCasts c
 possibleCasts d = [d]
 ```
 
@@ -909,59 +874,70 @@ to our initializers.
 
 ```haskell
 translateInitializer :: CType -> CInit -> EnvMonad Initializer
-translateInitializer ty (CInitExpr expr _) = do
+```
+
+For the case when the initializer is just an expression, we just evaluate
+the expression and make a `Scalar` out of it, provided that it has the
+right width (right number of fields, counted recursively).
+
+```haskell
+translateInitializer ty i@(CInitExpr expr _) = do
     expr' <- interpretExpr True expr
     if (typeWidth (resultType expr') == typeWidth ty)
         then pure $ Scalar (castTo ty expr') IntMap.empty
-        else badSource expr (concat ["intializer: expected width ", show (typeWidth ty), " (", show ty, ") but recieved width ", show (typeWidth (resultType expr')), " (", show (resultType expr'), ")"])
+        else badSource i "intializer"
 
     where
 
     typeWidth :: CType -> Int
     typeWidth (IsStruct _ fields) = sum $ map (typeWidth . snd) fields
     typeWidth _ = 1
+```
 
-translateInitializer ty (CInitList list _) = foldr (<|>) (throwE "no options") $ do
+For the case where we have a list of expressions, since there are usually
+several ways of interpreting the current object, we have to try all of
+them and take the one that suceeds (if any of them do).
 
-    -- go through C initializers and bind them to the current objects
-    -- objectsAndInitializers :: [(CurrentObject, CInit)]
-    -- objectsAndInitializers <- maybeToList $ forM list $ \ (desigs, initial) -> do
-    --     obj <- objectFromDesignators ty desigs
-    --     pure (obj, initial)
-    let objectsAndInitializers = map (\ (desigs, initial) -> (objectFromDesignators ty desigs, initial)) list
+```haskell
+translateInitializer ty i@(CInitList list _) = do 
 
-    -- map through the C initializers to convert them to our form of initializers while threading through the current object
-    -- [(CurrentObject, [EnvMonad Initializer])]
-    (currObj, initializers) <- mapAccumLM resolveCurrentObject (Just $ Base ty) objectsAndInitializers
+    objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
+        currObj <- objectFromDesignators ty desigs
+        pure (currObj, initial)   
+    
+    let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
+        initializer = msum $ do
+            (_, initializers) <- mapAccumLM resolveCurrentObject (Just (Base ty)) objectsAndInitializers
+            let initializerPossibility = mconcat <$> sequence initializers
+            pure ((\x -> [x]) `withExceptT` initializerPossibility)
 
-    pure $ mconcat <$> sequence initializers
+    head `withExceptT` (defaultError `mplus` initializer)
 
     where
 
     mapAccumLM :: (Monad m, Traversable t) => (a -> b -> m (a, c)) -> a -> t b -> m (a, t c)
     mapAccumLM f s t = swap <$> runStateT (traverse (StateT . (\x y -> swap <$> f y x)) t) s
-
-    designatorList :: Designator -> [Int]
-    designatorList = unfoldr (\obj -> case obj of
-                                Base{} -> Nothing
-                                From _ i _ p -> Just (i,p))
 ```
 
 Resolution takes a current object to use if no designator is specified. It
-returns the new current object for the next element to use, and the above
+returns the new current objects for the next element to use, and the above
 Initializer type representing the part of the object that this element
 initialized.
 
 ```haskell
     resolveCurrentObject :: CurrentObject -> (CurrentObject, CInit) -> [(CurrentObject, EnvMonad Initializer)]
-    resolveCurrentObject obj0 (obj1, initial) = case obj1 <|> obj0 of
+    resolveCurrentObject obj0 (obj1, cinitial) = case obj1 <|> obj0 of
         Nothing -> [(Nothing, pure mempty)]
         Just obj -> do
             obj' <- possibleCasts obj
-            let initial' = translateInitializer (designatorType obj') initial
-            pure (nextObject obj'
-                 ,foldl (\a i -> Aggregate <$> IntMap.singleton i <$> a) initial' (designatorList obj')
-                 )
+            
+            let initial = translateInitializer (case obj' of { Base t -> t; From t _ _ _ -> t }) cinitial
+                indices = unfoldr (\o -> case o of
+                                     Base{} -> Nothing
+                                     From _ j _ p -> Just (j,p)) obj'
+                initializer = foldl (\a j -> Aggregate <$> IntMap.singleton j <$> a) initial indices
+            
+            pure (nextObject obj', initializer)
 ```
 
 Finally, we can implement the full `interpretInitializer` function we
@@ -970,7 +946,7 @@ declared near the beginning of this section.
 ```haskell
 interpretInitializer ty initial = do
     initial' <- translateInitializer ty initial
-    case interpretInitializer' ty (traceShowId initial') of
+    case interpretInitializer' ty initial' of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
 ```
