@@ -2075,12 +2075,14 @@ particular compiler, and the C standard allows us to define `int` to be
 whatever size we like. That said, this assumption may break non-portable
 C programs.
 
-Conveniently, Rust allows `bool` expressions to be cast to any integer
-type, and it converts `true` to 1 and `false` to 0 just like C requires,
-so we don't need any special magic to handle booleans here.
+Conveniently, Rust allows `bool` and `enum` typed expressions to be cast
+to any integer type, and it converts `true` to 1 and `false` to 0 just
+like C requires, so we don't need any special magic to handle booleans
+or enumerated types here.
 
 ```haskell
 intPromote IsBool = IsInt Signed (BitWidth 32)
+intPromote (IsEnum _) = enumReprType
 intPromote (IsInt _ (BitWidth w)) | w < 32 = IsInt Signed (BitWidth 32)
 ```
 
@@ -2100,8 +2102,6 @@ usual :: CType -> CType -> Maybe CType
 usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
 usual a@(IsFloat _) _ = Just a
 usual _ b@(IsFloat _) = Just b
-usual (IsEnum _) b = usual (IsInt Signed (BitWidth 32)) b
-usual a (IsEnum _) = usual a (IsInt Signed (BitWidth 32))
 ```
 
 "Otherwise, the integer promotions are performed on both operands."
