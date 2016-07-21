@@ -2351,7 +2351,18 @@ of Rust's byte literals.
 ```haskell
 charType :: CType
 charType = IsInt Unsigned (BitWidth 8)
+```
 
+C permits implementations to represent enum values using integer types
+narrower than `int`, but for the moment we choose not to. This may be
+incompatible with some ABIs.
+
+```haskell
+enumReprType :: CType
+enumReprType = IsInt Signed (BitWidth 32)
+```
+
+```haskell
 baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType))
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
@@ -2407,8 +2418,7 @@ baseTypeOf specs = do
             Just (_, ty) -> return (mut, ty)
             Nothing -> badSource spec "undefined enum"
     go (CEnumType (CEnum mident (Just items) _ _) _) (mut, _) = do
-        let reprTy = IsInt Signed (BitWidth 32)
-        let Rust.TypeName repr = toRustType reprTy
+        let Rust.TypeName repr = toRustType enumReprType
         name <- case mident of
             Just ident -> do
                  let name = identToString ident
@@ -2420,7 +2430,7 @@ baseTypeOf specs = do
                 Nothing -> return (Rust.EnumeratorAuto enumName)
                 Just expr -> do
                     expr' <- interpretExpr True expr
-                    return (Rust.EnumeratorExpr enumName (castTo reprTy expr'))
+                    return (Rust.EnumeratorExpr enumName (castTo enumReprType expr'))
         let attrs = [ Rust.Attribute "derive(Clone, Copy)"
                     , Rust.Attribute (concat [ "repr(", repr, ")" ])
                     ]
