@@ -25,7 +25,7 @@ instance Pretty Var where
     pPrint (VarName s) = text s
 
 instance Pretty Path where
-    pPrint (PathSegments names) = hcat (punctuate (text "::") [ text name | name <- names ])
+    pPrint (PathSegments names) = hcat (punctuate (text "::") (map text names))
 
 data Visibility = Public | Private
     deriving Eq
@@ -110,7 +110,7 @@ instance Pretty ItemKind where
     pPrint (Use path) = text "use" <+> text path <> text ";"
     pPrint (Enum name enums) =
         text "enum" <+> text name <+> text "{" $+$
-        nest 4 (vcat [ pPrint enum <+> text "," | enum <- enums ]) $+$
+        nest 4 (vcat [ pPrint enum <> text "," | enum <- enums ]) $+$
         text "}"
 
 data ExternItem
