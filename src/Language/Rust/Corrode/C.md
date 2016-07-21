@@ -686,14 +686,14 @@ initializes in a way that the underlying memory of the target is just
 zeroed out.
 
 ```haskell
-zeroInitialize :: CType -> Rust.Expr
-zeroInitialize IsBool{} = Rust.Lit (Rust.LitRep "false")
-zeroInitialize IsVoid{} = Rust.Lit (Rust.LitRep "()")
-zeroInitialize t@IsInt{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
-zeroInitialize t@IsFloat{} = let Rust.TypeName s = toRustType t in Rust.Lit (Rust.LitRep ("0" ++ s))
-zeroInitialize t@IsPtr{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
-zeroInitialize t@IsFunc{} = Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)
-zeroInitialize (IsStruct str fields) = Rust.StructExpr str (map (fmap zeroInitialize) fields) Nothing
+zeroInitializer :: CType -> Initializer
+zeroInitializer IsBool{} = Scalar (Rust.Lit (Rust.LitRep "false")) IntMap.empty
+zeroInitializer IsVoid{} = Scalar (Rust.Lit (Rust.LitRep "()")) IntMap.empty
+zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in Scalar (Rust.Lit (Rust.LitRep ("0" ++ s))) IntMap.empty
+zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in Scalar (Rust.Lit (Rust.LitRep ("0" ++ s))) IntMap.empty
+zeroInitializer t@IsPtr{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
+zeroInitializer t@IsFunc{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
+zeroInitializer (IsStruct str fields) = Aggregate (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
 ```
 
 The general form of initialization, described in section 6.7.8, involves
@@ -768,35 +768,6 @@ instance Monoid Initializer where
         mappend (Aggregate a) (Aggregate b) = Aggregate (IntMap.unionWith mappend a b)
         mappend (Scalar s a) (Aggregate b) = Scalar s (IntMap.unionWith mappend a b)
     ```
-
-Once we have translated all the C initializer(s) to one of our
-initializers, we can produce a corresponding Rust expression. (We still
-need type information about what we are initializing since our
-Initializer type doesn't keep track of things like field or struct names.)
-
-```haskell
-interpretInitializer' :: CType -> Initializer -> Maybe Rust.Expr
-interpretInitializer' _ (Scalar expr initials) | IntMap.null initials = Just expr
-interpretInitializer' (IsStruct str fields) initializer = Rust.StructExpr str <$> fields' <*> pure expr
-    where
-
-    (expr,initials) = case initializer of
-        Scalar e i -> (Just e, i)
-        Aggregate i -> (Nothing, i)
-
-    fields' = sequence $ do
-        ((field,ty),i) <- zip fields [0..]
-        case IntMap.lookup i initials of
-            Just initial -> case interpretInitializer' ty initial of
-                Nothing -> pure Nothing
-                Just initial' -> pure (Just (field, initial'))
-            Nothing -> case initializer of
-                Scalar{} -> mzero
-                Aggregate{} -> pure (Just (field, zeroInitialize ty))
-
-
-interpretInitializer' _ _ = Nothing
-```
 
 Now, we need to concern ourselves with constructing these initializers in
 the first place. We will need to keep track of the current object (see
@@ -877,21 +848,24 @@ translateInitializer :: CType -> CInit -> EnvMonad Initializer
 ```
 
 For the case when the initializer is just an expression, we just evaluate
-the expression and make a `Scalar` out of it, provided that it has the
-right width (right number of fields, counted recursively).
+the expression and make a `Scalar` out of it. Note that C doesn't check
+that the type of the initializer is the same as the type of the expression
+as long as neither is a compound type.
 
 ```haskell
 translateInitializer ty i@(CInitExpr expr _) = do
     expr' <- interpretExpr True expr
-    if (typeWidth (resultType expr') == typeWidth ty)
+    if  resultType expr' `compatible` ty
         then pure $ Scalar (castTo ty expr') IntMap.empty
         else badSource i "intializer"
 
     where
 
-    typeWidth :: CType -> Int
-    typeWidth (IsStruct _ fields) = sum $ map (typeWidth . snd) fields
-    typeWidth _ = 1
+    compatible :: CType -> CType -> Bool
+    compatible (IsStruct name1 _) (IsStruct name2 _) = name1 == name2
+    compatible IsStruct{} _ = False
+    compatible _ IsStruct{} = False
+    compatible _ _ = True
 ```
 
 For the case where we have a list of expressions, since there are usually
@@ -946,11 +920,33 @@ declared near the beginning of this section.
 ```haskell
 interpretInitializer ty initial = do
     initial' <- translateInitializer ty initial
-    case interpretInitializer' ty initial' of
+    case helper ty initial' of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
-```
 
+    where
+
+    helper :: CType -> Initializer -> Maybe Rust.Expr
+    helper _ (Scalar expr initials) | IntMap.null initials = Just expr
+    helper (IsStruct str fields) initializer = Rust.StructExpr str <$> fields' <*> pure expr
+        where
+
+        (expr,initials) = case initializer of
+            Scalar e i -> (Just e, i)
+            Aggregate i -> (Nothing, i)
+
+        fields' = sequence $ do
+            ((field,ty),i) <- zip fields [0..]
+            case IntMap.lookup i initials of
+                Just initial -> case helper ty initial of
+                    Nothing -> pure Nothing
+                    Just initial' -> pure (Just (field, initial'))
+                Nothing -> case initializer of
+                    Scalar{} -> mzero
+                    Aggregate{} -> pure ((,) field <$> helper ty (zeroInitializer ty))
+
+    helper _ _ = Nothing
+```
 
 Function definitions
 ====================
