@@ -64,9 +64,13 @@ main = dieOnError $ do
 1. The user may have specified the `-o <outputfile>` option. Not only do
    we ignore that, but we need to suppress it so the preprocessor
    doesn't write its output where a binary was expected to be written.
+   We also force-undefine preprocessor symbols that would indicate
+   support for language features we can't actually handle.
 
     ```haskell
-        let args = rawArgs { outputFile = Nothing }
+        let args = foldl addCppOption
+                (rawArgs { outputFile = Nothing })
+                (map Undefine ["__BLOCKS__"])
     ```
 
 1. Run the preprocessor&mdash;except that if the input appears to have
