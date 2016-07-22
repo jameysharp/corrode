@@ -693,7 +693,7 @@ zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in Scalar (Rust.L
 zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in Scalar (Rust.Lit (Rust.LitRep ("0" ++ s))) IntMap.empty
 zeroInitializer t@IsPtr{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
 zeroInitializer t@IsFunc{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
-zeroInitializer (IsStruct str fields) = Aggregate (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
+zeroInitializer (IsStruct _ fields) = Aggregate (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
 ```
 
 The general form of initialization, described in section 6.7.8, involves
@@ -920,7 +920,7 @@ declared near the beginning of this section.
 ```haskell
 interpretInitializer ty initial = do
     initial' <- translateInitializer ty initial
-    case helper ty initial' of
+    case helper ty (zeroInitializer ty `mappend` initial') of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
 
@@ -935,18 +935,13 @@ interpretInitializer ty initial = do
             Scalar e i -> (Just e, i)
             Aggregate i -> (Nothing, i)
 
-        fields' = sequence $ do
-            ((field,ty),i) <- zip fields [0..]
-            case IntMap.lookup i initials of
-                Just initial -> case helper ty initial of
-                    Nothing -> pure Nothing
-                    Just initial' -> pure (Just (field, initial'))
-                Nothing -> case initializer of
-                    Scalar{} -> mzero
-                    Aggregate{} -> pure ((,) field <$> helper ty (zeroInitializer ty))
-
+        fields' = forM (IntMap.toList initials) $ \ (idx, value) -> do
+            (field, ty') <- listToMaybe (drop idx fields)
+            value' <- helper ty' value
+            Just (field, value')
     helper _ _ = Nothing
 ```
+
 
 Function definitions
 ====================
