@@ -2366,8 +2366,32 @@ data CType
     | IsStruct String [(String, CType)]
     | IsEnum String
     | IsIncomplete String
-    deriving (Show, Eq)
+    deriving Show
+```
 
+Deriving a default implementation of the `Eq` typeclass for equality
+almost works, except for our representation of function types, where
+argument names and `const`-ness may differ without the types being
+different.
+
+```haskell
+instance Eq CType where
+    IsBool == IsBool = True
+    IsInt as aw == IsInt bs bw = as == bs && aw == bw
+    IsFloat aw == IsFloat bw = aw == bw
+    IsVoid == IsVoid = True
+    IsFunc aRetTy aFormals aVariadic == IsFunc bRetTy bFormals bVariadic =
+        aRetTy == bRetTy && aVariadic == bVariadic &&
+        map snd aFormals == map snd bFormals
+    IsPtr aMut aTy == IsPtr bMut bTy = aMut == bMut && aTy == bTy
+    IsStruct aName aFields == IsStruct bName bFields =
+        aName == bName && aFields == bFields
+    IsEnum aName == IsEnum bName = aName == bName
+    IsIncomplete aName == IsIncomplete bName = aName == bName
+    _ == _ = False
+```
+
+```haskell
 toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
