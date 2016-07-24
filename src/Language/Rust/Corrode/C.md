@@ -35,6 +35,7 @@ import Data.Foldable
 import Data.Maybe
 import Data.Monoid
 import Data.List
+import qualified Data.Set as Set
 import Language.C
 import qualified Language.Rust.AST as Rust
 import Numeric
@@ -136,6 +137,7 @@ unnecessary code to deal with edge cases&mdash;see the case of
 data Output = Output
     { outputItems :: [Rust.Item]
     , outputExterns :: [Rust.ExternItem]
+    , outputIncomplete :: Set.Set String
     , usesBreak :: Any
     , usesContinue :: Any
     }
@@ -160,6 +162,7 @@ For our output to be a monoid, it needs to specify
         mempty = Output
             { outputItems = mempty
             , outputExterns = mempty
+            , outputIncomplete = mempty
             , usesBreak = mempty
             , usesContinue = mempty
             }
@@ -172,6 +175,7 @@ For our output to be a monoid, it needs to specify
         mappend a b = Output
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
+            , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
             , usesBreak = usesBreak a `mappend` usesBreak b
             , usesContinue = usesContinue a `mappend` usesContinue b
             }
@@ -266,6 +270,18 @@ there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 ```haskell
 emitExterns :: [Rust.ExternItem] -> EnvMonad ()
 emitExterns items = lift $ tell mempty { outputExterns = items }
+```
+
+`emitIncomplete` records that we saw an incomplete type. For our
+purposes, an incomplete type is anything with a definition we can't
+translate, but we can still allow pointers to values of this type as
+long as nobody tries dereferencing those pointers.
+
+```haskell
+emitIncomplete :: String -> EnvMonad CType
+emitIncomplete name = do
+    lift $ tell mempty { outputIncomplete = Set.singleton name }
+    return (IsIncomplete name)
 ```
 
 `recordBreak`/`recordContinue` take note of the presence of a `break`/
@@ -383,6 +399,36 @@ three possible kinds for each declaration:
     perDecl decl = unimplemented decl
 ```
 
+Incomplete types (see `emitIncomplete` above) may be referenced early
+and then completed later. In that case we need to only emit the complete
+definition.
+
+If they are never completed, however, then we need to emit some Rust
+type that can only be passed around by reference. We can't allow the
+Rust compiler to construct, copy, or consume values of the incomplete
+type, because we don't know how big it is. We also want each incomplete
+type to be distinct from all other incomplete types.
+
+We meet those requirements by, for each incomplete type, creating a
+private `enum` type. We don't give the type any constructors, so new
+values can't be constructed and it can't be `match`ed on. Unlike the
+translation of other types, we don't declare this enum's `repr`, and we
+don't derive `Copy` or `Clone` for it.
+
+```haskell
+    completeTypes = Set.fromList $ catMaybes
+        [ case item of
+            Rust.Item _ _ (Rust.Struct name _) -> Just name
+            _ -> Nothing
+        | item <- outputItems output
+        ]
+    incompleteTypes = outputIncomplete output `Set.difference` completeTypes
+    incompleteItems =
+        [ Rust.Item [] Rust.Private (Rust.Enum name [])
+        | name <- Set.toList incompleteTypes
+        ]
+```
+
 Next we remove any locally-defined names from the list of external
 declarations. We can't tell whether something is actually external when
 we encounter its declaration, but once we've collected all the symbols
@@ -407,9 +453,10 @@ wrap them in an `extern { }` block. We place that before the other
 items, by convention.
 
 ```haskell
+    items = incompleteItems ++ outputItems output
     items' = if null externs'
-        then outputItems output
-        else Rust.Item [] Rust.Private (Rust.Extern externs') : outputItems output
+        then items
+        else Rust.Item [] Rust.Private (Rust.Extern externs') : items
 ```
 
 
@@ -2318,6 +2365,7 @@ data CType
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
     | IsEnum String
+    | IsIncomplete String
     deriving (Show, Eq)
 
 toRustType :: CType -> Rust.Type
@@ -2342,6 +2390,7 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
+toRustType (IsIncomplete name) = Rust.TypeName name
 ```
 
 C leaves it up to the implementation to decide whether the base `char`
@@ -2387,10 +2436,10 @@ baseTypeOf specs = do
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
         (name, mty) <- getIdent (StructIdent ident)
-        return $ (,) mut $ case mty of
-            Just (_, ty) -> ty
-            -- FIXME: treating incomplete types as having no fields, but that's probably wrong
-            Nothing -> IsStruct name []
+        ty <- case mty of
+            Just (_, ty) -> return ty
+            Nothing -> emitIncomplete name
+        return (mut, ty)
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
             (storage, base) <- baseTypeOf spec
