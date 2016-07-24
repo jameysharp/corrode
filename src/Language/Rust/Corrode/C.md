@@ -261,15 +261,32 @@ emitItems :: [Rust.Item] -> EnvMonad ()
 emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
-`emitExterns` adds to the output a list of functions or global variables
-which _may_ be declared in some other translation unit. (We can't tell
-when we see a C extern declaration whether it's just the prototype for a
+`addExternIdent` saves type information into the environment like
+`addIdent`, unless the ident is already there, in which case it verifies
+that the types are the same.
+
+It also adds to the output a list of functions or global variables which
+_may_ be declared in some other translation unit. (We can't tell when we
+see a C extern declaration whether it's just the prototype for a
 definition that we'll find later in the current translation unit, so
 there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 
 ```haskell
-emitExterns :: [Rust.ExternItem] -> EnvMonad ()
-emitExterns items = lift $ tell mempty { outputExterns = items }
+addExternIdent
+    :: (Pretty node, Pos node)
+    => node
+    -> IdentKind
+    -> (Rust.Mutable, CType)
+    -> (String -> Rust.ExternItem)
+    -> EnvMonad ()
+addExternIdent node ident ty mkItem = do
+    (_, mty) <- getIdent ident
+    case mty of
+        Just oldTy -> when (ty /= oldTy) $ badSource node
+            ("redefinition, previously defined as " ++ show oldTy)
+        Nothing -> do
+            name <- addIdent ident ty
+            lift $ tell mempty { outputExterns = [mkItem name] }
 ```
 
 `emitIncomplete` records that we saw an incomplete type. For our
@@ -688,8 +705,8 @@ duplicates later.
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
-                name <- addIdent (SymbolIdent ident) (mut, ty)
-                emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
+                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                    Rust.ExternFn name formals variadic (toRustType retTy)
                 return Nothing
 ```
 
@@ -699,8 +716,8 @@ prune duplicates later.
 
 ```haskell
             (Just (CExtern _), _, _) -> do
-                name <- addIdent (SymbolIdent ident) (mut, ty)
-                emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
+                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                    Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)
                 return Nothing
 ```
 
