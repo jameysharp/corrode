@@ -2461,6 +2461,12 @@ baseTypeOf specs = do
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
+    go (CSUType (CStruct CUnionTag mident _ _ _) _) (mut, _) = do
+        name <- case mident of
+            Just ident -> return (identToString ident)
+            Nothing -> uniqueName "Union"
+        ty <- emitIncomplete name
+        return (mut, ty)
     go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
         (_, mty) <- getIdent (EnumIdent ident)
         case mty of
