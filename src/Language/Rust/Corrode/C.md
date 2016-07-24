@@ -138,6 +138,7 @@ data Output = Output
     { outputItems :: [Rust.Item]
     , outputExterns :: [Rust.ExternItem]
     , outputIncomplete :: Set.Set String
+    , usesSymbols :: Set.Set String
     , usesBreak :: Any
     , usesContinue :: Any
     }
@@ -163,6 +164,7 @@ For our output to be a monoid, it needs to specify
             { outputItems = mempty
             , outputExterns = mempty
             , outputIncomplete = mempty
+            , usesSymbols = mempty
             , usesBreak = mempty
             , usesContinue = mempty
             }
@@ -176,6 +178,7 @@ For our output to be a monoid, it needs to specify
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
             , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
+            , usesSymbols = usesSymbols a `mappend` usesSymbols b
             , usesBreak = usesBreak a `mappend` usesBreak b
             , usesContinue = usesContinue a `mappend` usesContinue b
             }
@@ -462,7 +465,8 @@ for this translation unit it becomes clear.
 
     externName (Rust.ExternFn name _ _ _) = name
     externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
-    externs' = filter (\ item -> externName item `notElem` itemNames) (outputExterns output)
+    keepExtern name = name `Set.member` usesSymbols output && name `notElem` itemNames
+    externs' = filter (keepExtern . externName) (outputExterns output)
 ```
 
 If there are any external declarations after filtering, then we need to
@@ -1781,6 +1785,7 @@ interpretExpr _ expr@(CVar ident _) = do
                 , result = Rust.Path (Rust.PathSegments [enum, name])
                 }
         Just (mut, ty) -> do
+            lift $ tell mempty { usesSymbols = Set.singleton name }
             return Result
                 { resultType = ty
                 , isMutable = mut
