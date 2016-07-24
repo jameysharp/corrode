@@ -2492,9 +2492,12 @@ baseTypeOf specs = do
         emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
         return (mut, IsEnum name)
     go spec@(CTypeDef ident _) (mut1, _) = do
-        (_, mty) <- getIdent (TypedefIdent ident)
+        (name, mty) <- getIdent (TypedefIdent ident)
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
+            Nothing | name == "__builtin_va_list" -> do
+                ty <- emitIncomplete name
+                return (mut1, IsPtr Rust.Mutable ty)
             Nothing -> badSource spec "undefined type"
     go spec _ = unimplemented spec
 
