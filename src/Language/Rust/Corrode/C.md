@@ -101,6 +101,7 @@ data IdentKind
     = SymbolIdent { identOfKind :: Ident }
     | TypedefIdent { identOfKind :: Ident }
     | StructIdent { identOfKind :: Ident }
+    | EnumIdent { identOfKind :: Ident }
     deriving Eq
 ```
 
@@ -1709,6 +1710,12 @@ pointer.
 interpretExpr _ expr@(CVar ident _) = do
     (name, sym) <- getIdent (SymbolIdent ident)
     case sym of
+        Just (mut, ty@(IsEnum enum)) -> do
+            return Result
+                { resultType = ty
+                , isMutable = mut
+                , result = Rust.Path (Rust.PathSegments [enum, name])
+                }
         Just (mut, ty) -> do
             return Result
                 { resultType = ty
@@ -2068,12 +2075,14 @@ particular compiler, and the C standard allows us to define `int` to be
 whatever size we like. That said, this assumption may break non-portable
 C programs.
 
-Conveniently, Rust allows `bool` expressions to be cast to any integer
-type, and it converts `true` to 1 and `false` to 0 just like C requires,
-so we don't need any special magic to handle booleans here.
+Conveniently, Rust allows `bool` and `enum` typed expressions to be cast
+to any integer type, and it converts `true` to 1 and `false` to 0 just
+like C requires, so we don't need any special magic to handle booleans
+or enumerated types here.
 
 ```haskell
 intPromote IsBool = IsInt Signed (BitWidth 32)
+intPromote (IsEnum _) = enumReprType
 intPromote (IsInt _ (BitWidth w)) | w < 32 = IsInt Signed (BitWidth 32)
 ```
 
@@ -2308,6 +2317,7 @@ data CType
     | IsFunc CType [(Maybe (Rust.Mutable, Ident), CType)] Bool
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
+    | IsEnum String
     deriving (Show, Eq)
 
 toRustType :: CType -> Rust.Type
@@ -2331,6 +2341,7 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
+toRustType (IsEnum name) = Rust.TypeName name
 ```
 
 C leaves it up to the implementation to decide whether the base `char`
@@ -2340,7 +2351,18 @@ of Rust's byte literals.
 ```haskell
 charType :: CType
 charType = IsInt Unsigned (BitWidth 8)
+```
 
+C permits implementations to represent enum values using integer types
+narrower than `int`, but for the moment we choose not to. This may be
+incompatible with some ABIs.
+
+```haskell
+enumReprType :: CType
+enumReprType = IsInt Signed (BitWidth 32)
+```
+
+```haskell
 baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType))
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
@@ -2390,6 +2412,30 @@ baseTypeOf specs = do
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
+    go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
+        (_, mty) <- getIdent (EnumIdent ident)
+        case mty of
+            Just (_, ty) -> return (mut, ty)
+            Nothing -> badSource spec "undefined enum"
+    go (CEnumType (CEnum mident (Just items) _ _) _) (mut, _) = do
+        let Rust.TypeName repr = toRustType enumReprType
+        name <- case mident of
+            Just ident -> do
+                 let name = identToString ident
+                 addIdent (EnumIdent ident) (Rust.Immutable, IsEnum name)
+            Nothing -> uniqueName "Enum"
+        enums <- forM items $ \ (ident, mexpr) -> do
+            enumName <- addIdent (SymbolIdent ident) (Rust.Immutable, IsEnum name)
+            case mexpr of
+                Nothing -> return (Rust.EnumeratorAuto enumName)
+                Just expr -> do
+                    expr' <- interpretExpr True expr
+                    return (Rust.EnumeratorExpr enumName (castTo enumReprType expr'))
+        let attrs = [ Rust.Attribute "derive(Clone, Copy)"
+                    , Rust.Attribute (concat [ "repr(", repr, ")" ])
+                    ]
+        emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
+        return (mut, IsEnum name)
     go spec@(CTypeDef ident _) (mut1, _) = do
         (_, mty) <- getIdent (TypedefIdent ident)
         case mty of

@@ -10,6 +10,7 @@ newtype Lit = LitRep String
     deriving Eq
 newtype Var = VarName String
     deriving Eq
+newtype Path = PathSegments [String]
 
 instance Pretty Lifetime where
     pPrint (Lifetime s) = text "'" <> text s
@@ -22,6 +23,9 @@ instance Pretty Lit where
 
 instance Pretty Var where
     pPrint (VarName s) = text s
+
+instance Pretty Path where
+    pPrint (PathSegments names) = hcat (punctuate (text "::") (map text names))
 
 data Visibility = Public | Private
     deriving Eq
@@ -80,6 +84,7 @@ data ItemKind
     | Struct String [(String, Type)]
     | Extern [ExternItem]
     | Use String
+    | Enum String [Enumerator]
 
 instance Pretty ItemKind where
     pPrint (Function attrs nm args ret body) = pPrintBlock (cat
@@ -103,6 +108,10 @@ instance Pretty ItemKind where
         ++ [text "}"]
         )
     pPrint (Use path) = text "use" <+> text path <> text ";"
+    pPrint (Enum name enums) =
+        text "enum" <+> text name <+> text "{" $+$
+        nest 4 (vcat [ pPrint enum <> text "," | enum <- enums ]) $+$
+        text "}"
 
 data ExternItem
     = ExternFn String [(Var, Type)] Bool Type
@@ -125,9 +134,18 @@ instance Pretty ExternItem where
         , pPrint ty
         ] <> text ";"
 
+data Enumerator
+    = EnumeratorAuto String
+    | EnumeratorExpr String Expr
+
+instance Pretty Enumerator where
+    pPrint (EnumeratorAuto name) = text name
+    pPrint (EnumeratorExpr name expr) = text name <+> text "=" <+> pPrint expr
+
 data Expr
     = Lit Lit
     | Var Var
+    | Path Path
     | StructExpr String [(String, Expr)]
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
@@ -199,6 +217,7 @@ instance Pretty Expr where
     pPrintPrec l d e' = case e' of
         Lit x -> pPrint x
         Var x -> pPrint x
+        Path x -> pPrint x
         StructExpr str fields -> sep
             ( text str <+> text "{"
             : punctuate (text ",") [ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ]
