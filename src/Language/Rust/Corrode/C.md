@@ -532,32 +532,28 @@ The return type of the function depends on which kind of binding it's
 constructing.
 
 ```haskell
-type MakeBinding a = Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> a
+type MakeBinding a = (Rust.ItemKind -> a, Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> a)
 ```
 
 It's up to the caller to provide an appropriate implementation of
 `makeBinding`, but there are only two sensible choices, which we'll
 define here for convenient use elsewhere.
 
-> **TODO**: `makeBinding` should only be used for non-`static` C
-> variable declarations, since declarations with the `static` storage
-> class should be translated to Rust static items regardless of whether
-> they're local or global. Then, since `makeStaticBinding` is used for
-> top-level declarations and will only be called for non-`static`
-> declarations, the static items it constructs should be public.
-
 > **FIXME**: Construct a correct default value for non-scalar static
 > variables.
 
 ```haskell
 makeStaticBinding :: MakeBinding Rust.Item
-makeStaticBinding mut var ty mexpr = Rust.Item attrs Rust.Private
-    (Rust.Static mut var ty (fromMaybe 0 mexpr))
+makeStaticBinding = (Rust.Item [] Rust.Private, makeBinding)
     where
+    makeBinding mut var ty mexpr = Rust.Item attrs Rust.Public
+        (Rust.Static mut var ty (fromMaybe 0 mexpr))
     attrs = [Rust.Attribute "no_mangle"]
 
 makeLetBinding :: MakeBinding Rust.Stmt
-makeLetBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
+makeLetBinding = (Rust.StmtItem [], makeBinding)
+    where
+    makeBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
 ```
 
 Now that we know how to translate variable declarations, everything else
@@ -649,7 +645,7 @@ declaration. It returns a list of bindings constructed using
 
 ```haskell
 interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad [b]
-interpretDeclarations makeBinding declaration@(CDecl specs decls _) = do
+interpretDeclarations (fromItem, makeBinding) declaration@(CDecl specs decls _) = do
 ```
 
 First, we call `baseTypeOf` to get our internal representation of the
@@ -748,6 +744,21 @@ prune duplicates later.
                 addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
                     Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)
                 return Nothing
+```
+
+Declarations with storage class `static` always need to construct Rust
+static items. These items always have an initializer, even if it's just
+the zero-equivalent initializer. We use the caller's `fromItem` callback
+to turn the item (actually an `ItemKind`) into the same type that we're
+returning for other bindings.
+
+```haskell
+            (Just (CStatic _), _, _) -> do
+                name <- addIdent (SymbolIdent ident) (mut, ty)
+                useType ty
+                expr <- interpretInitializer ty (fromMaybe (CInitList [] (nodeInfo decl)) minit)
+                return (Just (fromItem
+                    (Rust.Static mut (Rust.VarName name) (toRustType ty) expr)))
 ```
 
 Anything else is a variable declaration to translate. This is the only
