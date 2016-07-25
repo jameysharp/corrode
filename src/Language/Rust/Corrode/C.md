@@ -735,7 +735,7 @@ duplicates later.
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
                 addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
-                    Rust.ExternFn name formals variadic (toRustType retTy)
+                    Rust.ExternFn name formals variadic (toRustRetType retTy)
                 return Nothing
 ```
 
@@ -916,7 +916,9 @@ expression.
 
 ```haskell
         let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) (statementsToBlock body')))
+        return (Rust.Item attrs vis
+            (Rust.Function [Rust.UnsafeFn] name formals (toRustRetType retTy)
+                (statementsToBlock body')))
 ```
 
 
@@ -2474,7 +2476,7 @@ toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
-toRustType IsVoid = Rust.TypeName "()"
+toRustType IsVoid = Rust.TypeName "std::os::raw::c_void"
 toRustType (IsFunc retTy args variadic) = Rust.TypeName $ concat
     [ "unsafe extern fn("
     , args'
@@ -2493,6 +2495,15 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
 toRustType (IsStruct name _fields) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
 toRustType (IsIncomplete name) = Rust.TypeName name
+```
+
+Functions that don't return anything have a return type in Rust that is
+different than the representation of C's `void` type elsewhere.
+
+```haskell
+toRustRetType :: CType -> Rust.Type
+toRustRetType IsVoid = Rust.TypeName "()"
+toRustRetType ty = toRustType ty
 ```
 
 C leaves it up to the implementation to decide whether the base `char`
