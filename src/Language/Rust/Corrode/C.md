@@ -136,9 +136,10 @@ unnecessary code to deal with edge cases&mdash;see the case of
 ```haskell
 data Output = Output
     { outputItems :: [Rust.Item]
-    , outputExterns :: [Rust.ExternItem]
+    , outputExterns :: [(Rust.ExternItem, CType)]
     , outputIncomplete :: Set.Set String
     , usesSymbols :: Set.Set String
+    , usesTypes :: Set.Set String
     , usesBreak :: Any
     , usesContinue :: Any
     }
@@ -165,6 +166,7 @@ For our output to be a monoid, it needs to specify
             , outputExterns = mempty
             , outputIncomplete = mempty
             , usesSymbols = mempty
+            , usesTypes = mempty
             , usesBreak = mempty
             , usesContinue = mempty
             }
@@ -179,6 +181,7 @@ For our output to be a monoid, it needs to specify
             , outputExterns = outputExterns a `mappend` outputExterns b
             , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
             , usesSymbols = usesSymbols a `mappend` usesSymbols b
+            , usesTypes = usesTypes a `mappend` usesTypes b
             , usesBreak = usesBreak a `mappend` usesBreak b
             , usesContinue = usesContinue a `mappend` usesContinue b
             }
@@ -264,6 +267,11 @@ emitItems :: [Rust.Item] -> EnvMonad ()
 emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
+```haskell
+useType :: CType -> EnvMonad ()
+useType ty = lift $ tell mempty { usesTypes = declaredNames ty }
+```
+
 `addExternIdent` saves type information into the environment like
 `addIdent`, unless the ident is already there, in which case it verifies
 that the types are the same.
@@ -289,7 +297,7 @@ addExternIdent node ident ty mkItem = do
             ("redefinition, previously defined as " ++ show oldTy)
         Nothing -> do
             name <- addIdent ident ty
-            lift $ tell mempty { outputExterns = [mkItem name] }
+            lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
 ```
 
 `emitIncomplete` records that we saw an incomplete type. For our
@@ -466,7 +474,25 @@ for this translation unit it becomes clear.
     externName (Rust.ExternFn name _ _ _) = name
     externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
     keepExtern name = name `Set.member` usesSymbols output && name `notElem` itemNames
-    externs' = filter (keepExtern . externName) (outputExterns output)
+    externs = filter (keepExtern . externName . fst) (outputExterns output)
+    (externs', externTypes) = unzip externs
+```
+
+If a type declaration isn't actually used by any of the other
+declarations that we're keeping, then drop it. C headers declare lots of
+types, and most of them don't get used in any given source file.
+
+This is not just a nice cleanup of the output. It also allows us to
+translate headers containing types we can't yet translate, as long as
+those types aren't actually used.
+
+```haskell
+    neededTypes = Set.unions (usesTypes output : map declaredNames externTypes)
+    keepItem (Rust.Item _ _ (Rust.Struct name _)) = name `Set.member` neededTypes
+    keepItem (Rust.Item _ _ (Rust.Enum name _)) = name `Set.member` neededTypes
+    keepItem _ = True
+
+    items = filter keepItem (incompleteItems ++ outputItems output)
 ```
 
 If there are any external declarations after filtering, then we need to
@@ -474,7 +500,6 @@ wrap them in an `extern { }` block. We place that before the other
 items, by convention.
 
 ```haskell
-    items = incompleteItems ++ outputItems output
     items' = if null externs'
         then items
         else Rust.Item [] Rust.Private (Rust.Extern externs') : items
@@ -732,6 +757,7 @@ to translate that; see below.
 ```haskell
             _ -> do
                 name <- addIdent (SymbolIdent ident) (mut, ty)
+                useType ty
                 mexpr <- mapM (interpretInitializer ty) minit
                 return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
 ```
@@ -825,6 +851,7 @@ support them.
         IsFunc _ _ True -> unimplemented declr
         IsFunc retTy args False -> return (retTy, args)
         _ -> badSource declr "function definition"
+    useType funTy
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -2413,6 +2440,22 @@ instance Eq CType where
     _ == _ = False
 ```
 
+To track which type declarations are actually used, at various points we
+need to find out which type names are referenced in some `CType`.
+`declaredNames` computes that set with a recursive walk down the type.
+
+```haskell
+declaredNames :: CType -> Set.Set String
+declaredNames (IsFunc retTy args _) =
+    Set.unions (map declaredNames (retTy : map snd args))
+declaredNames (IsPtr _ ty) = declaredNames ty
+declaredNames (IsStruct name fields) = Set.insert name
+    (Set.unions (map (declaredNames . snd) fields))
+declaredNames (IsEnum name) = Set.singleton name
+declaredNames (IsIncomplete name) = Set.singleton name
+declaredNames _ = Set.empty
+```
+
 ```haskell
 toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
@@ -2612,12 +2655,13 @@ typeName decl@(CDecl spec declarators _) = do
     case storage of
         Just s -> badSource s "storage class specifier in type name"
         Nothing -> return ()
-    -- Declaration mutability has no effect in type names.
-    case declarators of
+    (mut, ty) <- case declarators of
         [] -> return base
         [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] -> do
             (mut, isFunc, ty) <- derivedTypeOf base declr
             when isFunc (badSource decl "use of function type")
             return (mut, ty)
         _ -> badSource decl "type name"
+    useType ty
+    return (mut, ty)
 ```
