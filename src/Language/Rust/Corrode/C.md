@@ -1766,9 +1766,22 @@ type specified, or it's a syntax error.
         arg' <- interpretExpr True arg
         args' <- castArgs variadic tys rest
         return (castTo ty arg' : args')
-    castArgs True [] rest = mapM (fmap result . interpretExpr True) rest
+    castArgs True [] rest = mapM (fmap promoteArg . interpretExpr True) rest
     castArgs False [] _ = badSource expr "arguments (too many)"
     castArgs _ _ [] = badSource expr "arguments (too few)"
+```
+
+In C, the "default argument promotions" (C99 6.5.2.2 paragraphs 6-7) are
+applied to any variable parameters after the last declared parameter.
+They would also be applied to arguments passed to a function declared
+with an empty argument list (`foo()`) or implicitly declared due to a
+lack of a prototype, except we don't allow either of those cases.
+
+```haskell
+    promoteArg :: Result -> Rust.Expr
+    promoteArg r = case resultType r of
+        IsFloat _ -> castTo (IsFloat 64) r
+        ty -> castTo (intPromote ty) r
 ```
 
 Structure member access has two forms in C (`.` and `->`), which only
