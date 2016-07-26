@@ -237,7 +237,22 @@ haven't seen a declaration for that name yet.
 getIdent :: IdentKind -> EnvMonad (String, Maybe (Rust.Mutable, CType))
 getIdent ident = lift $ do
     env <- gets environment
-    return (applyRenames ident, lookup ident env)
+    let name = applyRenames ident
+    return $ case lookup ident env of
+        Just ty -> (name, Just ty)
+        Nothing -> fromMaybe (name, Nothing) $ case ident of
+            SymbolIdent ident' -> lookup (identToString ident') builtinSymbols
+            _ -> Nothing
+    where
+    builtinSymbols =
+        [ ("__builtin_bswap" ++ show w,
+            ("u" ++ show w ++ "::swap_bytes",
+                Just (Rust.Immutable,
+                    IsFunc (IsInt Unsigned (BitWidth w))
+                        [(Nothing, IsInt Unsigned (BitWidth w))] False
+            )))
+        | w <- [16, 32, 64]
+        ]
 ```
 
 `addIdent` saves type information into the environment.
