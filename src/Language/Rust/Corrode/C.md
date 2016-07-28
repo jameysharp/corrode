@@ -1546,7 +1546,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
     if demand
-        then promote expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
+        then promotePtr expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
         else return Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
