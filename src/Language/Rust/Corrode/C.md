@@ -2074,11 +2074,9 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         where
         lhsTy = intPromote (resultType lhs)
         rhsTy = intPromote (resultType rhs)
-    comparison op' = case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> return (promotePtr op' lhs rhs)
-        _ -> do
-            res <- promote expr op' lhs rhs
-            return res { resultType = IsBool }
+    comparison op' = do
+        res <- promotePtr expr op' lhs rhs
+        return res { resultType = IsBool }
 
 isSimple :: Rust.Expr -> Bool
 isSimple (Rust.Var{}) = True
@@ -2403,20 +2401,32 @@ architectures.
 compatiblePtr _ _ = IsVoid
 ```
 
-Finally, `promotePtr` is like `promote` but for pointer types instead of
-arithmetic types. This function is only used for boolean-valued
-operators such as `==` or `<`, so it's specialized to mark the result
-type as boolean for convenience.
+Finally, `promotePtr` is like `promote` but for operators that allow
+pointers as operands, not just arithmetic types. Since integer literals
+may be implicitly used as pointers, if either operand is a pointer, we
+pretend the other one is a void pointer and let `compatiblePtr` figure
+out what type it should really be converted to.
 
 ```haskell
-promotePtr :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promotePtr op a b = Result
-    { resultType = IsBool
-    , isMutable = Rust.Immutable
-    , result =
-        let ty = compatiblePtr (resultType a) (resultType b)
-        in op (castTo ty a) (castTo ty b)
-    }
+promotePtr
+    :: (Pretty node, Pos node)
+    => node
+    -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
+    -> Result -> Result -> EnvMonad Result
+promotePtr node op a b = case (resultType a, resultType b) of
+    (IsPtr _ _, _) -> ptrs
+    (_, IsPtr _ _) -> ptrs
+    _ -> promote node op a b
+    where
+    ptrOrVoid r = case resultType r of
+        t@(IsPtr _ _) -> t
+        _ -> IsPtr Rust.Mutable IsVoid
+    ty = compatiblePtr (ptrOrVoid a) (ptrOrVoid b)
+    ptrs = return Result
+        { resultType = ty
+        , isMutable = Rust.Immutable
+        , result = op (castTo ty a) (castTo ty b)
+        }
 ```
 
 
