@@ -37,6 +37,7 @@ import Data.Monoid
 import Data.List
 import qualified Data.Set as Set
 import Language.C
+import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
 import Numeric
 import Text.PrettyPrint
@@ -321,10 +322,10 @@ translate, but we can still allow pointers to values of this type as
 long as nobody tries dereferencing those pointers.
 
 ```haskell
-emitIncomplete :: String -> EnvMonad CType
-emitIncomplete name = do
-    lift $ tell mempty { outputIncomplete = Set.singleton name }
-    return (IsIncomplete name)
+emitIncomplete :: Ident -> EnvMonad CType
+emitIncomplete ident = do
+    lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
+    return (IsIncomplete ident)
 ```
 
 `recordBreak`/`recordContinue` take note of the presence of a `break`/
@@ -2465,7 +2466,7 @@ data CType
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
     | IsEnum String
-    | IsIncomplete String
+    | IsIncomplete Ident
     deriving Show
 ```
 
@@ -2503,7 +2504,7 @@ declaredNames (IsPtr _ ty) = declaredNames ty
 declaredNames (IsStruct name fields) = Set.insert name
     (Set.unions (map (declaredNames . snd) fields))
 declaredNames (IsEnum name) = Set.singleton name
-declaredNames (IsIncomplete name) = Set.singleton name
+declaredNames (IsIncomplete ident) = Set.singleton (identToString ident)
 declaredNames _ = Set.empty
 ```
 
@@ -2530,7 +2531,7 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
-toRustType (IsIncomplete name) = Rust.TypeName name
+toRustType (IsIncomplete ident) = Rust.TypeName (identToString ident)
 ```
 
 Functions that don't return anything have a return type in Rust that is
@@ -2584,10 +2585,10 @@ baseTypeOf specs = do
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        (name, mty) <- getIdent (StructIdent ident)
+        (_name, mty) <- getIdent (StructIdent ident)
         ty <- case mty of
             Just (_, ty) -> return ty
-            Nothing -> emitIncomplete name
+            Nothing -> emitIncomplete ident
         return (mut, ty)
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
@@ -2610,11 +2611,13 @@ baseTypeOf specs = do
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
-    go (CSUType (CStruct CUnionTag mident _ _ _) _) (mut, _) = do
-        name <- case mident of
-            Just ident -> return (identToString ident)
-            Nothing -> uniqueName "Union"
-        ty <- emitIncomplete name
+    go (CSUType (CStruct CUnionTag mident _ _ _) node) (mut, _) = do
+        ident <- case mident of
+            Just ident -> return ident
+            Nothing -> do
+                name <- uniqueName "Union"
+                return (internalIdentAt (posOfNode node) name)
+        ty <- emitIncomplete ident
         return (mut, ty)
     go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
         (_, mty) <- getIdent (EnumIdent ident)
@@ -2645,7 +2648,7 @@ baseTypeOf specs = do
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing | name == "__builtin_va_list" -> do
-                ty <- emitIncomplete name
+                ty <- emitIncomplete ident
                 return (mut1, IsPtr Rust.Mutable ty)
             Nothing -> badSource spec "undefined type"
     go spec _ = unimplemented spec
