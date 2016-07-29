@@ -1825,6 +1825,11 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
     fields <- case resultType obj' of
         IsStruct _ fields -> return fields
+        IsIncomplete tyIdent -> do
+            (_, struct) <- getIdent (StructIdent tyIdent)
+            case struct of
+                Just (_, IsStruct _ fields) -> return fields
+                _ -> badSource expr "member access of incomplete type"
         _ -> badSource expr "member access of non-struct"
     let field = identToString ident
     ty <- case lookup field fields of
