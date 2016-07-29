@@ -883,7 +883,7 @@ translateInitializer ty i@(CInitList list _) = do
 
 Next, we have to chose the starting current object (`base`). For structs,
 the first current object points to their first field but for primitives it
-points to the primitive itself. For example 
+points to the primitive itself. For example
 
 ```c
 struct point { int x, y };
@@ -912,7 +912,7 @@ Then, the whole initializer is the result of combining all the
 initializers together using `mconcat`.
 
 ```haskell
-        initializer = msum $ do 
+        initializer = msum $ do
             (_, initializers) <- mapAccumLM resolveCurrentObject (Just base) objectsAndInitializers
             let initializerPossibility = mconcat <$> sequence initializers
             pure ((\x -> [x]) `withExceptT` initializerPossibility)
@@ -937,11 +937,13 @@ initialized.
         Just obj -> do
 ```
 
-If the intializer provided is list, then the intializer has to be for the
-current object. If it is just an intializer expression, however, we need
-to explore all the different possibilities for the actual current object.
-This turns out to be efficient since only one of these will actually work,
-and all the others will be weeded out immediately in the recursive call.
+If the intializer provided is another initializer list, then the
+intializer has to be for the current object. If it is just an intializer
+expression, however, we need to explore all the different possibilities
+for the actual current object (which we do with the list monad). This
+turns out to be efficient since only one of these intializers will be
+successfully translated and all the others will be weeded out immediately
+in the recursive call.
 
 ```haskell
             obj' <- case cinitial of
