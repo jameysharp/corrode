@@ -903,7 +903,9 @@ initialized.
     resolveCurrentObject obj0 (obj1, cinitial) = case obj1 <|> obj0 of
         Nothing -> [(Nothing, pure mempty)]
         Just obj -> do
-            obj' <- possibleCasts obj
+            obj' <- case cinitial of
+                CInitList{} -> [obj]
+                CInitExpr{} -> possibleCasts obj
             
             let initial = translateInitializer (case obj' of { Base t -> t; From t _ _ _ -> t }) cinitial
                 indices = unfoldr (\o -> case o of
