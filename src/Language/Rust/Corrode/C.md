@@ -811,7 +811,8 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
 However, since it is possible for some entries in an initializer to have
 no designators (in which case the initializer implicitly applies to the
 next object), we need a way to calculate the most general next object from
-the current one (provided we haven't reach the end of the struct/array).
+the current one (provided we haven't reach the end of the thing we are
+initializing).
 
 ```haskell
 nextObject :: Designator -> CurrentObject
@@ -881,9 +882,9 @@ translateInitializer ty i@(CInitList list _) = do
     let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
 ```
 
-Next, we have to chose the starting current object (`base`). For structs,
-the first current object points to their first field but for primitives it
-points to the primitive itself. For example
+Next, we have to chose the starting current object (`base`). For aggregate
+types, the first current object points to their first field but for scalar
+types it points to the primitive itself. For example
 
 ```c
 struct point { int x, y };
@@ -908,8 +909,8 @@ walk through the list of designators and their initializers from left to
 right passing along the current object as we go (in case the initializer
 that follows has no designator).
 
-Then, the whole initializer is the result of combining all the
-initializers together using `mconcat`.
+The whole initializer is the result of combining all the initializers
+together using `mconcat`.
 
 ```haskell
         initializer = msum $ do
