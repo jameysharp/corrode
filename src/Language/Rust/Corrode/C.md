@@ -868,9 +868,8 @@ translateInitializer ty i@(CInitExpr expr _) = do
     compatible _ _ = True
 ```
 
-For the case where we have a list of expressions, since there are usually
-several ways of interpreting the current object, we have to try all of
-them and take the one that suceeds (if any of them do).
+For the case where we have a list of expressions, things get a little
+hairier. We start by parsing all of the designators into our format.
 
 ```haskell
 translateInitializer ty i@(CInitList list _) = do 
@@ -880,10 +879,40 @@ translateInitializer ty i@(CInitList list _) = do
         pure (currObj, initial)   
     
     let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
-        initializer = msum $ do
-            let base = case ty of
-                        IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
-                        _ -> Base ty
+```
+
+Next, we have to chose the starting current object (`base`). For structs,
+the first current object points to their first field but for primitives it
+points to the primitive itself. For example 
+
+```c
+struct point { int x, y };
+
+int i = { 1, 3 };
+struct point p = { 1, 3 };
+```
+
+In the first example, the whole of `i` gets initialized to `1` (and `3` is
+ignored) since `i` is not a struct. On the other, in the second example,
+it is the fields of `p` that get initialized to `1` and `3` since `p` is a
+struct.
+
+```haskell
+        base = case ty of
+                    IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
+                    _ -> Base ty
+```
+
+Finally, we are ready to calculate the initializer for the whole list. We
+walk through the list of designators and their initializers from left to
+right passing along the current object as we go (in case the initializer
+that follows has no designator).
+
+Then, the whole initializer is the result of combining all the
+initializers together using `mconcat`.
+
+```haskell
+        initializer = msum $ do 
             (_, initializers) <- mapAccumLM resolveCurrentObject (Just base) objectsAndInitializers
             let initializerPossibility = mconcat <$> sequence initializers
             pure ((\x -> [x]) `withExceptT` initializerPossibility)
@@ -906,6 +935,15 @@ initialized.
     resolveCurrentObject obj0 (obj1, cinitial) = case obj1 <|> obj0 of
         Nothing -> [(Nothing, pure mempty)]
         Just obj -> do
+```
+
+If the intializer provided is list, then the intializer has to be for the
+current object. If it is just an intializer expression, however, we need
+to explore all the different possibilities for the actual current object.
+This turns out to be efficient since only one of these will actually work,
+and all the others will be weeded out immediately in the recursive call.
+
+```haskell
             obj' <- case cinitial of
                 CInitList{} -> [obj]
                 CInitExpr{} -> possibleCasts obj
