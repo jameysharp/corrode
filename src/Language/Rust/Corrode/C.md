@@ -881,7 +881,10 @@ translateInitializer ty i@(CInitList list _) = do
     
     let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
         initializer = msum $ do
-            (_, initializers) <- mapAccumLM resolveCurrentObject (Just (Base ty)) objectsAndInitializers
+            let base = case ty of
+                        IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
+                        _ -> Base ty
+            (_, initializers) <- mapAccumLM resolveCurrentObject (Just base) objectsAndInitializers
             let initializerPossibility = mconcat <$> sequence initializers
             pure ((\x -> [x]) `withExceptT` initializerPossibility)
 
