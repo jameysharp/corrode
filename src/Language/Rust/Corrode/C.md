@@ -26,7 +26,6 @@ useful data structures and control flow abstractions.
 ```haskell
 module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
-import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State (runStateT, StateT(..))
@@ -933,7 +932,7 @@ initialized.
 
 ```haskell
     resolveCurrentObject :: CurrentObject -> (CurrentObject, CInit) -> [(CurrentObject, EnvMonad Initializer)]
-    resolveCurrentObject obj0 (obj1, cinitial) = case obj1 <|> obj0 of
+    resolveCurrentObject obj0 (obj1, cinitial) = case obj1 `mplus` obj0 of
         Nothing -> [(Nothing, pure mempty)]
         Just obj -> do
 ```
