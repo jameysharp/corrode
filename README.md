@@ -21,6 +21,9 @@ As of now, there are no pre-built binaries available, so you need to build the
 project yourself, but don't let that scare you away; clone the project, `cd`
 into it and follow along :)
 
+If you're using Windows, start by running `./fixGitSymlinksForWindows.bat` as
+admin.
+
 Ensure that you have GHC and the `cabal-install` tool installed by following
 the [directions on haskell.org](https://www.haskell.org/downloads#minimal).
 After that, you can build `corrode` by navigating to the `corrode` directory

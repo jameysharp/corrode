@@ -32,12 +32,15 @@ import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
+import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
 import Data.Monoid
 import Data.List
+import qualified Data.Set as Set
 import Language.C
+import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
-import qualified Data.IntMap.Strict as IntMap
+import Numeric
 import Text.PrettyPrint
 ```
 
@@ -101,6 +104,7 @@ data IdentKind
     = SymbolIdent { identOfKind :: Ident }
     | TypedefIdent { identOfKind :: Ident }
     | StructIdent { identOfKind :: Ident }
+    | EnumIdent { identOfKind :: Ident }
     deriving Eq
 ```
 
@@ -134,7 +138,10 @@ unnecessary code to deal with edge cases&mdash;see the case of
 ```haskell
 data Output = Output
     { outputItems :: [Rust.Item]
-    , outputExterns :: [Rust.ExternItem]
+    , outputExterns :: [(Rust.ExternItem, CType)]
+    , outputIncomplete :: Set.Set String
+    , usesSymbols :: Set.Set String
+    , usesTypes :: Set.Set String
     , usesBreak :: Any
     , usesContinue :: Any
     }
@@ -159,6 +166,9 @@ For our output to be a monoid, it needs to specify
         mempty = Output
             { outputItems = mempty
             , outputExterns = mempty
+            , outputIncomplete = mempty
+            , usesSymbols = mempty
+            , usesTypes = mempty
             , usesBreak = mempty
             , usesContinue = mempty
             }
@@ -171,6 +181,9 @@ For our output to be a monoid, it needs to specify
         mappend a b = Output
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
+            , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
+            , usesSymbols = usesSymbols a `mappend` usesSymbols b
+            , usesTypes = usesTypes a `mappend` usesTypes b
             , usesBreak = usesBreak a `mappend` usesBreak b
             , usesContinue = usesContinue a `mappend` usesContinue b
             }
@@ -226,7 +239,22 @@ haven't seen a declaration for that name yet.
 getIdent :: IdentKind -> EnvMonad (String, Maybe (Rust.Mutable, CType))
 getIdent ident = lift $ do
     env <- gets environment
-    return (applyRenames ident, lookup ident env)
+    let name = applyRenames ident
+    return $ case lookup ident env of
+        Just ty -> (name, Just ty)
+        Nothing -> fromMaybe (name, Nothing) $ case ident of
+            SymbolIdent ident' -> lookup (identToString ident') builtinSymbols
+            _ -> Nothing
+    where
+    builtinSymbols =
+        [ ("__builtin_bswap" ++ show w,
+            ("u" ++ show w ++ "::swap_bytes",
+                Just (Rust.Immutable,
+                    IsFunc (IsInt Unsigned (BitWidth w))
+                        [(Nothing, IsInt Unsigned (BitWidth w))] False
+            )))
+        | w <- [16, 32, 64]
+        ]
 ```
 
 `addIdent` saves type information into the environment.
@@ -256,15 +284,49 @@ emitItems :: [Rust.Item] -> EnvMonad ()
 emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
-`emitExterns` adds to the output a list of functions or global variables
-which _may_ be declared in some other translation unit. (We can't tell
-when we see a C extern declaration whether it's just the prototype for a
+```haskell
+useType :: CType -> EnvMonad ()
+useType ty = lift $ tell mempty { usesTypes = declaredNames ty }
+```
+
+`addExternIdent` saves type information into the environment like
+`addIdent`, unless the ident is already there, in which case it verifies
+that the types are the same.
+
+It also adds to the output a list of functions or global variables which
+_may_ be declared in some other translation unit. (We can't tell when we
+see a C extern declaration whether it's just the prototype for a
 definition that we'll find later in the current translation unit, so
 there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 
 ```haskell
-emitExterns :: [Rust.ExternItem] -> EnvMonad ()
-emitExterns items = lift $ tell mempty { outputExterns = items }
+addExternIdent
+    :: (Pretty node, Pos node)
+    => node
+    -> IdentKind
+    -> (Rust.Mutable, CType)
+    -> (String -> Rust.ExternItem)
+    -> EnvMonad ()
+addExternIdent node ident ty mkItem = do
+    (_, mty) <- getIdent ident
+    case mty of
+        Just oldTy -> when (ty /= oldTy) $ badSource node
+            ("redefinition, previously defined as " ++ show oldTy)
+        Nothing -> do
+            name <- addIdent ident ty
+            lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
+```
+
+`emitIncomplete` records that we saw an incomplete type. For our
+purposes, an incomplete type is anything with a definition we can't
+translate, but we can still allow pointers to values of this type as
+long as nobody tries dereferencing those pointers.
+
+```haskell
+emitIncomplete :: Ident -> EnvMonad CType
+emitIncomplete ident = do
+    lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
+    return (IsIncomplete ident)
 ```
 
 `recordBreak`/`recordContinue` take note of the presence of a `break`/
@@ -382,6 +444,36 @@ three possible kinds for each declaration:
     perDecl decl = unimplemented decl
 ```
 
+Incomplete types (see `emitIncomplete` above) may be referenced early
+and then completed later. In that case we need to only emit the complete
+definition.
+
+If they are never completed, however, then we need to emit some Rust
+type that can only be passed around by reference. We can't allow the
+Rust compiler to construct, copy, or consume values of the incomplete
+type, because we don't know how big it is. We also want each incomplete
+type to be distinct from all other incomplete types.
+
+We meet those requirements by, for each incomplete type, creating a
+private `enum` type. We don't give the type any constructors, so new
+values can't be constructed and it can't be `match`ed on. Unlike the
+translation of other types, we don't declare this enum's `repr`, and we
+don't derive `Copy` or `Clone` for it.
+
+```haskell
+    completeTypes = Set.fromList $ catMaybes
+        [ case item of
+            Rust.Item _ _ (Rust.Struct name _) -> Just name
+            _ -> Nothing
+        | item <- outputItems output
+        ]
+    incompleteTypes = outputIncomplete output `Set.difference` completeTypes
+    incompleteItems =
+        [ Rust.Item [] Rust.Private (Rust.Enum name [])
+        | name <- Set.toList incompleteTypes
+        ]
+```
+
 Next we remove any locally-defined names from the list of external
 declarations. We can't tell whether something is actually external when
 we encounter its declaration, but once we've collected all the symbols
@@ -398,7 +490,26 @@ for this translation unit it becomes clear.
 
     externName (Rust.ExternFn name _ _ _) = name
     externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
-    externs' = filter (\ item -> externName item `notElem` itemNames) (outputExterns output)
+    keepExtern name = name `Set.member` usesSymbols output && name `notElem` itemNames
+    externs = filter (keepExtern . externName . fst) (outputExterns output)
+    (externs', externTypes) = unzip externs
+```
+
+If a type declaration isn't actually used by any of the other
+declarations that we're keeping, then drop it. C headers declare lots of
+types, and most of them don't get used in any given source file.
+
+This is not just a nice cleanup of the output. It also allows us to
+translate headers containing types we can't yet translate, as long as
+those types aren't actually used.
+
+```haskell
+    neededTypes = Set.unions (usesTypes output : map declaredNames externTypes)
+    keepItem (Rust.Item _ _ (Rust.Struct name _)) = name `Set.member` neededTypes
+    keepItem (Rust.Item _ _ (Rust.Enum name _)) = name `Set.member` neededTypes
+    keepItem _ = True
+
+    items = filter keepItem (incompleteItems ++ outputItems output)
 ```
 
 If there are any external declarations after filtering, then we need to
@@ -407,8 +518,8 @@ items, by convention.
 
 ```haskell
     items' = if null externs'
-        then outputItems output
-        else Rust.Item [] Rust.Private (Rust.Extern externs') : outputItems output
+        then items
+        else Rust.Item [] Rust.Private (Rust.Extern externs') : items
 ```
 
 
@@ -438,32 +549,28 @@ The return type of the function depends on which kind of binding it's
 constructing.
 
 ```haskell
-type MakeBinding a = Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> a
+type MakeBinding a = (Rust.ItemKind -> a, Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> a)
 ```
 
 It's up to the caller to provide an appropriate implementation of
 `makeBinding`, but there are only two sensible choices, which we'll
 define here for convenient use elsewhere.
 
-> **TODO**: `makeBinding` should only be used for non-`static` C
-> variable declarations, since declarations with the `static` storage
-> class should be translated to Rust static items regardless of whether
-> they're local or global. Then, since `makeStaticBinding` is used for
-> top-level declarations and will only be called for non-`static`
-> declarations, the static items it constructs should be public.
-
 > **FIXME**: Construct a correct default value for non-scalar static
 > variables.
 
 ```haskell
 makeStaticBinding :: MakeBinding Rust.Item
-makeStaticBinding mut var ty mexpr = Rust.Item attrs Rust.Private
-    (Rust.Static mut var ty (fromMaybe 0 mexpr))
+makeStaticBinding = (Rust.Item [] Rust.Private, makeBinding)
     where
+    makeBinding mut var ty mexpr = Rust.Item attrs Rust.Public
+        (Rust.Static mut var ty (fromMaybe 0 mexpr))
     attrs = [Rust.Attribute "no_mangle"]
 
 makeLetBinding :: MakeBinding Rust.Stmt
-makeLetBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
+makeLetBinding = (Rust.StmtItem [], makeBinding)
+    where
+    makeBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
 ```
 
 Now that we know how to translate variable declarations, everything else
@@ -555,7 +662,7 @@ declaration. It returns a list of bindings constructed using
 
 ```haskell
 interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad [b]
-interpretDeclarations makeBinding declaration@(CDecl specs decls _) = do
+interpretDeclarations (fromItem, makeBinding) declaration@(CDecl specs decls _) = do
 ```
 
 First, we call `baseTypeOf` to get our internal representation of the
@@ -610,7 +717,8 @@ environment.
 > always possible, so this requires careful thought.
 
 ```haskell
-            (Just (CTypedef _), False, _) -> do
+            (Just (CTypedef _), _, _) -> do
+                when isFunc (unimplemented decl)
                 when (isJust minit) (badSource decl "initializer on typedef")
                 _ <- addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
@@ -640,8 +748,8 @@ duplicates later.
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
-                name <- addIdent (SymbolIdent ident) (mut, ty)
-                emitExterns [Rust.ExternFn name formals variadic (toRustType retTy)]
+                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                    Rust.ExternFn name formals variadic (toRustRetType retTy)
                 return Nothing
 ```
 
@@ -651,9 +759,24 @@ prune duplicates later.
 
 ```haskell
             (Just (CExtern _), _, _) -> do
-                name <- addIdent (SymbolIdent ident) (mut, ty)
-                emitExterns [Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)]
+                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                    Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)
                 return Nothing
+```
+
+Declarations with storage class `static` always need to construct Rust
+static items. These items always have an initializer, even if it's just
+the zero-equivalent initializer. We use the caller's `fromItem` callback
+to turn the item (actually an `ItemKind`) into the same type that we're
+returning for other bindings.
+
+```haskell
+            (Just (CStatic _), _, _) -> do
+                name <- addIdent (SymbolIdent ident) (mut, ty)
+                useType ty
+                expr <- interpretInitializer ty (fromMaybe (CInitList [] (nodeInfo decl)) minit)
+                return (Just (fromItem
+                    (Rust.Static mut (Rust.VarName name) (toRustType ty) expr)))
 ```
 
 Anything else is a variable declaration to translate. This is the only
@@ -663,6 +786,7 @@ to translate that; see below.
 ```haskell
             _ -> do
                 name <- addIdent (SymbolIdent ident) (mut, ty)
+                useType ty
                 mexpr <- mapM (interpretInitializer ty) minit
                 return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
 ```
@@ -993,6 +1117,12 @@ zeroed out.
     zeroInitializer (IsStruct _ fields) = do
         fields' <- mapM (zeroInitializer . snd) fields
         return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
+    zeroInitializer IsEnum{} = unimplemented initial
+    zeroInitializer (IsIncomplete ident) = do
+        (_, struct) <- getIdent (StructIdent ident)
+        case struct of
+            Just (_, ty'@IsStruct{}) -> zeroInitializer ty'
+            _ -> badSource initial "initialization of incomplete type"
 ```
 
 ```haskell
@@ -1048,6 +1178,7 @@ support them.
         IsFunc _ _ True -> unimplemented declr
         IsFunc retTy args False -> return (retTy, args)
         _ -> badSource declr "function definition"
+    useType funTy
 ```
 
 Add this function to the globals before evaluating its body so recursive
@@ -1112,7 +1243,9 @@ expression.
 
 ```haskell
         let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis (Rust.Function [Rust.UnsafeFn] name formals (toRustType retTy) (statementsToBlock body')))
+        return (Rust.Item attrs vis
+            (Rust.Function [Rust.UnsafeFn] name formals (toRustRetType retTy)
+                (statementsToBlock body')))
 ```
 
 
@@ -1714,7 +1847,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
     if demand
-        then promote expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
+        then promotePtr expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
         else return Result
             { resultType = IsVoid
             , isMutable = Rust.Immutable
@@ -1962,9 +2095,22 @@ type specified, or it's a syntax error.
         arg' <- interpretExpr True arg
         args' <- castArgs variadic tys rest
         return (castTo ty arg' : args')
-    castArgs True [] rest = mapM (fmap result . interpretExpr True) rest
+    castArgs True [] rest = mapM (fmap promoteArg . interpretExpr True) rest
     castArgs False [] _ = badSource expr "arguments (too many)"
     castArgs _ _ [] = badSource expr "arguments (too few)"
+```
+
+In C, the "default argument promotions" (C99 6.5.2.2 paragraphs 6-7) are
+applied to any variable parameters after the last declared parameter.
+They would also be applied to arguments passed to a function declared
+with an empty argument list (`foo()`) or implicitly declared due to a
+lack of a prototype, except we don't allow either of those cases.
+
+```haskell
+    promoteArg :: Result -> Rust.Expr
+    promoteArg r = case resultType r of
+        IsFloat _ -> castTo (IsFloat 64) r
+        ty -> castTo (intPromote ty) r
 ```
 
 Structure member access has two forms in C (`.` and `->`), which only
@@ -1979,6 +2125,11 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
     fields <- case resultType obj' of
         IsStruct _ fields -> return fields
+        IsIncomplete tyIdent -> do
+            (_, struct) <- getIdent (StructIdent tyIdent)
+            case struct of
+                Just (_, IsStruct _ fields) -> return fields
+                _ -> badSource expr "member access of incomplete type"
         _ -> badSource expr "member access of non-struct"
     let field = identToString ident
     ty <- case lookup field fields of
@@ -2001,7 +2152,14 @@ pointer.
 interpretExpr _ expr@(CVar ident _) = do
     (name, sym) <- getIdent (SymbolIdent ident)
     case sym of
+        Just (mut, ty@(IsEnum enum)) -> do
+            return Result
+                { resultType = ty
+                , isMutable = mut
+                , result = Rust.Path (Rust.PathSegments [enum, name])
+                }
         Just (mut, ty) -> do
+            lift $ tell mempty { usesSymbols = Set.singleton name }
             return Result
                 { resultType = ty
                 , isMutable = mut
@@ -2013,9 +2171,6 @@ interpretExpr _ expr@(CVar ident _) = do
 C literals (integer, floating-point, character, and string) translate to
 similar tokens in Rust.
 
-> **TODO**: If the integer literal was written in hex or octal, emit a
-> hex or octal literal in the generated Rust.
-
 > **TODO**: Figure out what to do about floating-point hex literals,
 > which as far as I can tell Rust doesn't support (yet?).
 
@@ -2023,12 +2178,41 @@ similar tokens in Rust.
 
 ```haskell
 interpretExpr _ expr@(CConst c) = case c of
-    CIntConst (CInteger v _repr flags) _ ->
-        let s = if testFlag FlagUnsigned flags then Unsigned else Signed
-            w = if testFlag FlagLongLong flags || testFlag FlagLong flags
-                then WordWidth
-                else BitWidth 32
-        in return (literalNumber (IsInt s w) (show v))
+```
+
+In C, the type of an integer literal depends on which types its value
+will fit in, constrained by its suffixes (`U` or `L`) and whether its
+representation is decimal or another base. See C99 6.4.4.1 paragraph 5
+and its subsequent table.
+
+For the purposes of deciding whether a literal will fit within the
+bounds of a type, we choose to pretend that `long` is 32 bits, but the
+Rust type we give it is `isize`. If a constant does not fit in 32 bits,
+we always give it type `i64`.
+
+```haskell
+    CIntConst (CInteger v repr flags) _ ->
+        let allow_signed = not (testFlag FlagUnsigned flags)
+            allow_unsigned = not allow_signed || repr /= DecRepr
+            widths =
+                [ (32 :: Int,
+                    if any (`testFlag` flags) [FlagLongLong, FlagLong]
+                    then WordWidth else BitWidth 32)
+                , (64, BitWidth 64)
+                ]
+            allowed_types =
+                [ IsInt s w
+                | (bits, w) <- widths
+                , (True, s) <- [(allow_signed, Signed), (allow_unsigned, Unsigned)]
+                , v < 2 ^ (bits - if s == Signed then 1 else 0)
+                ]
+            str = case repr of
+                DecRepr -> show v
+                OctalRepr -> "0o" ++ showOct v ""
+                HexRepr -> "0x" ++ showHex v ""
+        in case allowed_types of
+        [] -> badSource expr "integer (too big)"
+        ty : _ -> return (literalNumber ty str)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
         (v, "") -> return (literalNumber (IsFloat 64) v)
         (v, [_]) -> return (literalNumber (IsFloat 32) v)
@@ -2174,8 +2358,8 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         (IsPtr _ _, IsPtr _ _) -> unimplemented expr
         (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
         _ -> promote expr Rust.Sub lhs rhs
-    CShlOp -> promote expr Rust.ShiftL lhs rhs
-    CShrOp -> promote expr Rust.ShiftR lhs rhs
+    CShlOp -> shift Rust.ShiftL
+    CShrOp -> shift Rust.ShiftR
     CLeOp -> comparison Rust.CmpLT
     CGrOp -> comparison Rust.CmpGT
     CLeqOp -> comparison Rust.CmpLE
@@ -2188,11 +2372,17 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     CLndOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
     CLorOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
     where
-    comparison op' = case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> return (promotePtr op' lhs rhs)
-        _ -> do
-            res <- promote expr op' lhs rhs
-            return res { resultType = IsBool }
+    shift op' = return Result
+        { resultType = lhsTy
+        , isMutable = Rust.Immutable
+        , result = op' (castTo lhsTy lhs) (castTo rhsTy rhs)
+        }
+        where
+        lhsTy = intPromote (resultType lhs)
+        rhsTy = intPromote (resultType rhs)
+    comparison op' = do
+        res <- promotePtr expr op' lhs rhs
+        return res { resultType = IsBool }
 
 isSimple :: Rust.Expr -> Bool
 isSimple (Rust.Var{}) = True
@@ -2326,12 +2516,14 @@ particular compiler, and the C standard allows us to define `int` to be
 whatever size we like. That said, this assumption may break non-portable
 C programs.
 
-Conveniently, Rust allows `bool` expressions to be cast to any integer
-type, and it converts `true` to 1 and `false` to 0 just like C requires,
-so we don't need any special magic to handle booleans here.
+Conveniently, Rust allows `bool` and `enum` typed expressions to be cast
+to any integer type, and it converts `true` to 1 and `false` to 0 just
+like C requires, so we don't need any special magic to handle booleans
+or enumerated types here.
 
 ```haskell
 intPromote IsBool = IsInt Signed (BitWidth 32)
+intPromote (IsEnum _) = enumReprType
 intPromote (IsInt _ (BitWidth w)) | w < 32 = IsInt Signed (BitWidth 32)
 ```
 
@@ -2346,20 +2538,124 @@ C also defines a set of rules called the "usual arithmetic conversions"
 (C99 section 6.3.1.8) to determine what type binary operators should be
 evaluated at.
 
-> **XXX**: I'm not sure this correctly implements the standard. It
-> should get checked.
-
 ```haskell
 usual :: CType -> CType -> Maybe CType
 usual (IsFloat aw) (IsFloat bw) = Just (IsFloat (max aw bw))
 usual a@(IsFloat _) _ = Just a
 usual _ b@(IsFloat _) = Just b
-usual a@(intPromote -> IsInt as aw) b@(intPromote -> IsInt bs bw)
-    | a == b = Just a
-    | as == bs = Just (IsInt as (max aw bw))
-    | as == Unsigned = Just (if aw >= bw then a else b)
-    | otherwise      = Just (if bw >= aw then b else a)
-usual _ _ = Nothing
+```
+
+"Otherwise, the integer promotions are performed on both operands."
+
+```haskell
+usual origA origB = case (intPromote origA, intPromote origB) of
+```
+
+"Then the following rules are applied to the promoted operands:"
+
+Note that we refuse to translate this expression if either promoted type
+is not an integer type, or if the integer conversion ranks are
+incomparable according to `integerConversionRank`. The latter is not due
+to anything in the C standard, which describes a total order for integer
+conversion ranks. Rather, we refuse to translate these programs due to
+non-portable code complicating the translation.
+
+- "If both operands have the same type, then no further conversion is
+  needed."
+
+    ```haskell
+        (a, b) | a == b -> Just a
+    ```
+
+- "Otherwise, if both operands have signed integer types or both have
+  unsigned integer types, the operand with the type of lesser integer
+  conversion rank is converted to the type of the operand with greater
+  rank."
+
+    ```haskell
+        (IsInt Signed sw, IsInt Unsigned uw) -> mixedSign sw uw
+        (IsInt Unsigned uw, IsInt Signed sw) -> mixedSign sw uw
+        (IsInt as aw, IsInt _bs bw) -> do
+            rank <- integerConversionRank aw bw
+            Just (IsInt as (if rank == GT then aw else bw))
+        _ -> Nothing
+        where
+    ```
+
+At this point we have one signed and one unsigned operand. The usual
+arithmetic conversions don't care which order the operands are in, so
+`mixedSign` is a helper function where the signed width is always the
+first argument and the unsigned width is always the second.
+
+- "Otherwise, if the operand that has unsigned integer type has rank
+  greater or equal to the rank of the type of the other operand, then
+  the operand with signed integer type is converted to the type of the
+  operand with unsigned integer type."
+
+    ```haskell
+        mixedSign sw uw = do
+            rank <- integerConversionRank uw sw
+            Just $ case rank of
+                GT -> IsInt Unsigned uw
+                EQ -> IsInt Unsigned uw
+    ```
+
+- "Otherwise, if the type of the operand with signed integer type can
+  represent all of the values of the type of the operand with unsigned
+  integer type, then the operand with unsigned integer type is converted
+  to the type of the operand with signed integer type."
+
+    A signed type can represent all the values of an unsigned type if
+    the unsigned type's bit-width is strictly smaller than the signed
+    type's bit-width.
+
+    For our purposes, `long` can only represent the values of `unsigned`
+    types smaller than `int` (because `long` and `int` might be the same
+    size). But `unsigned long` values can only be represented by signed
+    types bigger than 64 bits (because `long` might be 64 bits instead).
+
+    ```haskell
+                _ | bitWidth 64 uw < bitWidth 32 sw -> IsInt Signed sw
+    ```
+
+- "Otherwise, both operands are converted to the unsigned integer type
+  corresponding to the type of the operand with signed integer type."
+
+    Given the above definitions, this only happens for `unsigned long`
+    and `int64_t`, where we want to choose `uint64_t`.
+
+    ```haskell
+                _ -> IsInt Unsigned sw
+    ```
+
+The usual arithmetic conversions refer to a definition called "integer
+conversion rank" from C99 6.3.1.1. We want these widths to have strictly
+increasing integer conversion rank:
+
+- `BitWidth 32` (our representation of `int`)
+- `WordWidth` (our representation of `long`)
+- `BitWidth 64`
+
+The first two come from C99 6.3.1.1 which says `long` has a higher rank
+than `int`. We add the last as an implementation choice. Since `isize`
+could be either `i32` or `i64`, when combining `isize` with another type
+we'll bump up to whichever type is definitely bigger.
+
+We disallow comparing bit-widths between 32 and 64 bits, exclusive,
+against word-size. Since word-size is platform-dependent, we can't be
+sure which is larger.
+
+```haskell
+integerConversionRank :: IntWidth -> IntWidth -> Maybe Ordering
+integerConversionRank (BitWidth a) (BitWidth b) = Just (compare a b)
+integerConversionRank WordWidth WordWidth = Just EQ
+integerConversionRank (BitWidth a) WordWidth
+    | a <= 32 = Just LT
+    | a >= 64 = Just GT
+integerConversionRank WordWidth (BitWidth b)
+    | b <= 32 = Just GT
+    | b >= 64 = Just LT
+integerConversionRank _ _ = Nothing
 ```
 
 Here's a helper function to apply the usual arithmetic conversions to
@@ -2411,20 +2707,32 @@ architectures.
 compatiblePtr _ _ = IsVoid
 ```
 
-Finally, `promotePtr` is like `promote` but for pointer types instead of
-arithmetic types. This function is only used for boolean-valued
-operators such as `==` or `<`, so it's specialized to mark the result
-type as boolean for convenience.
+Finally, `promotePtr` is like `promote` but for operators that allow
+pointers as operands, not just arithmetic types. Since integer literals
+may be implicitly used as pointers, if either operand is a pointer, we
+pretend the other one is a void pointer and let `compatiblePtr` figure
+out what type it should really be converted to.
 
 ```haskell
-promotePtr :: (Rust.Expr -> Rust.Expr -> Rust.Expr) -> Result -> Result -> Result
-promotePtr op a b = Result
-    { resultType = IsBool
-    , isMutable = Rust.Immutable
-    , result =
-        let ty = compatiblePtr (resultType a) (resultType b)
-        in op (castTo ty a) (castTo ty b)
-    }
+promotePtr
+    :: (Pretty node, Pos node)
+    => node
+    -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
+    -> Result -> Result -> EnvMonad Result
+promotePtr node op a b = case (resultType a, resultType b) of
+    (IsPtr _ _, _) -> ptrs
+    (_, IsPtr _ _) -> ptrs
+    _ -> promote node op a b
+    where
+    ptrOrVoid r = case resultType r of
+        t@(IsPtr _ _) -> t
+        _ -> IsPtr Rust.Mutable IsVoid
+    ty = compatiblePtr (ptrOrVoid a) (ptrOrVoid b)
+    ptrs = return Result
+        { resultType = ty
+        , isMutable = Rust.Immutable
+        , result = op (castTo ty a) (castTo ty b)
+        }
 ```
 
 
@@ -2438,8 +2746,22 @@ data Signed = Signed | Unsigned
     deriving (Show, Eq)
 
 data IntWidth = BitWidth Int | WordWidth
-    deriving (Show, Eq, Ord)
+    deriving (Show, Eq)
+```
 
+Sometimes we want to treat `WordWidth` as being equivalent to a
+particular number of bits, but the choice depends on whether we want it
+to be its smallest width or its largest. (We choose to define the
+machine's word size as always either 32 or 64, because those are the
+only sizes Rust currently targets.)
+
+```haskell
+bitWidth :: Int -> IntWidth -> Int
+bitWidth wordWidth WordWidth = wordWidth
+bitWidth _ (BitWidth w) = w
+```
+
+```haskell
 data CType
     = IsBool
     | IsInt Signed IntWidth
@@ -2448,13 +2770,55 @@ data CType
     | IsFunc CType [(Maybe (Rust.Mutable, Ident), CType)] Bool
     | IsPtr Rust.Mutable CType
     | IsStruct String [(String, CType)]
-    deriving (Show, Eq)
+    | IsEnum String
+    | IsIncomplete Ident
+    deriving Show
+```
 
+Deriving a default implementation of the `Eq` typeclass for equality
+almost works, except for our representation of function types, where
+argument names and `const`-ness may differ without the types being
+different.
+
+```haskell
+instance Eq CType where
+    IsBool == IsBool = True
+    IsInt as aw == IsInt bs bw = as == bs && aw == bw
+    IsFloat aw == IsFloat bw = aw == bw
+    IsVoid == IsVoid = True
+    IsFunc aRetTy aFormals aVariadic == IsFunc bRetTy bFormals bVariadic =
+        aRetTy == bRetTy && aVariadic == bVariadic &&
+        map snd aFormals == map snd bFormals
+    IsPtr aMut aTy == IsPtr bMut bTy = aMut == bMut && aTy == bTy
+    IsStruct aName aFields == IsStruct bName bFields =
+        aName == bName && aFields == bFields
+    IsEnum aName == IsEnum bName = aName == bName
+    IsIncomplete aName == IsIncomplete bName = aName == bName
+    _ == _ = False
+```
+
+To track which type declarations are actually used, at various points we
+need to find out which type names are referenced in some `CType`.
+`declaredNames` computes that set with a recursive walk down the type.
+
+```haskell
+declaredNames :: CType -> Set.Set String
+declaredNames (IsFunc retTy args _) =
+    Set.unions (map declaredNames (retTy : map snd args))
+declaredNames (IsPtr _ ty) = declaredNames ty
+declaredNames (IsStruct name fields) = Set.insert name
+    (Set.unions (map (declaredNames . snd) fields))
+declaredNames (IsEnum name) = Set.singleton name
+declaredNames (IsIncomplete ident) = Set.singleton (identToString ident)
+declaredNames _ = Set.empty
+```
+
+```haskell
 toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
-toRustType IsVoid = Rust.TypeName "()"
+toRustType IsVoid = Rust.TypeName "std::os::raw::c_void"
 toRustType (IsFunc retTy args variadic) = Rust.TypeName $ concat
     [ "unsafe extern fn("
     , args'
@@ -2471,6 +2835,17 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
 toRustType (IsStruct name _fields) = Rust.TypeName name
+toRustType (IsEnum name) = Rust.TypeName name
+toRustType (IsIncomplete ident) = Rust.TypeName (identToString ident)
+```
+
+Functions that don't return anything have a return type in Rust that is
+different than the representation of C's `void` type elsewhere.
+
+```haskell
+toRustRetType :: CType -> Rust.Type
+toRustRetType IsVoid = Rust.TypeName "()"
+toRustRetType ty = toRustType ty
 ```
 
 C leaves it up to the implementation to decide whether the base `char`
@@ -2480,7 +2855,18 @@ of Rust's byte literals.
 ```haskell
 charType :: CType
 charType = IsInt Unsigned (BitWidth 8)
+```
 
+C permits implementations to represent enum values using integer types
+narrower than `int`, but for the moment we choose not to. This may be
+incompatible with some ABIs.
+
+```haskell
+enumReprType :: CType
+enumReprType = IsInt Signed (BitWidth 32)
+```
+
+```haskell
 baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType))
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
@@ -2504,11 +2890,11 @@ baseTypeOf specs = do
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        (name, mty) <- getIdent (StructIdent ident)
-        return $ (,) mut $ case mty of
-            Just (_, ty) -> ty
-            -- FIXME: treating incomplete types as having no fields, but that's probably wrong
-            Nothing -> IsStruct name []
+        (_name, mty) <- getIdent (StructIdent ident)
+        ty <- case mty of
+            Just (_, ty) -> return ty
+            Nothing -> emitIncomplete ident
+        return (mut, ty)
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
             (storage, base) <- baseTypeOf spec
@@ -2530,10 +2916,45 @@ baseTypeOf specs = do
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
         return (mut, IsStruct name fields)
+    go (CSUType (CStruct CUnionTag mident _ _ _) node) (mut, _) = do
+        ident <- case mident of
+            Just ident -> return ident
+            Nothing -> do
+                name <- uniqueName "Union"
+                return (internalIdentAt (posOfNode node) name)
+        ty <- emitIncomplete ident
+        return (mut, ty)
+    go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
+        (_, mty) <- getIdent (EnumIdent ident)
+        case mty of
+            Just (_, ty) -> return (mut, ty)
+            Nothing -> badSource spec "undefined enum"
+    go (CEnumType (CEnum mident (Just items) _ _) _) (mut, _) = do
+        let Rust.TypeName repr = toRustType enumReprType
+        name <- case mident of
+            Just ident -> do
+                 let name = identToString ident
+                 addIdent (EnumIdent ident) (Rust.Immutable, IsEnum name)
+            Nothing -> uniqueName "Enum"
+        enums <- forM items $ \ (ident, mexpr) -> do
+            enumName <- addIdent (SymbolIdent ident) (Rust.Immutable, IsEnum name)
+            case mexpr of
+                Nothing -> return (Rust.EnumeratorAuto enumName)
+                Just expr -> do
+                    expr' <- interpretExpr True expr
+                    return (Rust.EnumeratorExpr enumName (castTo enumReprType expr'))
+        let attrs = [ Rust.Attribute "derive(Clone, Copy)"
+                    , Rust.Attribute (concat [ "repr(", repr, ")" ])
+                    ]
+        emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
+        return (mut, IsEnum name)
     go spec@(CTypeDef ident _) (mut1, _) = do
-        (_, mty) <- getIdent (TypedefIdent ident)
+        (name, mty) <- getIdent (TypedefIdent ident)
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
+            Nothing | name == "__builtin_va_list" -> do
+                ty <- emitIncomplete ident
+                return (mut1, IsPtr Rust.Mutable ty)
             Nothing -> badSource spec "undefined type"
     go spec _ = unimplemented spec
 
@@ -2602,12 +3023,13 @@ typeName decl@(CDecl spec declarators _) = do
     case storage of
         Just s -> badSource s "storage class specifier in type name"
         Nothing -> return ()
-    -- Declaration mutability has no effect in type names.
-    case declarators of
+    (mut, ty) <- case declarators of
         [] -> return base
         [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] -> do
             (mut, isFunc, ty) <- derivedTypeOf base declr
             when isFunc (badSource decl "use of function type")
             return (mut, ty)
         _ -> badSource decl "type name"
+    useType ty
+    return (mut, ty)
 ```
