@@ -678,22 +678,6 @@ Return the bindings produced for any declarator that did not return
 Initialization
 ==============
 
-The simplest type of initialization in C is zero-initialization. It
-initializes in a way that the underlying memory of the target is just
-zeroed out.
-
-```haskell
-zeroInitializer :: CType -> Initializer
-zeroInitializer IsBool{} = scalar (Rust.Lit (Rust.LitRep "false"))
-zeroInitializer IsVoid{} = scalar (Rust.Lit (Rust.LitRep "()"))
-zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
-zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
-zeroInitializer t@IsPtr{} = scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t))
-zeroInitializer t@IsFunc{} = scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t))
-zeroInitializer (IsStruct _ fields) = Initializer Nothing
-    (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
-```
-
 The general form of initialization, described in C99 section 6.7.8, involves
 an initializer construct. The interface we want to expose for translating
 C initializers is fairly simple: given the type of the thing we are trying
@@ -985,12 +969,33 @@ interpretInitializer ty initial = do
                 else badSource initial "initializer for incompatible type"
         CInitList list _ -> translateInitList ty list
 
-    case helper ty (zeroInitializer ty `mappend` initial') of
+    zeroed <- zeroInitializer ty
+    case helper ty (zeroed `mappend` initial') of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
 
     where
+```
 
+The simplest type of initialization in C is zero-initialization. It
+initializes in a way that the underlying memory of the target is just
+zeroed out.
+
+```haskell
+    zeroInitializer IsBool{} = return $ scalar (Rust.Lit (Rust.LitRep "false"))
+    zeroInitializer IsVoid{} = badSource initial "initializer for void"
+    zeroInitializer t@IsInt{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+        where Rust.TypeName s = toRustType t
+    zeroInitializer t@IsFloat{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+        where Rust.TypeName s = toRustType t
+    zeroInitializer t@IsPtr{} = return $ scalar (Rust.Cast 0 (toRustType t))
+    zeroInitializer t@IsFunc{} = return $ scalar (Rust.Cast 0 (toRustType t))
+    zeroInitializer (IsStruct _ fields) = do
+        fields' <- mapM (zeroInitializer . snd) fields
+        return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
+```
+
+```haskell
     helper :: CType -> Initializer -> Maybe Rust.Expr
     helper _ (Initializer (Just expr) initials) | IntMap.null initials = Just expr
     helper (IsStruct str fields) (Initializer expr initials) =
