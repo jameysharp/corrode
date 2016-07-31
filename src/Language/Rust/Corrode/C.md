@@ -695,7 +695,7 @@ zeroInitializer t@IsFunc{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toR
 zeroInitializer (IsStruct _ fields) = Aggregate (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
 ```
 
-The general form of initialization, described in section 6.7.8, involves
+The general form of initialization, described in C99 section 6.7.8, involves
 an initializer construct. The interface we want to expose for translating
 C initializers is fairly simple: given the type of the thing we are trying
 to initialize and the C initializer, produce a Rust expression that
@@ -705,7 +705,7 @@ corresponds to the C expression that would have been initialized:
 interpretInitializer :: CType -> CInit -> EnvMonad Rust.Expr
 ```
 
-Unfortunately, we have to delay the actually implementation of this
+Unfortunately, we have to delay the actual implementation of this
 function until the end of this section when we will have all the necessary
 pieces.
 
@@ -728,7 +728,7 @@ struct Foo s = { (struct Bar) { 1, 2 }, 3 }
 
 We need some canonical form for manipulating and composing initializer
 expressions. Then, we can deal with C initialization expressions in
-several steps: start be converting them to a canonical form, compose them
+several steps: start by converting them to a canonical form, compose them
 together accordingly, and finally convert them to Rust expressions.
 
 ```haskell
@@ -759,7 +759,7 @@ instance Monoid Initializer where
         mempty = Aggregate IntMap.empty
     ```
 
-- When combining two intializers, the one on the right overrides/shadows
+- When combining two initializers, the one on the right overrides/shadows
   definitions made by the one on the left.
 
     ```haskell
@@ -771,13 +771,13 @@ instance Monoid Initializer where
 Now, we need to concern ourselves with constructing these initializers in
 the first place. We will need to keep track of the current object (see
 point 17 of section 6.7.8). A `Designator` describes a position inside a
-type. 
+type.
 
 ```haskell
 type CurrentObject = Maybe Designator
 
 data Designator
-  = Base CType 
+  = Base CType
 ```
 * encodes the type of the base object pointed to
 
@@ -804,13 +804,13 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
             (_, []) -> badSource d ("designator for field not in struct " ++ name)
             (earlier, (_, ty') : rest) ->
                 go ty' ds (From ty' (length earlier) (map snd rest) obj)
-    go ty' (d : _) _ = badSource d ("designator for " ++ show ty') 
+    go ty' (d : _) _ = badSource d ("designator for " ++ show ty')
 ```
 
 However, since it is possible for some entries in an initializer to have
 no designators (in which case the initializer implicitly applies to the
 next object), we need a way to calculate the most general next object from
-the current one (provided we haven't reach the end of the thing we are
+the current one (provided we haven't reached the end of the thing we are
 initializing).
 
 ```haskell
@@ -822,7 +822,7 @@ nextObject (From _ _ [] base) = nextObject base
 
 We've used the expression "the most general (object)" several times. This
 is because designators alone aren't actually enough to determine exactly
-what gets initialized &mdash; we also need the type of the thing
+what gets initialized&mdash;we also need the type of the thing
 initialized. For example, if a designator points to a struct, the
 initializer that follows might be for the first field of the struct (and
 not the struct itself).
@@ -857,7 +857,7 @@ translateInitializer ty i@(CInitExpr expr _) = do
     expr' <- interpretExpr True expr
     if  resultType expr' `compatible` ty
         then pure $ Scalar (castTo ty expr') IntMap.empty
-        else badSource i "intializer"
+        else badSource i "initializer"
 
     where
 
@@ -872,16 +872,16 @@ For the case where we have a list of expressions, things get a little
 hairier. We start by parsing all of the designators into our format.
 
 ```haskell
-translateInitializer ty i@(CInitList list _) = do 
+translateInitializer ty i@(CInitList list _) = do
 
     objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
         currObj <- objectFromDesignators ty desigs
-        pure (currObj, initial)   
-    
+        pure (currObj, initial)
+
     let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
 ```
 
-Next, we have to chose the starting current object (`base`). For aggregate
+Next, we have to choose the starting current object (`base`). For aggregate
 types, the first current object points to their first field but for scalar
 types it points to the primitive itself. For example
 
@@ -926,8 +926,8 @@ together using `mconcat`.
 ```
 
 Resolution takes a current object to use if no designator is specified. It
-returns the new current objects for the next element to use, and the above
-Initializer type representing the part of the object that this element
+returns the new current object for the next element to use, and the above
+`Initializer` type representing the part of the object that this element
 initialized.
 
 ```haskell
@@ -937,8 +937,8 @@ initialized.
         Just obj -> do
 ```
 
-If the intializer provided is another initializer list, then the
-intializer has to be for the current object. If it is just an intializer
+If the initializer provided is another initializer list, then the
+initializer has to be for the current object. If it is just an initializer
 expression, however, we need to explore all the different possibilities
 for the actual current object (which we do with the list monad). This
 turns out to be efficient since only one of these intializers will be
@@ -949,13 +949,13 @@ in the recursive call.
             obj' <- case cinitial of
                 CInitList{} -> [obj]
                 CInitExpr{} -> possibleCasts obj
-            
+
             let initial = translateInitializer (case obj' of { Base t -> t; From t _ _ _ -> t }) cinitial
                 indices = unfoldr (\o -> case o of
                                      Base{} -> Nothing
                                      From _ j _ p -> Just (j,p)) obj'
                 initializer = foldl (\a j -> Aggregate <$> IntMap.singleton j <$> a) initial indices
-            
+
             pure (nextObject obj', initializer)
 ```
 
