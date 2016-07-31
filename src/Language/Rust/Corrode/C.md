@@ -716,7 +716,8 @@ environment.
 > always possible, so this requires careful thought.
 
 ```haskell
-            (Just (CTypedef _), False, _) -> do
+            (Just (CTypedef _), _, _) -> do
+                when isFunc (unimplemented decl)
                 when (isJust minit) (badSource decl "initializer on typedef")
                 _ <- addIdent (TypedefIdent ident) (mut, ty)
                 return Nothing
