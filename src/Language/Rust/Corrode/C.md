@@ -684,13 +684,14 @@ zeroed out.
 
 ```haskell
 zeroInitializer :: CType -> Initializer
-zeroInitializer IsBool{} = Scalar (Rust.Lit (Rust.LitRep "false")) IntMap.empty
-zeroInitializer IsVoid{} = Scalar (Rust.Lit (Rust.LitRep "()")) IntMap.empty
-zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in Scalar (Rust.Lit (Rust.LitRep ("0" ++ s))) IntMap.empty
-zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in Scalar (Rust.Lit (Rust.LitRep ("0" ++ s))) IntMap.empty
-zeroInitializer t@IsPtr{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
-zeroInitializer t@IsFunc{} = Scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t)) IntMap.empty
-zeroInitializer (IsStruct _ fields) = Aggregate (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
+zeroInitializer IsBool{} = scalar (Rust.Lit (Rust.LitRep "false"))
+zeroInitializer IsVoid{} = scalar (Rust.Lit (Rust.LitRep "()"))
+zeroInitializer t@IsInt{} = let Rust.TypeName s = toRustType t in scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+zeroInitializer t@IsFloat{} = let Rust.TypeName s = toRustType t in scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+zeroInitializer t@IsPtr{} = scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t))
+zeroInitializer t@IsFunc{} = scalar (Rust.Cast (Rust.Lit (Rust.LitRep "0")) (toRustType t))
+zeroInitializer (IsStruct _ fields) = Initializer Nothing
+    (IntMap.fromList $ zip [0..] [ zeroInitializer ty | (_,ty) <- fields ])
 ```
 
 The general form of initialization, described in C99 section 6.7.8, involves
@@ -729,18 +730,21 @@ expressions. Then, we can deal with C initialization expressions in
 several steps: start by converting them to a canonical form, compose them
 together accordingly, and finally convert them to Rust expressions.
 
-```haskell
-data Initializer
-    = Scalar Rust.Expr (IntMap.IntMap Initializer)
-```
-* either a scalar expression or a compound expression with certain
-  fields' initialization overriden.
+Our canonical form may have a base expression, which (if we're
+initializing an aggregate) may have some of its fields overridden. If a
+base expression is present, it overrides all previous initializers for
+this object. Otherwise, all fields not specified in the `IntMap` will
+get initialized to their zero-equivalent values.
 
 ```haskell
-    | Aggregate (IntMap.IntMap Initializer)
+data Initializer
+    = Initializer (Maybe Rust.Expr) (IntMap.IntMap Initializer)
 ```
-* compound expression with only the corresponding fields initialized
-  (remaining fields will be zero-initialized)
+
+```haskell
+scalar :: Rust.Expr -> Initializer
+scalar expr = Initializer (Just expr) IntMap.empty
+```
 
 Notice that combining initializers is an associative binary operation.
 This motivates us to use the `Monoid` typeclass again to represent the
@@ -754,16 +758,16 @@ instance Monoid Initializer where
   the left or the right), the result is just the other initializer.
 
     ```haskell
-        mempty = Aggregate IntMap.empty
+        mempty = Initializer Nothing IntMap.empty
     ```
 
 - When combining two initializers, the one on the right overrides/shadows
   definitions made by the one on the left.
 
     ```haskell
-        mappend _ b@(Scalar{}) = b
-        mappend (Aggregate a) (Aggregate b) = Aggregate (IntMap.unionWith mappend a b)
-        mappend (Scalar s a) (Aggregate b) = Scalar s (IntMap.unionWith mappend a b)
+        mappend _ b@(Initializer (Just _) _) = b
+        mappend (Initializer m a) (Initializer Nothing b) =
+            Initializer m (IntMap.unionWith mappend a b)
     ```
 
 Now, we need to concern ourselves with constructing these initializers in
@@ -946,7 +950,7 @@ using `nestedObject`.
                     Nothing -> badSource cinitial "type in initializer"
                     Just obj' -> do
                         let s = castTo (designatorType obj') expr'
-                        return (obj', Scalar s IntMap.empty)
+                        return (obj', scalar s)
 ```
 
 Now that we've settled on the right current object and constructed an
@@ -957,7 +961,7 @@ minimal aggregate initializer for each designator in the former.
         let indices = unfoldr (\o -> case o of
                                  Base{} -> Nothing
                                  From _ j _ p -> Just (j,p)) obj'
-        let initializer = foldl (\a j -> Aggregate (IntMap.singleton j a)) initial indices
+        let initializer = foldl (\a j -> Initializer Nothing (IntMap.singleton j a)) initial indices
 
         return (nextObject obj', prior `mappend` initializer)
 ```
@@ -977,7 +981,7 @@ interpretInitializer ty initial = do
         CInitExpr expr _ -> do
             expr' <- interpretExpr True expr
             if resultType expr' `compatibleInitializer` ty
-                then pure $ Scalar (castTo ty expr') IntMap.empty
+                then pure $ scalar (castTo ty expr')
                 else badSource initial "initializer for incompatible type"
         CInitList list _ -> translateInitList ty list
 
@@ -988,14 +992,10 @@ interpretInitializer ty initial = do
     where
 
     helper :: CType -> Initializer -> Maybe Rust.Expr
-    helper _ (Scalar expr initials) | IntMap.null initials = Just expr
-    helper (IsStruct str fields) initializer = Rust.StructExpr str <$> fields' <*> pure expr
+    helper _ (Initializer (Just expr) initials) | IntMap.null initials = Just expr
+    helper (IsStruct str fields) (Initializer expr initials) =
+        Rust.StructExpr str <$> fields' <*> pure expr
         where
-
-        (expr,initials) = case initializer of
-            Scalar e i -> (Just e, i)
-            Aggregate i -> (Nothing, i)
-
         fields' = forM (IntMap.toList initials) $ \ (idx, value) -> do
             (field, ty') <- listToMaybe (drop idx fields)
             value' <- helper ty' value
