@@ -28,7 +28,6 @@ module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
 import Control.Monad.Trans.Class
-import Control.Monad.Trans.State (runStateT, StateT(..))
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
 import Data.Char
@@ -36,7 +35,6 @@ import Data.Foldable
 import Data.Maybe
 import Data.Monoid
 import Data.List
-import Data.Tuple
 import Language.C
 import qualified Language.Rust.AST as Rust
 import qualified Data.IntMap.Strict as IntMap
@@ -788,6 +786,14 @@ data Designator
 * encodes the type of the object pointed to, its index in the parent,
   remaining fields in the parent, and the parent designator
 
+In several places, we need to know the type of a designated object.
+
+```haskell
+designatorType :: Designator -> CType
+designatorType (Base ty) = ty
+designatorType (From ty _ _ _) = ty
+```
+
 Then, given a list of designators and the type we are currently in, we can
 compute the most general possible current object.
 
@@ -820,65 +826,56 @@ nextObject (From _ i (ty : remaining) base) = Just (From ty (i+1) remaining base
 nextObject (From _ _ [] base) = nextObject base
 ```
 
-We've used the expression "the most general (object)" several times. This
-is because designators alone aren't actually enough to determine exactly
-what gets initialized&mdash;we also need the type of the thing
-initialized. For example, if a designator points to a struct, the
-initializer that follows might be for the first field of the struct (and
-not the struct itself).
+The type of an initializer expression is compatible with the type of the
+object it's initializing if either:
 
-We need a function that takes a most general designator and returns all
-the possible more specific designators (from most general to most
-specific).
+- Both have structure type and they're the same `struct`,
+- Or neither have structure type.
+
+In the latter case we don't check what type they are, because we can
+cast any scalar type to any other as needed.
 
 ```haskell
-possibleCasts :: Designator -> [Designator]
-possibleCasts b@(Base (IsStruct _ ((_,ty'):fields))) =
-    let c = (From ty' 0 (map snd fields) b) in b : possibleCasts c
-possibleCasts f@(From (IsStruct _ ((_,ty'):fields)) _ _ _) =
-    let c = (From ty' 0 (map snd fields) f) in f : possibleCasts c
-possibleCasts d = [d]
+compatibleInitializer :: CType -> CType -> Bool
+compatibleInitializer (IsStruct name1 _) (IsStruct name2 _) = name1 == name2
+compatibleInitializer IsStruct{} _ = False
+compatibleInitializer _ IsStruct{} = False
+compatibleInitializer _ _ = True
+```
+
+We've used the expression "the most general (object)" several times.
+This is because designators alone aren't actually enough to determine
+exactly what gets initialized&mdash;we also need to compare types.
+
+An initializer expression initializes the current object, if the two
+have compatible types. Otherwise, we extend the designator to refer to
+the first sub-object of the current object and check whether _that_
+object is compatible with the initializer. We keep descending through
+first sub-objects until we run out of sub-objects without finding any
+compatible objects.
+
+```haskell
+nestedObject :: CType -> Designator -> Maybe Designator
+nestedObject ty desig = case designatorType desig of
+    ty' | ty `compatibleInitializer` ty' -> Just desig
+    IsStruct _ ((_ , ty') : fields) ->
+        nestedObject ty (From ty' 0 (map snd fields) desig)
+    _ -> Nothing
 ```
 
 Given these helpers, we are now in a position to translate C initializers
 to our initializers.
 
-```haskell
-translateInitializer :: CType -> CInit -> EnvMonad Initializer
-```
-
-For the case when the initializer is just an expression, we just evaluate
-the expression and make a `Scalar` out of it. Note that C doesn't check
-that the type of the initializer is the same as the type of the expression
-as long as neither is a compound type.
+When we have a list of expressions, we start by parsing all of the
+designators into our internal representation.
 
 ```haskell
-translateInitializer ty i@(CInitExpr expr _) = do
-    expr' <- interpretExpr True expr
-    if  resultType expr' `compatible` ty
-        then pure $ Scalar (castTo ty expr') IntMap.empty
-        else badSource i "initializer"
-
-    where
-
-    compatible :: CType -> CType -> Bool
-    compatible (IsStruct name1 _) (IsStruct name2 _) = name1 == name2
-    compatible IsStruct{} _ = False
-    compatible _ IsStruct{} = False
-    compatible _ _ = True
-```
-
-For the case where we have a list of expressions, things get a little
-hairier. We start by parsing all of the designators into our format.
-
-```haskell
-translateInitializer ty i@(CInitList list _) = do
+translateInitList :: CType -> CInitList -> EnvMonad Initializer
+translateInitList ty list = do
 
     objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
         currObj <- objectFromDesignators ty desigs
         pure (currObj, initial)
-
-    let defaultError = (\x -> [x]) `withExceptT` badSource i "no possible ways to parse initializer"
 ```
 
 Next, we have to choose the starting current object (`base`). For aggregate
@@ -898,7 +895,7 @@ it is the fields of `p` that get initialized to `1` and `3` since `p` is a
 struct.
 
 ```haskell
-        base = case ty of
+    let base = case ty of
                     IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
                     _ -> Base ty
 ```
@@ -908,21 +905,13 @@ walk through the list of designators and their initializers from left to
 right passing along the current object as we go (in case the initializer
 that follows has no designator).
 
-The whole initializer is the result of combining all the initializers
-together using `mconcat`.
+When we get to the end, we throw away the final current object as
+initializer lists never affect the current object of their enclosing
+initializer.
 
 ```haskell
-        initializer = msum $ do
-            (_, initializers) <- mapAccumLM resolveCurrentObject (Just base) objectsAndInitializers
-            let initializerPossibility = mconcat <$> sequence initializers
-            pure ((\x -> [x]) `withExceptT` initializerPossibility)
-
-    head `withExceptT` (defaultError `mplus` initializer)
-
-    where
-
-    mapAccumLM :: (Monad m, Traversable t) => (a -> b -> m (a, c)) -> a -> t b -> m (a, t c)
-    mapAccumLM f s t = swap <$> runStateT (traverse (StateT . (\x y -> swap <$> f y x)) t) s
+    (_, initializer) <- foldM resolveCurrentObject (Just base, mempty) objectsAndInitializers
+    return initializer
 ```
 
 Resolution takes a current object to use if no designator is specified. It
@@ -931,40 +920,67 @@ returns the new current object for the next element to use, and the above
 initialized.
 
 ```haskell
-    resolveCurrentObject :: CurrentObject -> (CurrentObject, CInit) -> [(CurrentObject, EnvMonad Initializer)]
-    resolveCurrentObject obj0 (obj1, cinitial) = case obj1 `mplus` obj0 of
-        Nothing -> [(Nothing, pure mempty)]
-        Just obj -> do
+resolveCurrentObject
+    :: (CurrentObject, Initializer)
+    -> (CurrentObject, CInit)
+    -> EnvMonad (CurrentObject, Initializer)
+resolveCurrentObject (obj0, prior) (obj1, cinitial) = case obj1 `mplus` obj0 of
+    Nothing -> return (Nothing, prior)
+    Just obj -> do
 ```
 
 If the initializer provided is another initializer list, then the
-initializer has to be for the current object. If it is just an initializer
-expression, however, we need to explore all the different possibilities
-for the actual current object (which we do with the list monad). This
-turns out to be efficient since only one of these intializers will be
-successfully translated and all the others will be weeded out immediately
-in the recursive call.
+initializer has to be for the current object. If it is just an
+initializer expression, however, we translate the expression to find out
+what type it has, and find the corresponding sub-object to initialize
+using `nestedObject`.
 
 ```haskell
-            obj' <- case cinitial of
-                CInitList{} -> [obj]
-                CInitExpr{} -> possibleCasts obj
+        (obj', initial) <- case cinitial of
+            CInitList list' _ -> do
+                initial <- translateInitList (designatorType obj) list'
+                return (obj, initial)
+            CInitExpr expr _ -> do
+                expr' <- interpretExpr True expr
+                case nestedObject (resultType expr') obj of
+                    Nothing -> badSource cinitial "type in initializer"
+                    Just obj' -> do
+                        let s = castTo (designatorType obj') expr'
+                        return (obj', Scalar s IntMap.empty)
+```
 
-            let initial = translateInitializer (case obj' of { Base t -> t; From t _ _ _ -> t }) cinitial
-                indices = unfoldr (\o -> case o of
-                                     Base{} -> Nothing
-                                     From _ j _ p -> Just (j,p)) obj'
-                initializer = foldl (\a j -> Aggregate <$> IntMap.singleton j <$> a) initial indices
+Now that we've settled on the right current object and constructed an
+intermediate `Initializer` for it, we need to wrap the latter in a
+minimal aggregate initializer for each designator in the former.
 
-            pure (nextObject obj', initializer)
+```haskell
+        let indices = unfoldr (\o -> case o of
+                                 Base{} -> Nothing
+                                 From _ j _ p -> Just (j,p)) obj'
+        let initializer = foldl (\a j -> Aggregate (IntMap.singleton j a)) initial indices
+
+        return (nextObject obj', prior `mappend` initializer)
 ```
 
 Finally, we can implement the full `interpretInitializer` function we
 declared near the beginning of this section.
 
+Inside an initializer list, we used `nestedObject` above to search for
+the right sub-object to apply an initializer expression to. But here,
+outside an initializer list, C99 section 6.7.8 paragraph 13 seems to
+disallow anything but immediately compatible types; and GCC, Clang, and
+ICC all reject sub-object typed scalar initializers for structs.
+
 ```haskell
 interpretInitializer ty initial = do
-    initial' <- translateInitializer ty initial
+    initial' <- case initial of
+        CInitExpr expr _ -> do
+            expr' <- interpretExpr True expr
+            if resultType expr' `compatibleInitializer` ty
+                then pure $ Scalar (castTo ty expr') IntMap.empty
+                else badSource initial "initializer for incompatible type"
+        CInitList list _ -> translateInitList ty list
+
     case helper ty (zeroInitializer ty `mappend` initial') of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
