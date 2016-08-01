@@ -1,0 +1,35 @@
+# Sudo used for custom apt setup
+sudo: true
+
+# Add new environments to the build here:
+env:
+ - GHCVER=7.10.1 CABALVER=1.22
+ - GHCVER=8.0.1 CABALVER=1.22
+ - GHCVER=head CABALVER=head
+
+# Allow for develop branch to break
+matrix:
+  allow_failures:
+   - env: GHCVER=head CABALVER=head
+
+# Manually install ghc and cabal
+before_install:
+  - travis_retry sudo add-apt-repository -y ppa:hvr/ghc
+  - travis_retry sudo apt-get update
+  - travis_retry sudo apt-get install cabal-install-$CABALVER ghc-$GHCVER
+  - export PATH=/opt/ghc/$GHCVER/bin:/opt/cabal/$CABALVER/bin:$PATH
+  - export PATH=$HOME/.cabal/bin:$PATH
+  - travis_retry cabal update
+
+# install happy and alex first, see: https://github.com/jameysharp/corrode/issues/57
+install:
+  - echo $PATH
+  - cabal --version
+  - ghc --version
+  - cabal install happy
+  - cabal install alex
+  - cabal install --verbose
+
+# TODO: Add an example or other tests.
+script:
+  - true
