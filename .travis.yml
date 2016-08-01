@@ -1,6 +1,7 @@
 # Sudo used for custom apt setup
 sudo: true
 
+# Add new environments to the build here:
 env:
  - GHCVER=7.10.1 CABALVER=1.22
  - GHCVER=head CABALVER=head
@@ -19,6 +20,7 @@ before_install:
   - export PATH=$HOME/.cabal/bin:$PATH
   - travis_retry cabal update
 
+# install happy and alex first, see: https://github.com/jameysharp/corrode/issues/57
 install:
   - echo $PATH
   - cabal --version
@@ -27,5 +29,6 @@ install:
   - cabal install alex
   - cabal install --verbose
 
+# TODO: Add an example or other tests.
 script:
   - true
