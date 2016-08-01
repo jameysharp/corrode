@@ -23,6 +23,8 @@ install:
   - echo $PATH
   - cabal --version
   - ghc --version
+  - cabal install happy
+  - cabal install alex
   - cabal install --verbose
 
 script:
