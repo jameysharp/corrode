@@ -4,6 +4,7 @@ sudo: true
 # Add new environments to the build here:
 env:
  - GHCVER=7.10.1 CABALVER=1.22
+ - GHCVER=8.0.1 CABALVER=1.22
  - GHCVER=head CABALVER=head
 
 # Allow for develop branch to break
