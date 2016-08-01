@@ -4,13 +4,15 @@ sudo: false
 language: haskell
 
 ghc:
-  - 7.10
-  - 8.1
+  - "7.10"
 
 before_install:
   - ghc --version
   - cabal --version
   - travis_retry cabal update
 
+install:
+  - cabal install --only-dependencies --enable-tests
+
 script:
-  - cabal install
+  - true
