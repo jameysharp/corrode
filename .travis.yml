@@ -19,9 +19,10 @@ before_install:
   - travis_retry cabal update
 
 install:
+  - echo $PATH
   - cabal --version
   - ghc --version
-  - cabal install --only-dependencies
+  - cabal install --verbose
 
 script:
   - true
