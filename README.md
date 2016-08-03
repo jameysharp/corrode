@@ -1,5 +1,7 @@
 # Corrode: Automatic semantics-preserving translation from C to Rust
 
+[![Build Status](https://travis-ci.org/jameysharp/corrode.svg?branch=master)](https://travis-ci.org/jameysharp/corrode)
+
 This program reads a C source file and prints an equivalent module in
 Rust syntax. It's intended to be useful for two different purposes:
 
