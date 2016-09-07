@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+
+import hashlib
+import subprocess
+import sys
+import tempfile
+
+cflags = sys.argv[1:]
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    try:
+        [rsfile, outfile] = subprocess.run(
+            ['corrode'] + cflags,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True
+        ).stdout.splitlines()
+
+        libfile = tmpdir + '/obj.a'
+
+        rustwarn = subprocess.run(
+            ['rustc', '--crate-type=lib', '-o', libfile, rsfile],
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stderr
+        if rustwarn:
+            sys.stderr.buffer.write(rustwarn)
+
+        with open(outfile, 'wb') as f:
+            subprocess.run(
+                ['ar', 'pf', libfile, 'obj.0.o'],
+                stdout=f,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+    except subprocess.SubprocessError as e:
+        with open('errors-' + hashlib.md5(e.stderr).hexdigest(), 'wb') as f:
+            f.write(e.stderr)
+
+        sys.exit(subprocess.run(['gcc'] + cflags).returncode)

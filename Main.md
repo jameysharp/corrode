@@ -109,7 +109,13 @@ main = dieOnError $ do
    except with any extension replaced by ".rs".
 
     ```haskell
-        lift (writeFile (replaceExtension (inputFile args) ".rs") output)
+        let rsfile = replaceExtension (inputFile args) ".rs"
+        lift $ do
+            writeFile rsfile output
+            putStrLn rsfile
+            putStrLn $ case outputFile rawArgs of
+                Just outfile -> outfile
+                Nothing -> replaceExtension (inputFile args) ".o"
     ```
 
 When the pipeline ends, we need to check whether it resulted in an
