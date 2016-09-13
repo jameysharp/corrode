@@ -1552,6 +1552,66 @@ interpretStatement (CWhile c b False _) = do
     return [Rust.Stmt (Rust.While Nothing (toBool c') (statementsToBlock b'))]
 ```
 
+`do ... while` loops are a little harder to translate because Rust doesn't have a direct equivalent.
+The basic idea is to translate them like this:
+
+```rust
+loop {
+    ...
+    if !cond {
+        break;
+    }
+}
+```
+
+However, this doesn't quite work in the presence of `continue` statements
+because the loop condition would be skipped.
+Therefore we use a trick, which is also used to translate `for` loops (see below).
+We create a nested inner loop, with a `break` at the end so that it's only run once.
+Breaking out of that loop enables us to jump directly to the loop condition test.
+
+```rust
+'breakTo: loop {
+    'continueTo: loop {
+        ...
+        break;
+    }
+    if !cond {
+        break;
+    }
+}
+```
+
+A `break` statement in C is translated to `break 'breakTo`, breaking out of both loops.
+A `continue` statement in C is translated to `break 'continueTo`,
+which breaks out of the inner loop and continues with the loop condition test, as desired.
+
+```haskell
+interpretStatement (CWhile c b True _) = do
+    breakName <- uniqueName "break"
+    continueName <- uniqueName "continue"
+    let breakTo = Just (Rust.Lifetime breakName)
+    let continueTo = Just (Rust.Lifetime continueName)
+
+    (b', (Any sawBreak, Any sawContinue)) <- loopScope
+        (Rust.Break breakTo) (Rust.Break continueTo)
+        (interpretStatement b)
+    let inner = if sawContinue
+            then let block = Rust.Block (b' ++ [Rust.Stmt (Rust.Break Nothing)]) Nothing
+                in [Rust.Stmt (Rust.Loop continueTo block)]
+            else b'
+
+    c' <- interpretExpr True c
+    let loopTest = Rust.Stmt $ Rust.IfThenElse
+            (Rust.Not (toBool c'))
+            (statementsToBlock [Rust.Stmt (Rust.Break Nothing)])
+            (statementsToBlock [])
+
+    let outerLabel = if sawBreak then breakTo else Nothing
+    let outer = Rust.Loop outerLabel (statementsToBlock (inner ++ [loopTest]))
+    return [Rust.Stmt outer]
+```
+
 C's `for` loops can be tricky to translate to Rust, which doesn't have
 anything quite like them.
 
