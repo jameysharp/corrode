@@ -1603,7 +1603,7 @@ interpretStatement (CWhile c b True _) = do
 
     c' <- interpretExpr True c
     let loopTest = Rust.Stmt $ Rust.IfThenElse
-            (Rust.Not (toBool c'))
+            (toNotBool c')
             (statementsToBlock [Rust.Stmt (Rust.Break Nothing)])
             (statementsToBlock [])
 
