@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
+import fnmatch
 import hashlib
+import os
 import subprocess
 import sys
-import tempfile
 
 cflags = sys.argv[1:]
 
-with tempfile.TemporaryDirectory() as tmpdir:
+if '-c' in cflags:
     try:
         [rsfile, outfile] = subprocess.run(
             ['corrode'] + cflags,
@@ -16,25 +17,33 @@ with tempfile.TemporaryDirectory() as tmpdir:
             check=True
         ).stdout.splitlines()
 
-        libfile = tmpdir + '/obj.a'
-
         rustwarn = subprocess.run(
-            ['rustc', '--crate-type=lib', '-o', libfile, rsfile],
+            ['rustc', '--crate-type=dylib', '--emit', 'obj', '-o', outfile, rsfile],
             stderr=subprocess.PIPE,
             check=True,
         ).stderr
         if rustwarn:
             sys.stderr.buffer.write(rustwarn)
-
-        with open(outfile, 'wb') as f:
-            subprocess.run(
-                ['ar', 'pf', libfile, 'obj.0.o'],
-                stdout=f,
-                stderr=subprocess.PIPE,
-                check=True
-            )
     except subprocess.SubprocessError as e:
         with open('errors-' + hashlib.md5(e.stderr).hexdigest(), 'wb') as f:
             f.write(e.stderr)
 
         sys.exit(subprocess.run(['gcc'] + cflags).returncode)
+else:
+    sysroot = subprocess.run(
+        ['rustc', '--print', 'sysroot'],
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+
+    rustlibdir = sysroot + b'/lib/rustlib/x86_64-unknown-linux-gnu/lib/'
+
+    needed = [b'libcompiler-rt.a'] + [
+        b'lib' + lib + b'-*.rlib'
+        for lib in (b'core', b'std', b'collections', b'panic_unwind', b'rustc_unicode', b'unwind', b'rand', b'alloc', b'alloc_system', b'libc')
+    ]
+    alllibs = os.listdir(rustlibdir)
+
+    rustlibs = [ rustlibdir + fnmatch.filter(alllibs, pat)[0] for pat in needed ]
+
+    sys.exit(subprocess.run(['gcc'] + cflags + rustlibs + ['-lgcc_eh']).returncode)
