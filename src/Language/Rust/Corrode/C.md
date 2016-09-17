@@ -320,17 +320,17 @@ there's a de-duplication pass at the end of `interpretTranslationUnit`.)
 addExternIdent
     :: (Pretty node, Pos node)
     => node
-    -> IdentKind
+    -> Ident
     -> (Rust.Mutable, CType)
     -> (String -> Rust.ExternItem)
     -> EnvMonad ()
 addExternIdent node ident ty mkItem = do
-    (_, mty) <- getIdent ident
+    (_, mty) <- getIdent (SymbolIdent ident)
     case mty of
         Just oldTy -> when (ty /= oldTy) $ badSource node
             ("redefinition, previously defined as " ++ show oldTy)
         Nothing -> do
-            name <- addIdent ident ty
+            name <- addIdent (SymbolIdent ident) ty
             lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
 ```
 
@@ -765,7 +765,7 @@ duplicates later.
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
-                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                addExternIdent decl ident (mut, ty) $ \ name ->
                     Rust.ExternFn name formals variadic (toRustRetType retTy)
                 return Nothing
 ```
@@ -776,7 +776,7 @@ prune duplicates later.
 
 ```haskell
             (Just (CExtern _), _, _) -> do
-                addExternIdent decl (SymbolIdent ident) (mut, ty) $ \ name ->
+                addExternIdent decl ident (mut, ty) $ \ name ->
                     Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)
                 return Nothing
 ```
