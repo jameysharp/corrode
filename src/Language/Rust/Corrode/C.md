@@ -2243,6 +2243,7 @@ interpretExpr _ expr@(CVar ident _) = do
     (name, sym) <- getSymbolIdent ident
     case sym of
         Just (mut, ty@(IsEnum enum)) -> do
+            useType ty
             return Result
                 { resultType = ty
                 , resultMutable = mut
