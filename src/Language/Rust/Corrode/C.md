@@ -1117,8 +1117,8 @@ interpretInitializer ty initial = do
                 else badSource initial "initializer for incompatible type"
         CInitList list _ -> translateInitList ty list
 
-    zeroed <- zeroInitializer ty
-    case helper ty (zeroed `mappend` initial') of
+    zeroed <- zeroInitialize initial' ty
+    case helper ty zeroed of
         Nothing -> badSource initial "initializer"
         Just expr -> pure expr
 
@@ -1130,23 +1130,27 @@ initializes in a way that the underlying memory of the target is just
 zeroed out.
 
 ```haskell
-    zeroInitializer IsBool{} = return $ scalar (Rust.Lit (Rust.LitRep "false"))
-    zeroInitializer IsVoid{} = badSource initial "initializer for void"
-    zeroInitializer t@IsInt{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
-        where Rust.TypeName s = toRustType t
-    zeroInitializer t@IsFloat{} = return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
-        where Rust.TypeName s = toRustType t
-    zeroInitializer t@IsPtr{} = return $ scalar (Rust.Cast 0 (toRustType t))
-    zeroInitializer t@IsFunc{} = return $ scalar (Rust.Cast 0 (toRustType t))
-    zeroInitializer (IsStruct _ fields) = do
-        fields' <- mapM (zeroInitializer . snd) fields
-        return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
-    zeroInitializer IsEnum{} = unimplemented initial
-    zeroInitializer (IsIncomplete ident) = do
-        struct <- getTagIdent ident
-        case struct of
-            Just ty'@IsStruct{} -> zeroInitializer ty'
-            _ -> badSource initial "initialization of incomplete type"
+    zeroInitialize i@(Initializer Nothing initials) t = case t of
+        IsBool{} -> return $ scalar (Rust.Lit (Rust.LitRep "false"))
+        IsVoid{} -> badSource initial "initializer for void"
+        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+            where Rust.TypeName s = toRustType t
+        IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+            where Rust.TypeName s = toRustType t
+        IsPtr{} -> return $ scalar (Rust.Cast 0 (toRustType t))
+        IsFunc{} -> return $ scalar (Rust.Cast 0 (toRustType t))
+        IsStruct _ fields -> do
+            let fields' = IntMap.fromDistinctAscList $ zip [0..] $ map snd fields
+            let missing = fields' `IntMap.difference` initials
+            zeros <- mapM (zeroInitialize (Initializer Nothing IntMap.empty)) missing
+            return (Initializer Nothing (IntMap.union initials zeros))
+        IsEnum{} -> unimplemented initial
+        IsIncomplete ident -> do
+            struct <- getTagIdent ident
+            case struct of
+                Just ty'@IsStruct{} -> zeroInitialize i ty'
+                _ -> badSource initial "initialization of incomplete type"
+    zeroInitialize i _ = return i
 ```
 
 ```haskell
