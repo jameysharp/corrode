@@ -2108,28 +2108,25 @@ Common helpers for the unary operators:
 
 C's `sizeof` and `alignof` operators translate to calls to Rust's
 `size_of` and `align_of` functions in `std::mem`, respectively.
+Note that for an expression, we don't evaluate it but only determine its type.
 
-> **TODO**: Translate `sizeof`/`alignof` when applied to expressions,
-> not just types. Just need to check first whether side effects in the
-> expressions are supposed to be evaluated or not.
+> **TODO**: Variable length arrays have to be evaluated for `sizeof`
+> (including  possible side effects), using `std::mem::size_of_val` in Rust.
+> What should `alignof` do for variable length arrays?
 
 ```haskell
+interpretExpr _ (CSizeofExpr e _) = do
+    e' <- interpretExpr True e
+    return (rustSizeOfType (toRustType (resultType e')))
 interpretExpr _ (CSizeofType decl _) = do
     (_mut, ty) <- typeName decl
-    let Rust.TypeName ty' = toRustType ty
-    return Result
-        { resultType = IsInt Unsigned WordWidth
-        , resultMutable = Rust.Immutable
-        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty' ++ ">"))) []
-        }
+    return (rustSizeOfType (toRustType ty))
+interpretExpr _ (CAlignofExpr e _) = do
+    e' <- interpretExpr True e
+    return (rustAlignOfType (toRustType (resultType e')))
 interpretExpr _ (CAlignofType decl _) = do
     (_mut, ty) <- typeName decl
-    let Rust.TypeName ty' = toRustType ty
-    return Result
-        { resultType = IsInt Unsigned WordWidth
-        , resultMutable = Rust.Immutable
-        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::align_of::<" ++ ty' ++ ">"))) []
-        }
+    return (rustAlignOfType (toRustType ty))
 ```
 
 C's array index or array subscript operator, `e1[e2]`, works just like
@@ -2525,6 +2522,20 @@ compound expr returnOld demand op lhs rhs = do
                 _ -> Rust.BlockExpr b
             }
         b -> lhs { result = Rust.BlockExpr b }
+
+rustSizeOfType :: Rust.Type -> Result
+rustSizeOfType (Rust.TypeName ty) = Result
+        { resultType = IsInt Unsigned WordWidth
+        , resultMutable = Rust.Immutable
+        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty ++ ">"))) []
+        }
+
+rustAlignOfType :: Rust.Type -> Result
+rustAlignOfType (Rust.TypeName ty) = Result
+        { resultType = IsInt Unsigned WordWidth
+        , resultMutable = Rust.Immutable
+        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::align_of::<" ++ ty ++ ">"))) []
+        }
 ```
 
 Implicit type coercions
