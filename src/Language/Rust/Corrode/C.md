@@ -231,8 +231,15 @@ treatment.
 
 ```haskell
 applyRenames :: Ident -> String
-applyRenames (identToString -> "main") = "_c_main"
-applyRenames ident = identToString ident
+applyRenames ident = case identToString ident of
+    "final" -> "final_"
+    "fn" -> "fn_"
+    "in" -> "in_"
+    "let" -> "let_"
+    "main" -> "_c_main"
+    "match" -> "match_"
+    "type" -> "type_"
+    name -> name
 ```
 
 `getIdent` looks up a name from the given namespace in the environment,
