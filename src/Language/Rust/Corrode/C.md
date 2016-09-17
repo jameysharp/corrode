@@ -121,7 +121,7 @@ our program while translating.
 ```haskell
 data EnvState = EnvState
     { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
-    , typedefEnvironment :: [(Ident, (Rust.Mutable, CType))]
+    , typedefEnvironment :: [(Ident, IntermediateType)]
     , tagEnvironment :: [(Ident, CType)]
     , unique :: Int
     }
@@ -258,7 +258,7 @@ getSymbolIdent ident = lift $ do
         | w <- [16, 32, 64]
         ]
 
-getTypedefIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
+getTypedefIdent :: Ident -> EnvMonad (String, Maybe IntermediateType)
 getTypedefIdent ident = lift $ do
     env <- gets typedefEnvironment
     return (identToString ident, lookup ident env)
@@ -277,7 +277,7 @@ addSymbolIdent ident ty = lift $ do
     modify $ \ st -> st { symbolEnvironment = (ident, ty) : symbolEnvironment st }
     return (applyRenames ident)
 
-addTypedefIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
+addTypedefIdent :: Ident -> IntermediateType -> EnvMonad ()
 addTypedefIdent ident ty = lift $ do
     modify $ \ st -> st { typedefEnvironment = (ident, ty) : typedefEnvironment st }
 
@@ -724,7 +724,10 @@ initialization expression is optional."
             CDeclr (Just ident) _ _ _ _ -> return ident
             _ -> badSource decl "abstract declarator"
 
-        (mut, isFunc, ty) <- derivedTypeOf baseTy decl
+        itype@IntermediateType
+            { typeMutable = mut
+            , typeIsFunc = isFunc
+            , typeRep = ty } <- derivedTypeOf baseTy decl
         case (storagespecs, isFunc, ty) of
 ```
 
@@ -740,9 +743,8 @@ effect of a `typedef` is to update the environment.
 
 ```haskell
             (Just (CTypedef _), _, _) -> do
-                when isFunc (unimplemented decl)
                 when (isJust minit) (badSource decl "initializer on typedef")
-                addTypedefIdent ident (mut, ty)
+                addTypedefIdent ident itype
                 return Nothing
 ```
 
@@ -1187,7 +1189,9 @@ function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    (_mut, isFunc, funTy) <- derivedTypeOf baseTy declr
+    IntermediateType
+        { typeIsFunc = isFunc
+        , typeRep = funTy } <- derivedTypeOf baseTy declr
 ```
 
 This must be a function type, not a function pointer or a non-function.
@@ -2951,8 +2955,26 @@ enumReprType :: CType
 enumReprType = IsInt Signed (BitWidth 32)
 ```
 
+`CType` is a representation of C types, simplified so that it's easy to
+translate to a corresponding Rust type--but during the process of
+constructing a `CType` from the raw C AST, here's some extra state we
+need to keep track of.
+
 ```haskell
-baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, (Rust.Mutable, CType))
+data IntermediateType = IntermediateType
+    { typeMutable :: Rust.Mutable
+    , typeIsFunc :: Bool
+    , typeRep :: CType
+    }
+```
+
+Given a bag of declaration specifiers like `static`, `const`, or `int`,
+we construct our own representation of the described type. In the
+process we add any nested declarations of new `struct`, `union`, or
+`enum` types to the environment.
+
+```haskell
+baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, IntermediateType)
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
     let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
@@ -2960,27 +2982,89 @@ baseTypeOf specs = do
         [] -> return Nothing
         [spec] -> return (Just spec)
         _ : excess : _ -> badSource excess "extra storage class specifier"
-    base <- foldrM go (mutable basequals, IsInt Signed (BitWidth 32)) basespecs
+    base <- typedef (mutable basequals) basespecs
     return (mstorage, base)
     where
-    go (CSignedType _) (mut, IsInt _ width) = return (mut, IsInt Signed width)
-    go (CUnsigType _) (mut, IsInt _ width) = return (mut, IsInt Unsigned width)
-    go (CCharType _) (mut, _) = return (mut, charType)
-    go (CShortType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 16))
-    go (CIntType _) (mut, IsInt s _) = return (mut, IsInt s (BitWidth 32))
-    go (CLongType _) (mut, IsInt s _) = return (mut, IsInt s WordWidth)
-    go (CLongType _) (mut, IsFloat w) = return (mut, IsFloat w)
-    go (CFloatType _) (mut, _) = return (mut, IsFloat 32)
-    go (CDoubleType _) (mut, _) = return (mut, IsFloat 64)
-    go (CVoidType _) (mut, _) = return (mut, IsVoid)
-    go (CBoolType _) (mut, _) = return (mut, IsBool)
-    go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
+```
+
+If the type specifiers include a reference to a `typedef`, that must be
+the only type specifier.
+
+```haskell
+    typedef mut [spec@(CTypeDef ident _)] = do
+```
+
+Using a `typedef` is tricky, since they can have `const` baked in, or
+represent a function type rather than a function pointer. The resulting
+type is `const` if at least one of the `typedef` or this specifier list
+includes `const`. Other type information is just copied from the
+`typedef`.
+
+```haskell
+        (name, mty) <- getTypedefIdent ident
+        case mty of
+            Just itype -> return itype
+                { typeMutable = if typeMutable itype == mut
+                    then mut else Rust.Immutable
+                }
+```
+
+GCC headers use `__builtin_va_list` as the type implementing `va_list`.
+On all the platforms I checked, this type's ABI is compatible with a
+pointer, so we translate it to a pointer to a unique incomplete type.
+
+```haskell
+            Nothing | name == "__builtin_va_list" -> do
+                ty <- emitIncomplete ident
+                return IntermediateType
+                    { typeMutable = mut
+                    , typeIsFunc = False
+                    , typeRep = IsPtr Rust.Mutable ty
+                    }
+            Nothing -> badSource spec "undefined type"
+```
+
+None of the other type specifiers can make a type `const`, so let the
+remaining cases return a `CType` and we'll wrap it up with the common
+extra fields.
+
+```haskell
+    typedef mut other = do
+        ty <- singleSpec other
+        return IntermediateType
+            { typeMutable = mut
+            , typeIsFunc = False
+            , typeRep = ty
+            }
+```
+
+Like `typedef` types, none of this next group of type specifiers can be
+used with any other type specifier.
+
+```haskell
+    singleSpec [CVoidType _] = return IsVoid
+    singleSpec [CBoolType _] = return IsBool
+```
+
+A `struct` with no fields must have a tag, and represents a reference to
+a `struct` whose fields are given elsewhere. If this is a forward
+declaration, then values of this type can't be constructed or accessed
+until after the actual declaration is processed, so we mark this type
+incomplete until then.
+
+```haskell
+    singleSpec [CSUType (CStruct CStructTag (Just ident) Nothing _ _) _] = do
         mty <- getTagIdent ident
-        ty <- case mty of
+        case mty of
             Just ty -> return ty
             Nothing -> emitIncomplete ident
-        return (mut, ty)
-    go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
+```
+
+Translating a `struct` declaration begins by recursively translating the
+type of each field.
+
+```haskell
+    singleSpec [CSUType (CStruct CStructTag mident (Just declarations) _ _) _] = do
         fields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
             (storage, base) <- baseTypeOf spec
             case storage of
@@ -2988,34 +3072,75 @@ baseTypeOf specs = do
                 Nothing -> return ()
             forM decls $ \ decl -> case decl of
                 (Just declr@(CDeclr (Just field) _ _ _ _), Nothing, Nothing) -> do
-                    (_mut, isFunc, ty) <- derivedTypeOf base declr
+                    IntermediateType
+                        { typeIsFunc = isFunc
+                        , typeRep = ty } <- derivedTypeOf base declr
                     when isFunc (badSource declr "function as struct field")
                     return (identToString field, ty)
                 (_, Nothing, Just _size) -> unimplemented declaration
                 _ -> badSource declaration "field in struct"
+```
+
+In C, a `struct` is allowed to be anonymous. Not so in Rust. If we
+encounter an anonymous `struct`, we need to construct a unique name for
+it and use that.
+
+```haskell
         name <- case mident of
             Just ident -> do
                 let name = identToString ident
                 addTagIdent ident (IsStruct name fields)
             Nothing -> uniqueName "Struct"
+```
+
+C allows assigning `struct` variables to each other and passing copies
+of them by value to function calls. To allow the same behavior in Rust,
+we need an implementation of the `Copy` trait, and that requires `Clone`
+as well. Fortunately we can ask the compiler to auto-generate both
+implementations.
+
+We also request that the Rust compiler lay out the fields of this
+`struct` using the same rules as the C ABI for the target platform.
+
+```haskell
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
-        return (mut, IsStruct name fields)
-    go (CSUType (CStruct CUnionTag mident _ _ _) node) (mut, _) = do
+        return (IsStruct name fields)
+```
+
+As of this writing, Rust support for C-style `union` types has just
+recently landed in rustc nightly. Until that stabilizes, we can't fully
+translate C `union` types. What we can do, though, is allow pointers to
+such unions to be passed around anywhere. So for now, this creates an
+incomplete type for each `union`.
+
+```haskell
+    singleSpec [CSUType (CStruct CUnionTag mident _ _ _) node] = do
         ident <- case mident of
             Just ident -> return ident
             Nothing -> do
                 name <- uniqueName "Union"
                 return (internalIdentAt (posOfNode node) name)
-        ty <- emitIncomplete ident
-        return (mut, ty)
-    go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
+        emitIncomplete ident
+```
+
+Unlike `struct` references, an `enum` reference must name an `enum` that
+has already been declared.
+
+```haskell
+    singleSpec [spec@(CEnumType (CEnum (Just ident) Nothing _ _) _)] = do
         mty <- getTagIdent ident
         case mty of
-            Just ty -> return (mut, ty)
+            Just ty -> return ty
             Nothing -> badSource spec "undefined enum"
-    go (CEnumType (CEnum mident (Just items) _ _) _) (mut, _) = do
-        let Rust.TypeName repr = toRustType enumReprType
+```
+
+In C, an `enum` declaration not only creates a new type, but also
+declares a collection of constants, which we add to the symbol
+environment.
+
+```haskell
+    singleSpec [CEnumType (CEnum mident (Just items) _ _) _] = do
         name <- case mident of
             Just ident -> do
                  let name = identToString ident
@@ -3028,24 +3153,48 @@ baseTypeOf specs = do
                 Just expr -> do
                     expr' <- interpretExpr True expr
                     return (Rust.EnumeratorExpr enumName (castTo enumReprType expr'))
+```
+
+Like `struct` above, `enum` needs both `Copy` and `Clone`. But we also
+force each `enum` to be represented just like `enumReprType`, defined
+above.
+
+```haskell
+        let Rust.TypeName repr = toRustType enumReprType
         let attrs = [ Rust.Attribute "derive(Clone, Copy)"
                     , Rust.Attribute (concat [ "repr(", repr, ")" ])
                     ]
         emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
-        return (mut, IsEnum name)
-    go spec@(CTypeDef ident _) (mut1, _) = do
-        (name, mty) <- getTypedefIdent ident
-        case mty of
-            Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
-            Nothing | name == "__builtin_va_list" -> do
-                ty <- emitIncomplete ident
-                return (mut1, IsPtr Rust.Mutable ty)
-            Nothing -> badSource spec "undefined type"
-    go spec _ = unimplemented spec
+        return (IsEnum name)
+```
 
-derivedTypeOf :: (Rust.Mutable, CType) -> CDeclr -> EnvMonad (Rust.Mutable, Bool, CType)
-derivedTypeOf (basemut, basety) declr@(CDeclr _ derived _ _ _) =
-    foldrM derive (basemut, False, basety) derived
+If none of those matched the type specifier list, then hopefully it's an
+arithmetic type. The default type in C is `signed int`, so we start
+there and modify it according to whatever type specifiers are present.
+
+```haskell
+    singleSpec other = foldrM arithmetic (IsInt Signed (BitWidth 32)) other
+
+    arithmetic :: CTypeSpec -> CType -> EnvMonad CType
+    arithmetic (CSignedType _) (IsInt _ width) = return (IsInt Signed width)
+    arithmetic (CUnsigType _) (IsInt _ width) = return (IsInt Unsigned width)
+    arithmetic (CCharType _) _ = return charType
+    arithmetic (CShortType _) (IsInt s _) = return (IsInt s (BitWidth 16))
+    arithmetic (CIntType _) (IsInt s _) = return (IsInt s (BitWidth 32))
+    arithmetic (CLongType _) (IsInt s _) = return (IsInt s WordWidth)
+    arithmetic (CFloatType _) _ = return (IsFloat 32)
+    arithmetic (CDoubleType _) _ = return (IsFloat 64)
+    arithmetic spec _ = unimplemented spec
+```
+
+We've just finished covering how to compute a simple type, but C
+declarators add to the complexity. A declarator can inductively wrap a
+simple type in zero or more derived types, each of which can be a
+pointer, an array, or a function type.
+
+```haskell
+derivedTypeOf :: IntermediateType -> CDeclr -> EnvMonad IntermediateType
+derivedTypeOf basetype declr@(CDeclr _ derived _ _ _) = foldrM derive basetype derived
     where
 ```
 
@@ -3054,16 +3203,23 @@ So if we see a `CPtrDeclr` followed by a `CFunDeclr`, we should eat the
 pointer.
 
 ```haskell
-    derive (CPtrDeclr _ _) (c, True, to) = return (c, False, to)
+    derive (CPtrDeclr _ _) itype@(IntermediateType { typeIsFunc = True }) = return itype { typeIsFunc = False }
 ```
 
 If we see a `CArrDeclr` or `CFunDeclr` before a `CFunDeclr`, that's an
 error; there must be an intervening pointer.
 
 ```haskell
-    derive _ (_, True, _) = badSource declr "use of function type"
-    derive (CPtrDeclr quals _) (c, False, to) = return (mutable quals, False, IsPtr c to)
-    derive (CArrDeclr quals _ _) (c, False, to) = return (mutable quals, False, IsPtr c to)
+    derive _ (IntermediateType { typeIsFunc = True }) =
+        badSource declr "use of function type"
+    derive (CPtrDeclr quals _) itype = return itype
+        { typeMutable = mutable quals
+        , typeRep = IsPtr (typeMutable itype) (typeRep itype)
+        }
+    derive (CArrDeclr quals _ _) itype = return itype
+        { typeMutable = mutable quals
+        , typeRep = IsPtr (typeMutable itype) (typeRep itype)
+        }
 ```
 
 > **TODO**: Handling old-style function declarations is probably not
@@ -3071,7 +3227,7 @@ error; there must be an intervening pointer.
 
 ```haskell
     derive (CFunDeclr (Left _) _ _) _ = unimplemented declr
-    derive (CFunDeclr (Right (args, variadic)) _ _) (c, False, retTy) = do
+    derive (CFunDeclr (Right (args, variadic)) _ _) itype = do
         args' <- sequence
             [ do
                 (storage, base') <- baseTypeOf argspecs
@@ -3080,9 +3236,12 @@ error; there must be an intervening pointer.
                     Just (CRegister _) -> return ()
                     Just s -> badSource s "storage class specifier on argument"
                 case declr' of
-                    [] -> return (Nothing, snd base')
+                    [] -> return (Nothing, typeRep base')
                     [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
-                        (mut, isFunc, ty) <- derivedTypeOf base' argdeclr
+                        IntermediateType
+                            { typeMutable = mut
+                            , typeIsFunc = isFunc
+                            , typeRep = ty } <- derivedTypeOf base' argdeclr
                         when isFunc (badSource arg "function as function argument")
                         return (fmap ((,) mut) argname, ty)
                     _ -> badSource arg "function argument"
@@ -3097,8 +3256,16 @@ mean the function takes no arguments.
                 [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
                 _ -> args
             ]
-        return (c, True, IsFunc retTy args' variadic)
+        return itype
+            { typeIsFunc = True
+            , typeRep = IsFunc (typeRep itype) args' variadic
+            }
+```
 
+Several places above need to check whether any type qualifiers are
+`const`, so this helper function answers that question.
+
+```haskell
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
@@ -3108,13 +3275,12 @@ typeName decl@(CDecl spec declarators _) = do
     case storage of
         Just s -> badSource s "storage class specifier in type name"
         Nothing -> return ()
-    (mut, ty) <- case declarators of
+    itype <- case declarators of
         [] -> return base
-        [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] -> do
-            (mut, isFunc, ty) <- derivedTypeOf base declr
-            when isFunc (badSource decl "use of function type")
-            return (mut, ty)
+        [(Just declr@(CDeclr Nothing _ _ _ _), Nothing, Nothing)] ->
+            derivedTypeOf base declr
         _ -> badSource decl "type name"
-    useType ty
-    return (mut, ty)
+    when (typeIsFunc itype) (badSource decl "use of function type")
+    useType (typeRep itype)
+    return (typeMutable itype, typeRep itype)
 ```
