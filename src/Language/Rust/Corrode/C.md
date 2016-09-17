@@ -72,16 +72,8 @@ Intermediate data structures
 One of the biggest challenges in correctly translating C to Rust is that
 we need to know what type C would give every expression, so we can
 ensure that the Rust equivalent uses the same types. To do that, we need
-to maintain a list of all the names that are currently in scope, along
-with their type information. This is called an `Environment` and we'll
-give it a handy type alias to use later.
-
-```haskell
-type Environment = [(IdentKind, (Rust.Mutable, CType))]
-```
-
-We'll come back to our internal representation of C types at the end of
-this module.
+to keep track of all the names that are currently in scope, along with
+their type information.
 
 C has three namespaces for variable, function, and type names:
 
@@ -113,17 +105,10 @@ fortunately Corrode never generates those kinds of structs.)
 Fortunately, language-c does the hard work for us of disambiguating
 these different uses of identical-looking names. As we'll see later,
 whenever an identifier occurs, we can tell which namespace to use for it
-from the AST context in which it appeared. However, we still need to
-keep these names separate in the environment, so we define a simple type
-to label identifiers with their namespace.
+from the AST context in which it appeared.
 
-```haskell
-data IdentKind
-    = SymbolIdent Ident
-    | TypedefIdent Ident
-    | TagIdent Ident
-    deriving Eq
-```
+We'll come back to our internal representation of C types at the end of
+this module.
 
 Sometimes we need to construct a unique name, because the Rust pattern
 we want to generate requires a name someplace where C did not require
@@ -135,7 +120,9 @@ our program while translating.
 
 ```haskell
 data EnvState = EnvState
-    { environment :: Environment
+    { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
+    , typedefEnvironment :: [(Ident, (Rust.Mutable, CType))]
+    , tagEnvironment :: [(Ident, CType)]
     , unique :: Int
     }
 ```
@@ -255,9 +242,9 @@ haven't seen a declaration for that name yet.
 ```haskell
 getSymbolIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
 getSymbolIdent ident = lift $ do
-    env <- gets environment
+    env <- gets symbolEnvironment
     let name = applyRenames ident
-    return $ case lookup (SymbolIdent ident) env of
+    return $ case lookup ident env of
         Just ty -> (name, Just ty)
         Nothing -> fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
     where
@@ -273,13 +260,13 @@ getSymbolIdent ident = lift $ do
 
 getTypedefIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
 getTypedefIdent ident = lift $ do
-    env <- gets environment
-    return (identToString ident, lookup (TypedefIdent ident) env)
+    env <- gets typedefEnvironment
+    return (identToString ident, lookup ident env)
 
 getTagIdent :: Ident -> EnvMonad (Maybe CType)
 getTagIdent ident = lift $ do
-    env <- gets environment
-    return $ fmap snd $ lookup (TagIdent ident) env
+    env <- gets tagEnvironment
+    return $ lookup ident env
 ```
 
 `addIdent` saves type information into the environment.
@@ -287,16 +274,16 @@ getTagIdent ident = lift $ do
 ```haskell
 addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad String
 addSymbolIdent ident ty = lift $ do
-    modify $ \ st -> st { environment = (SymbolIdent ident, ty) : environment st }
+    modify $ \ st -> st { symbolEnvironment = (ident, ty) : symbolEnvironment st }
     return (applyRenames ident)
 
 addTypedefIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
 addTypedefIdent ident ty = lift $ do
-    modify $ \ st -> st { environment = (TypedefIdent ident, ty) : environment st }
+    modify $ \ st -> st { typedefEnvironment = (ident, ty) : typedefEnvironment st }
 
 addTagIdent :: Ident -> CType -> EnvMonad String
 addTagIdent ident ty = lift $ do
-    modify $ \ st -> st { environment = (TagIdent ident, (Rust.Immutable, ty)) : environment st }
+    modify $ \ st -> st { tagEnvironment = (ident, ty) : tagEnvironment st }
     return (identToString ident)
 ```
 
@@ -458,7 +445,9 @@ Specifically, we:
         , onContinue = flip badSource "continue outside loop"
         }
     initState = EnvState
-        { environment = []
+        { symbolEnvironment = []
+        , typedefEnvironment = []
+        , tagEnvironment = []
         , unique = 1
         }
     (err, _, output) = runRWS (runExceptT (mapM_ perDecl decls)) initFlow initState
@@ -1846,10 +1835,14 @@ are kept, though.
 scope :: EnvMonad a -> EnvMonad a
 scope m = do
     -- Save the current environment.
-    old <- lift (gets environment)
+    old <- lift get
     a <- m
     -- Restore the environment to its state before running m.
-    lift (modify (\ st -> st { environment = old }))
+    lift (modify (\ st -> st
+        { symbolEnvironment = symbolEnvironment old
+        , typedefEnvironment = typedefEnvironment old
+        , tagEnvironment = tagEnvironment old
+        }))
     return a
 ```
 
