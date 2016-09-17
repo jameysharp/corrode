@@ -119,9 +119,9 @@ to label identifiers with their namespace.
 
 ```haskell
 data IdentKind
-    = SymbolIdent { identOfKind :: Ident }
-    | TypedefIdent { identOfKind :: Ident }
-    | TagIdent { identOfKind :: Ident }
+    = SymbolIdent Ident
+    | TypedefIdent Ident
+    | TagIdent Ident
     deriving Eq
 ```
 
@@ -243,9 +243,9 @@ as we encounter them. At the moment, only `main` gets this special
 treatment.
 
 ```haskell
-applyRenames :: IdentKind -> String
-applyRenames (SymbolIdent (identToString -> "main")) = "_c_main"
-applyRenames ident = identToString (identOfKind ident)
+applyRenames :: Ident -> String
+applyRenames (identToString -> "main") = "_c_main"
+applyRenames ident = identToString ident
 ```
 
 `getIdent` looks up a name from the given namespace in the environment,
@@ -253,15 +253,13 @@ and returns the type information we have for it, or `Nothing` if we
 haven't seen a declaration for that name yet.
 
 ```haskell
-getIdent :: IdentKind -> EnvMonad (String, Maybe (Rust.Mutable, CType))
-getIdent ident = lift $ do
+getSymbolIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
+getSymbolIdent ident = lift $ do
     env <- gets environment
     let name = applyRenames ident
-    return $ case lookup ident env of
+    return $ case lookup (SymbolIdent ident) env of
         Just ty -> (name, Just ty)
-        Nothing -> fromMaybe (name, Nothing) $ case ident of
-            SymbolIdent ident' -> lookup (identToString ident') builtinSymbols
-            _ -> Nothing
+        Nothing -> fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
     where
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w,
@@ -272,15 +270,34 @@ getIdent ident = lift $ do
             )))
         | w <- [16, 32, 64]
         ]
+
+getTypedefIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
+getTypedefIdent ident = lift $ do
+    env <- gets environment
+    return (identToString ident, lookup (TypedefIdent ident) env)
+
+getTagIdent :: Ident -> EnvMonad (Maybe CType)
+getTagIdent ident = lift $ do
+    env <- gets environment
+    return $ fmap snd $ lookup (TagIdent ident) env
 ```
 
 `addIdent` saves type information into the environment.
 
 ```haskell
-addIdent :: IdentKind -> (Rust.Mutable, CType) -> EnvMonad String
-addIdent ident ty = lift $ do
-    modify $ \ st -> st { environment = (ident, ty) : environment st }
+addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad String
+addSymbolIdent ident ty = lift $ do
+    modify $ \ st -> st { environment = (SymbolIdent ident, ty) : environment st }
     return (applyRenames ident)
+
+addTypedefIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad ()
+addTypedefIdent ident ty = lift $ do
+    modify $ \ st -> st { environment = (TypedefIdent ident, ty) : environment st }
+
+addTagIdent :: Ident -> CType -> EnvMonad String
+addTagIdent ident ty = lift $ do
+    modify $ \ st -> st { environment = (TagIdent ident, (Rust.Immutable, ty)) : environment st }
+    return (identToString ident)
 ```
 
 `uniqueName` generates a new name with the given base and a new unique
@@ -325,12 +342,12 @@ addExternIdent
     -> (String -> Rust.ExternItem)
     -> EnvMonad ()
 addExternIdent node ident ty mkItem = do
-    (_, mty) <- getIdent (SymbolIdent ident)
+    (_, mty) <- getSymbolIdent ident
     case mty of
         Just oldTy -> when (ty /= oldTy) $ badSource node
             ("redefinition, previously defined as " ++ show oldTy)
         Nothing -> do
-            name <- addIdent (SymbolIdent ident) ty
+            name <- addSymbolIdent ident ty
             lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
 ```
 
@@ -722,10 +739,9 @@ initialization expression is optional."
         case (storagespecs, isFunc, ty) of
 ```
 
-Each `typedef` declarator is added to the environment, tagged as a
-`TypedefIdent`. They must not have an initializer and do not return any
-declarations, so the only effect of a `typedef` is to update the
-environment.
+Each `typedef` declarator is added to the environment. They must not
+have an initializer and do not return any declarations, so the only
+effect of a `typedef` is to update the environment.
 
 > **TODO**: It would be nice to emit a type-alias item for each
 > `typedef` and use the alias names anywhere we can, instead of
@@ -737,12 +753,12 @@ environment.
             (Just (CTypedef _), _, _) -> do
                 when isFunc (unimplemented decl)
                 when (isJust minit) (badSource decl "initializer on typedef")
-                _ <- addIdent (TypedefIdent ident) (mut, ty)
+                addTypedefIdent ident (mut, ty)
                 return Nothing
 ```
 
 Non-`typedef` declarations may have an initializer. Each declarator is
-added to the environment, tagged as a `SymbolIdent`.
+added to the environment as a new symbol.
 
 Static function prototypes don't need to be translated because the
 function definition must be in the same translation unit. We still need
@@ -750,7 +766,7 @@ to have the function's type signature in the environment though.
 
 ```haskell
             (Just (CStatic _), True, IsFunc{}) -> do
-                _ <- addIdent (SymbolIdent ident) (mut, ty)
+                _ <- addSymbolIdent ident (mut, ty)
                 return Nothing
 ```
 
@@ -789,7 +805,7 @@ returning for other bindings.
 
 ```haskell
             (Just (CStatic _), _, _) -> do
-                name <- addIdent (SymbolIdent ident) (mut, ty)
+                name <- addSymbolIdent ident (mut, ty)
                 useType ty
                 expr <- interpretInitializer ty (fromMaybe (CInitList [] (nodeInfo decl)) minit)
                 return (Just (fromItem
@@ -802,7 +818,7 @@ to translate that; see below.
 
 ```haskell
             _ -> do
-                name <- addIdent (SymbolIdent ident) (mut, ty)
+                name <- addSymbolIdent ident (mut, ty)
                 useType ty
                 mexpr <- mapM (interpretInitializer ty) minit
                 return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
@@ -1136,9 +1152,9 @@ zeroed out.
         return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
     zeroInitializer IsEnum{} = unimplemented initial
     zeroInitializer (IsIncomplete ident) = do
-        (_, struct) <- getIdent (TagIdent ident)
+        struct <- getTagIdent ident
         case struct of
-            Just (_, ty'@IsStruct{}) -> zeroInitializer ty'
+            Just ty'@IsStruct{} -> zeroInitializer ty'
             _ -> badSource initial "initialization of incomplete type"
 ```
 
@@ -1204,7 +1220,7 @@ calls work. (Note that function definitions can't be anonymous.)
 ```haskell
     name <- case mident of
         Nothing -> badSource declr "anonymous function definition"
-        Just ident -> addIdent (SymbolIdent ident) (Rust.Mutable, funTy)
+        Just ident -> addSymbolIdent ident (Rust.Mutable, funTy)
 ```
 
 Translating `main` requires special care; see `wrapMain` below.
@@ -1221,8 +1237,7 @@ type available so we can correctly translate `return` statements.
     mapExceptT (local setRetTy) $ scope $ do
 ```
 
-Add each formal parameter into the new environment, tagged as
-`SymbolIdent`.
+Add each formal parameter into the new environment, as a symbol.
 
 > **XXX**: We currently require that every parameter have a name, but
 > I'm not sure that C actually requires that. If it doesn't, we should
@@ -1235,7 +1250,7 @@ Add each formal parameter into the new environment, tagged as
         formals <- sequence
             [ case arg of
                 Just (mut, argident) -> do
-                    argname <- addIdent (SymbolIdent argident) (mut, ty)
+                    argname <- addSymbolIdent argident (mut, ty)
                     return (mut, Rust.VarName argname, toRustType ty)
                 Nothing -> badSource declr "anonymous parameter"
             | (arg, ty) <- args
@@ -2203,9 +2218,9 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     fields <- case resultType obj' of
         IsStruct _ fields -> return fields
         IsIncomplete tyIdent -> do
-            (_, struct) <- getIdent (TagIdent tyIdent)
+            struct <- getTagIdent tyIdent
             case struct of
-                Just (_, IsStruct _ fields) -> return fields
+                Just (IsStruct _ fields) -> return fields
                 _ -> badSource expr "member access of incomplete type"
         _ -> badSource expr "member access of non-struct"
     let field = identToString ident
@@ -2227,7 +2242,7 @@ pointer.
 
 ```haskell
 interpretExpr _ expr@(CVar ident _) = do
-    (name, sym) <- getIdent (SymbolIdent ident)
+    (name, sym) <- getSymbolIdent ident
     case sym of
         Just (mut, ty@(IsEnum enum)) -> do
             return Result
@@ -2967,9 +2982,9 @@ baseTypeOf specs = do
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        (_name, mty) <- getIdent (TagIdent ident)
+        mty <- getTagIdent ident
         ty <- case mty of
-            Just (_, ty) -> return ty
+            Just ty -> return ty
             Nothing -> emitIncomplete ident
         return (mut, ty)
     go (CSUType (CStruct CStructTag mident (Just declarations) _ _) _) (mut, _) = do
@@ -2988,7 +3003,7 @@ baseTypeOf specs = do
         name <- case mident of
             Just ident -> do
                 let name = identToString ident
-                addIdent (TagIdent ident) (Rust.Immutable, IsStruct name fields)
+                addTagIdent ident (IsStruct name fields)
             Nothing -> uniqueName "Struct"
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
@@ -3002,19 +3017,19 @@ baseTypeOf specs = do
         ty <- emitIncomplete ident
         return (mut, ty)
     go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
-        (_, mty) <- getIdent (TagIdent ident)
+        mty <- getTagIdent ident
         case mty of
-            Just (_, ty) -> return (mut, ty)
+            Just ty -> return (mut, ty)
             Nothing -> badSource spec "undefined enum"
     go (CEnumType (CEnum mident (Just items) _ _) _) (mut, _) = do
         let Rust.TypeName repr = toRustType enumReprType
         name <- case mident of
             Just ident -> do
                  let name = identToString ident
-                 addIdent (TagIdent ident) (Rust.Immutable, IsEnum name)
+                 addTagIdent ident (IsEnum name)
             Nothing -> uniqueName "Enum"
         enums <- forM items $ \ (ident, mexpr) -> do
-            enumName <- addIdent (SymbolIdent ident) (Rust.Immutable, IsEnum name)
+            enumName <- addSymbolIdent ident (Rust.Immutable, IsEnum name)
             case mexpr of
                 Nothing -> return (Rust.EnumeratorAuto enumName)
                 Just expr -> do
@@ -3026,7 +3041,7 @@ baseTypeOf specs = do
         emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
         return (mut, IsEnum name)
     go spec@(CTypeDef ident _) (mut1, _) = do
-        (name, mty) <- getIdent (TypedefIdent ident)
+        (name, mty) <- getTypedefIdent ident
         case mty of
             Just (mut2, ty) -> return (if mut1 == mut2 then mut1 else Rust.Immutable, ty)
             Nothing | name == "__builtin_va_list" -> do
