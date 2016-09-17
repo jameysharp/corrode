@@ -65,11 +65,15 @@ main = dieOnError $ do
    we ignore that, but we need to suppress it so the preprocessor
    doesn't write its output where a binary was expected to be written.
    We also force-undefine preprocessor symbols that would indicate
-   support for language features we can't actually handle.
+   support for language features we can't actually handle, and remove
+   optimization flags that make GCC define preprocessor symbols.
 
     ```haskell
         let args = foldl addCppOption
-                (rawArgs { outputFile = Nothing })
+                (rawArgs
+                    { outputFile = Nothing
+                    , extraOptions = filter (not . ("-O" `isPrefixOf`)) (extraOptions rawArgs)
+                    })
                 (map Undefine ["__BLOCKS__"])
     ```
 
