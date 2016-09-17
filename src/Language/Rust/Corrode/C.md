@@ -3186,6 +3186,7 @@ there and modify it according to whatever type specifiers are present.
     arithmetic (CShortType _) (IsInt s _) = return (IsInt s (BitWidth 16))
     arithmetic (CIntType _) (IsInt s _) = return (IsInt s (BitWidth 32))
     arithmetic (CLongType _) (IsInt s _) = return (IsInt s WordWidth)
+    arithmetic (CLongType _) (IsFloat w) = return (IsFloat w)
     arithmetic (CFloatType _) _ = return (IsFloat 32)
     arithmetic (CDoubleType _) _ = return (IsFloat 64)
     arithmetic spec _ = unimplemented spec
