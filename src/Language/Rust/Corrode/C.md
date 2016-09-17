@@ -1865,7 +1865,7 @@ can be combined into the larger expression that we're building up.
 ```haskell
 data Result = Result
     { resultType :: CType
-    , isMutable :: Rust.Mutable
+    , resultMutable :: Rust.Mutable
     , result :: Rust.Expr
     }
 ```
@@ -1899,7 +1899,7 @@ interpretExpr demand (CComma exprs _) = do
     mfinal' <- mapM (interpretExpr True) mfinal
     return Result
         { resultType = maybe IsVoid resultType mfinal'
-        , isMutable = maybe Rust.Immutable isMutable mfinal'
+        , resultMutable = maybe Rust.Immutable resultMutable mfinal'
         , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
         }
 ```
@@ -1935,7 +1935,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
         then promotePtr expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
         else return Result
             { resultType = IsVoid
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = Rust.IfThenElse c' (Rust.Block (exprToStatements t') Nothing) (Rust.Block (exprToStatements f') Nothing)
             }
 ```
@@ -1961,7 +1961,7 @@ interpretExpr _ (CCast decl expr _) = do
     expr' <- interpretExpr True expr
     return Result
         { resultType = ty
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = Rust.Cast (result expr') (toRustType ty)
         }
 ```
@@ -1993,11 +1993,11 @@ real C compiler.
 ```haskell
     CAdrOp -> do
         expr' <- interpretExpr True expr
-        let ty' = IsPtr (isMutable expr') (resultType expr')
+        let ty' = IsPtr (resultMutable expr') (resultType expr')
         return Result
             { resultType = ty'
-            , isMutable = Rust.Immutable
-            , result = Rust.Cast (Rust.Borrow (isMutable expr') (result expr')) (toRustType ty')
+            , resultMutable = Rust.Immutable
+            , result = Rust.Cast (Rust.Borrow (resultMutable expr') (result expr')) (toRustType ty')
             }
 ```
 
@@ -2011,7 +2011,7 @@ on whether the pointer was to a mutable value.
         case resultType expr' of
             IsPtr mut' ty' -> return Result
                 { resultType = ty'
-                , isMutable = mut'
+                , resultMutable = mut'
                 , result = Rust.Deref (result expr')
                 }
             _ -> badSource node "dereference of non-pointer"
@@ -2043,7 +2043,7 @@ if there had been no unary plus operator in the expression at all.
         let ty' = intPromote (resultType expr')
         return Result
             { resultType = ty'
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = castTo ty' expr'
             }
 ```
@@ -2072,7 +2072,7 @@ extra "not" operators by creating a special-case `toNotBool` variant of
         expr' <- interpretExpr True expr
         return Result
             { resultType = IsBool
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = toNotBool expr'
             }
 ```
@@ -2085,7 +2085,7 @@ Common helpers for the unary operators:
         expr' <- interpretExpr True expr
         compound node returnOld demand assignop expr' Result
             { resultType = IsInt Signed (BitWidth 32)
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = 1
             }
     simple f = do
@@ -2093,7 +2093,7 @@ Common helpers for the unary operators:
         let ty' = intPromote (resultType expr')
         return Result
             { resultType = ty'
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = f (castTo ty' expr')
             }
 ```
@@ -2111,7 +2111,7 @@ interpretExpr _ (CSizeofType decl _) = do
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty' ++ ">"))) []
         }
 interpretExpr _ (CAlignofType decl _) = do
@@ -2119,7 +2119,7 @@ interpretExpr _ (CAlignofType decl _) = do
     let Rust.TypeName ty' = toRustType ty
     return Result
         { resultType = IsInt Unsigned WordWidth
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::align_of::<" ++ ty' ++ ">"))) []
         }
 ```
@@ -2139,7 +2139,7 @@ interpretExpr _ expr@(CIndex lhs rhs _) = do
     case resultType ptr of
         IsPtr mut ty -> return Result
             { resultType = ty
-            , isMutable = mut
+            , resultMutable = mut
             , result = Rust.Deref (result ptr)
             }
         _ -> badSource expr "array subscript of non-pointer"
@@ -2156,7 +2156,7 @@ interpretExpr _ expr@(CCall func args _) = do
             args' <- castArgs variadic (map snd argTys) args
             return Result
                 { resultType = retTy
-                , isMutable = Rust.Immutable
+                , resultMutable = Rust.Immutable
                 , result = Rust.Call (result func') args'
                 }
         _ -> badSource expr "function call to non-function"
@@ -2222,7 +2222,7 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
         Nothing -> badSource expr "request for non-existent field"
     return Result
         { resultType = ty
-        , isMutable = isMutable obj'
+        , resultMutable = resultMutable obj'
         , result = Rust.Member (result obj') (Rust.VarName field)
         }
 ```
@@ -2240,14 +2240,14 @@ interpretExpr _ expr@(CVar ident _) = do
         Just (mut, ty@(IsEnum enum)) -> do
             return Result
                 { resultType = ty
-                , isMutable = mut
+                , resultMutable = mut
                 , result = Rust.Path (Rust.PathSegments [enum, name])
                 }
         Just (mut, ty) -> do
             lift $ tell mempty { usesSymbols = Set.singleton name }
             return Result
                 { resultType = ty
-                , isMutable = mut
+                , resultMutable = mut
                 , result = Rust.Var (Rust.VarName name)
                 }
         Nothing -> badSource expr "undefined variable"
@@ -2313,7 +2313,7 @@ syntax.
 ```haskell
     CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = Rust.Lit (Rust.LitRep ("b'" ++ rustByteLit ch ++ "'"))
         }
 ```
@@ -2331,7 +2331,7 @@ lifetime, the resulting raw pointer is always safe to use.
 ```haskell
     CStrConst (CString str False) _ -> return Result
         { resultType = IsPtr Rust.Immutable charType
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = Rust.MethodCall (Rust.Lit (
                 Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")
             )) (Rust.VarName "as_ptr") []
@@ -2356,7 +2356,7 @@ need to match C's rules instead.
         let Rust.TypeName suffix = toRustType ty
         in Result
             { resultType = ty
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = Rust.Lit (Rust.LitRep (v ++ suffix))
             }
 ```
@@ -2388,7 +2388,7 @@ interpretExpr _ (CCompoundLit decl initials info) = do
     final <- interpretInitializer ty (CInitList initials info)
     return Result
         { resultType = ty
-        , isMutable = mut
+        , resultMutable = mut
         , result = final
         }
 ```
@@ -2405,7 +2405,7 @@ interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
     final' <- mapM (interpretExpr True) final
     return Result
         { resultType = maybe IsVoid resultType final'
-        , isMutable = maybe Rust.Immutable isMutable final'
+        , resultMutable = maybe Rust.Immutable resultMutable final'
         , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result final'))
         }
 ```
@@ -2454,12 +2454,12 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     CAndOp -> promote expr Rust.And lhs rhs
     CXorOp -> promote expr Rust.Xor lhs rhs
     COrOp -> promote expr Rust.Or lhs rhs
-    CLndOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
-    CLorOp -> return Result { resultType = IsBool, isMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
+    CLndOp -> return Result { resultType = IsBool, resultMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
+    CLorOp -> return Result { resultType = IsBool, resultMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
     where
     shift op' = return Result
         { resultType = lhsTy
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = op' (castTo lhsTy lhs) (castTo rhsTy rhs)
         }
         where
@@ -2511,7 +2511,7 @@ compound expr returnOld demand op lhs rhs = do
     return $ case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
         b@(Rust.Block body Nothing) -> Result
             { resultType = IsVoid
-            , isMutable = Rust.Immutable
+            , resultMutable = Rust.Immutable
             , result = case body of
                 [Rust.Stmt e] -> e
                 _ -> Rust.BlockExpr b
@@ -2756,7 +2756,7 @@ promote
 promote node op a b = case usual (resultType a) (resultType b) of
     Just rt -> return Result
         { resultType = rt
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = op (castTo rt a) (castTo rt b)
         }
     Nothing -> badSource node $ concat
@@ -2815,7 +2815,7 @@ promotePtr node op a b = case (resultType a, resultType b) of
     ty = compatiblePtr (ptrOrVoid a) (ptrOrVoid b)
     ptrs = return Result
         { resultType = ty
-        , isMutable = Rust.Immutable
+        , resultMutable = Rust.Immutable
         , result = op (castTo ty a) (castTo ty b)
         }
 ```
