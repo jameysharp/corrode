@@ -83,14 +83,32 @@ type Environment = [(IdentKind, (Rust.Mutable, CType))]
 We'll come back to our internal representation of C types at the end of
 this module.
 
-C has several different namespaces for different kinds of names. For
-example, here is a legal snippet of C source, using the name `foo` in
-several different ways:
+C has three namespaces for variable, function, and type names:
+
+- field names, introduced inside `struct` or `union` definitions;
+- identifiers, introduced by declarations, which may be variables,
+  functions, or typedefs;
+- and tags, introduced with `struct <tag>`, `union <tag>`, or `enum
+  <tag>` (C99 section 6.7.2.3).
+
+For example, here is a legal snippet of C source, using the name `foo`
+in all three ways:
 
 ```c
 typedef struct foo { struct foo *foo; } foo;
-foo foo;
 ```
+
+Within a scope, names which are in the same namespace must refer to the
+same thing. For example, you can't declare both a `struct x` and an
+`enum x` in the same scope, because they both use the same tag.
+Similarly, you can't declare a `typedef` and a variable with the same
+name in the same scope, because both declare identifiers.
+
+Rust divides namespaces a different way. In Rust, types are in one
+namespace--not just `struct` and `enum` types, as in C, but also type
+aliases. Variables and functions are in another namespace. (Unit-like
+and tuple-like structs are actually in _both_ namespaces, though
+fortunately Corrode never generates those kinds of structs.)
 
 Fortunately, language-c does the hard work for us of disambiguating
 these different uses of identical-looking names. As we'll see later,
@@ -103,8 +121,7 @@ to label identifiers with their namespace.
 data IdentKind
     = SymbolIdent { identOfKind :: Ident }
     | TypedefIdent { identOfKind :: Ident }
-    | StructIdent { identOfKind :: Ident }
-    | EnumIdent { identOfKind :: Ident }
+    | TagIdent { identOfKind :: Ident }
     deriving Eq
 ```
 
@@ -1119,7 +1136,7 @@ zeroed out.
         return (Initializer Nothing (IntMap.fromList $ zip [0..] fields'))
     zeroInitializer IsEnum{} = unimplemented initial
     zeroInitializer (IsIncomplete ident) = do
-        (_, struct) <- getIdent (StructIdent ident)
+        (_, struct) <- getIdent (TagIdent ident)
         case struct of
             Just (_, ty'@IsStruct{}) -> zeroInitializer ty'
             _ -> badSource initial "initialization of incomplete type"
@@ -2186,7 +2203,7 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     fields <- case resultType obj' of
         IsStruct _ fields -> return fields
         IsIncomplete tyIdent -> do
-            (_, struct) <- getIdent (StructIdent tyIdent)
+            (_, struct) <- getIdent (TagIdent tyIdent)
             case struct of
                 Just (_, IsStruct _ fields) -> return fields
                 _ -> badSource expr "member access of incomplete type"
@@ -2950,7 +2967,7 @@ baseTypeOf specs = do
     go (CVoidType _) (mut, _) = return (mut, IsVoid)
     go (CBoolType _) (mut, _) = return (mut, IsBool)
     go (CSUType (CStruct CStructTag (Just ident) Nothing _ _) _) (mut, _) = do
-        (_name, mty) <- getIdent (StructIdent ident)
+        (_name, mty) <- getIdent (TagIdent ident)
         ty <- case mty of
             Just (_, ty) -> return ty
             Nothing -> emitIncomplete ident
@@ -2971,7 +2988,7 @@ baseTypeOf specs = do
         name <- case mident of
             Just ident -> do
                 let name = identToString ident
-                addIdent (StructIdent ident) (Rust.Immutable, IsStruct name fields)
+                addIdent (TagIdent ident) (Rust.Immutable, IsStruct name fields)
             Nothing -> uniqueName "Struct"
         let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
         emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
@@ -2985,7 +3002,7 @@ baseTypeOf specs = do
         ty <- emitIncomplete ident
         return (mut, ty)
     go spec@(CEnumType (CEnum (Just ident) Nothing _ _) _) (mut, _) = do
-        (_, mty) <- getIdent (EnumIdent ident)
+        (_, mty) <- getIdent (TagIdent ident)
         case mty of
             Just (_, ty) -> return (mut, ty)
             Nothing -> badSource spec "undefined enum"
@@ -2994,7 +3011,7 @@ baseTypeOf specs = do
         name <- case mident of
             Just ident -> do
                  let name = identToString ident
-                 addIdent (EnumIdent ident) (Rust.Immutable, IsEnum name)
+                 addIdent (TagIdent ident) (Rust.Immutable, IsEnum name)
             Nothing -> uniqueName "Enum"
         enums <- forM items $ \ (ident, mexpr) -> do
             enumName <- addIdent (SymbolIdent ident) (Rust.Immutable, IsEnum name)
