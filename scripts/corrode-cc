@@ -3,19 +3,49 @@
 import fnmatch
 import hashlib
 import os
+from pathlib import PurePath
 import subprocess
 import sys
 
-cflags = sys.argv[1:]
+cflags = []
+outfile = None
+depflags = []
+origflags = iter(sys.argv[1:])
+try:
+    while True:
+        flag = next(origflags)
+        if flag in ("-MD", "-MMD"):
+            depflags.append(flag[:-1])
+        elif flag.startswith("-M"):
+            depflags.append(flag)
+            if flag in ("-MF", "-MT", "-MQ"):
+                depflags.append(next(origflags))
+        elif flag == "-o":
+            outfile = next(origflags)
+        else:
+            cflags.append(flag)
+except StopIteration:
+    pass
+
+outflags = ['-o', outfile] if outfile is not None else []
+
+if "-M" in depflags or "-MM" in depflags:
+    depflags.extend(flag for flag in cflags if flag not in ('-c', '-S', '-E'))
+    result = subprocess.run(['gcc'] + depflags)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
 
 if '-c' in cflags:
     try:
-        [rsfile, outfile] = subprocess.run(
+        rsfile = subprocess.run(
             ['corrode'] + cflags,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True
-        ).stdout.splitlines()
+        ).stdout.splitlines()[0]
+
+        if outfile is None:
+            outfile = str(PurePath(rsfile).with_suffix(".o"))
 
         rustwarn = subprocess.run(
             ['rustc', '--crate-type=dylib', '--emit', 'obj', '-o', outfile, rsfile],
@@ -28,7 +58,7 @@ if '-c' in cflags:
         with open('errors-' + hashlib.md5(e.stderr).hexdigest(), 'wb') as f:
             f.write(e.stderr)
 
-        sys.exit(subprocess.run(['gcc'] + cflags).returncode)
+        sys.exit(subprocess.run(['gcc'] + outflags + cflags).returncode)
 else:
     sysroot = subprocess.run(
         ['rustc', '--print', 'sysroot'],
@@ -46,4 +76,4 @@ else:
 
     rustlibs = [ rustlibdir + fnmatch.filter(alllibs, pat)[0] for pat in needed ]
 
-    sys.exit(subprocess.run(['gcc'] + cflags + rustlibs + ['-lgcc_eh']).returncode)
+    sys.exit(subprocess.run(['gcc'] + outflags + cflags + rustlibs + ['-lgcc_eh']).returncode)
