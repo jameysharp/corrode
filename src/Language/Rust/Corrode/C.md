@@ -264,6 +264,21 @@ getSymbolIdent ident = lift $ do
             )))
         | w <- [16, 32, 64]
         ]
+        ++
+        [ ("__FILE__",
+            ("file!().as_ptr()",
+                Just (Rust.Immutable,
+                    IsFunc (IsPtr Rust.Immutable charType)
+                        [(Nothing, IsInt Unsigned (BitWidth 32))] False
+            )))
+        ,
+          ("__LINE__",
+            ("line!()",
+                Just (Rust.Immutable,
+                    IsFunc (IsInt Unsigned (BitWidth 32))
+                        [(Nothing, IsInt Unsigned (BitWidth 32))] False
+            )))
+        ]
 
 getTypedefIdent :: Ident -> EnvMonad (String, Maybe IntermediateType)
 getTypedefIdent ident = lift $ do
