@@ -268,15 +268,13 @@ getSymbolIdent ident = lift $ do
         [ ("__FILE__",
             ("file!().as_ptr()",
                 Just (Rust.Immutable,
-                    IsFunc (IsPtr Rust.Immutable charType)
-                        [(Nothing, IsInt Unsigned (BitWidth 32))] False
+                    IsPtr Rust.Immutable charType
             )))
         ,
           ("__LINE__",
             ("line!()",
                 Just (Rust.Immutable,
-                    IsFunc (IsInt Unsigned (BitWidth 32))
-                        [(Nothing, IsInt Unsigned (BitWidth 32))] False
+                    IsInt Unsigned (BitWidth 32)
             )))
         ]
 
