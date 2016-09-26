@@ -32,6 +32,7 @@ import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
 import Data.Char
 import Data.Foldable
+import qualified Data.Map.Lazy as Map
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
 import Data.Monoid
@@ -121,9 +122,8 @@ unnecessary code to deal with edge cases&mdash;see the case of
 ```haskell
 data Output = Output
     { outputItems :: [Rust.Item]
-    , outputExterns :: [(Rust.ExternItem, CType)]
+    , outputExterns :: Map.Map String Rust.ExternItem
     , outputIncomplete :: Set.Set String
-    , usesSymbols :: Set.Set String
     , usesTypes :: Set.Set String
     , usesBreak :: Any
     , usesContinue :: Any
@@ -150,7 +150,6 @@ For our output to be a monoid, it needs to specify
             { outputItems = mempty
             , outputExterns = mempty
             , outputIncomplete = mempty
-            , usesSymbols = mempty
             , usesTypes = mempty
             , usesBreak = mempty
             , usesContinue = mempty
@@ -165,7 +164,6 @@ For our output to be a monoid, it needs to specify
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
             , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
-            , usesSymbols = usesSymbols a `mappend` usesSymbols b
             , usesTypes = usesTypes a `mappend` usesTypes b
             , usesBreak = usesBreak a `mappend` usesBreak b
             , usesContinue = usesContinue a `mappend` usesContinue b
@@ -301,6 +299,7 @@ data EnvState = EnvState
     { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
     , typedefEnvironment :: [(Ident, IntermediateType)]
     , tagEnvironment :: [(Ident, CType)]
+    , externSymbols :: Map.Map Ident Rust.ExternItem
     , globalState :: GlobalState
     }
 ```
@@ -340,12 +339,18 @@ environment, and returns the type information we have for it, or
 
 ```haskell
 getSymbolIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
-getSymbolIdent ident = lift $ do
-    env <- gets symbolEnvironment
+getSymbolIdent ident = do
+    env <- lift get
     let name = applyRenames ident
-    return $ case lookup ident env of
-        Just ty -> (name, Just ty)
-        Nothing -> fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
+    case lookup ident (symbolEnvironment env) of
+        Just ty -> do
+            case Map.lookup ident (externSymbols env) of
+                Nothing -> return ()
+                Just extern -> do
+                    useType (snd ty)
+                    lift $ tell mempty { outputExterns = Map.singleton name extern }
+            return (name, Just ty)
+        Nothing -> return $ fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
     where
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w,
@@ -400,31 +405,24 @@ addTagIdent ident ty = lift $ do
 ```
 
 `addExternIdent` saves type information into the environment like
-`addIdent`, unless the ident is already there, in which case it verifies
-that the types are the same.
-
-It also adds to the output a list of functions or global variables which
-_may_ be declared in some other translation unit. (We can't tell when we
-see a C extern declaration whether it's just the prototype for a
-definition that we'll find later in the current translation unit, so
-there's a de-duplication pass at the end of `interpretTranslationUnit`.)
+`addSymbolIdent`. But external declarations are not immediately added to
+the output. Most declarations in header files go unused in any given
+translation unit so including them in the output is just clutter; and
+even if a declaration is used, this translation unit may have a
+non-`extern` definition of the same symbol, in which case we should only
+emit the full definition. So this function records which extern
+declaration _would_ be emitted if it turns out that we need it.
 
 ```haskell
 addExternIdent
-    :: (Pretty node, Pos node)
-    => node
-    -> Ident
+    :: Ident
     -> (Rust.Mutable, CType)
     -> (String -> Rust.ExternItem)
     -> EnvMonad ()
-addExternIdent node ident ty mkItem = do
-    (_, mty) <- getSymbolIdent ident
-    case mty of
-        Just oldTy -> when (ty /= oldTy) $ badSource node
-            ("redefinition, previously defined as " ++ show oldTy)
-        Nothing -> do
-            name <- addSymbolIdent ident ty
-            lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
+addExternIdent ident ty mkItem = do
+    name <- addSymbolIdent ident ty
+    lift $ modify $ \ st ->
+        st { externSymbols = Map.insert ident (mkItem name) (externSymbols st) }
 ```
 
 
@@ -514,6 +512,7 @@ Specifically, we:
         { symbolEnvironment = []
         , typedefEnvironment = []
         , tagEnvironment = []
+        , externSymbols = Map.empty
         , globalState = GlobalState
             { unique = 1
             }
@@ -579,11 +578,11 @@ for this translation unit it becomes clear.
         | item <- outputItems output
         ]
 
-    externName (Rust.ExternFn name _ _ _) = name
-    externName (Rust.ExternStatic _ (Rust.VarName name) _) = name
-    keepExtern name = name `Set.member` usesSymbols output && name `notElem` itemNames
-    externs = filter (keepExtern . externName . fst) (outputExterns output)
-    (externs', externTypes) = unzip externs
+    externs' =
+        [ extern
+        | (name, extern) <- Map.toList (outputExterns output)
+        , name `notElem` itemNames
+        ]
 ```
 
 If a type declaration isn't actually used by any of the other
@@ -595,7 +594,7 @@ translate headers containing types we can't yet translate, as long as
 those types aren't actually used.
 
 ```haskell
-    neededTypes = Set.unions (usesTypes output : map declaredNames externTypes)
+    neededTypes = usesTypes output
     keepItem (Rust.Item _ _ (Rust.Struct name _)) = name `Set.member` neededTypes
     keepItem (Rust.Item _ _ (Rust.Enum name _)) = name `Set.member` neededTypes
     keepItem _ = True
@@ -840,7 +839,7 @@ duplicates later.
                         | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
                         , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
                         ]
-                addExternIdent decl ident (mut, ty) $ \ name ->
+                addExternIdent ident (mut, ty) $ \ name ->
                     Rust.ExternFn name formals variadic (toRustRetType retTy)
                 return Nothing
 ```
@@ -851,7 +850,7 @@ prune duplicates later.
 
 ```haskell
             (Just (CExtern _), _, _) -> do
-                addExternIdent decl ident (mut, ty) $ \ name ->
+                addExternIdent ident (mut, ty) $ \ name ->
                     Rust.ExternStatic mut (Rust.VarName name) (toRustType ty)
                 return Nothing
 ```
@@ -2314,7 +2313,6 @@ interpretExpr _ expr@(CVar ident _) = do
                 , result = Rust.Path (Rust.PathSegments [enum, name])
                 }
         Just (mut, ty) -> do
-            lift $ tell mempty { usesSymbols = Set.singleton name }
             return Result
                 { resultType = ty
                 , resultMutable = mut
