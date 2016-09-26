@@ -69,63 +69,42 @@ results as we go through the translation.
 Intermediate data structures
 ============================
 
-One of the biggest challenges in correctly translating C to Rust is that
-we need to know what type C would give every expression, so we can
-ensure that the Rust equivalent uses the same types. To do that, we need
-to keep track of all the names that are currently in scope, along with
-their type information.
+The C language is defined such that a compiler can generate code in a
+single top-to-bottom pass through a translation unit. That is, any uses
+of a name must come after the point in the translation unit where that
+name is first declared.
 
-C has three namespaces for variable, function, and type names:
+That's convenient for us, because it means we can easily keep the
+environment in a "state monad", and emit the translated Rust items using
+a "writer monad". These are fancy terms for objects that have some
+simple operations.
 
-- field names, introduced inside `struct` or `union` definitions;
-- identifiers, introduced by declarations, which may be variables,
-  functions, or typedefs;
-- and tags, introduced with `struct <tag>`, `union <tag>`, or `enum
-  <tag>` (C99 section 6.7.2.3).
+- The state monad has `get`, `put`, and `modify` operations that we use
+  to query or update the current enviroment.
+- The writer monad has a `tell` operation we use to add new Rust items
+  to the output.
 
-For example, here is a legal snippet of C source, using the name `foo`
-in all three ways:
+Actually, we use a combined type, `RWS`, which supports the operations
+of reader, writer, and state monads all in one. We use the reader monad
+for control flow context, which is covered in more detail in the section
+on statements, below.
 
-```c
-typedef struct foo { struct foo *foo; } foo;
-```
-
-Within a scope, names which are in the same namespace must refer to the
-same thing. For example, you can't declare both a `struct x` and an
-`enum x` in the same scope, because they both use the same tag.
-Similarly, you can't declare a `typedef` and a variable with the same
-name in the same scope, because both declare identifiers.
-
-Rust divides namespaces a different way. In Rust, types are in one
-namespace--not just `struct` and `enum` types, as in C, but also type
-aliases. Variables and functions are in another namespace. (Unit-like
-and tuple-like structs are actually in _both_ namespaces, though
-fortunately Corrode never generates those kinds of structs.)
-
-Fortunately, language-c does the hard work for us of disambiguating
-these different uses of identical-looking names. As we'll see later,
-whenever an identifier occurs, we can tell which namespace to use for it
-from the AST context in which it appeared.
-
-We'll come back to our internal representation of C types at the end of
-this module.
-
-Sometimes we need to construct a unique name, because the Rust pattern
-we want to generate requires a name someplace where C did not require
-one. We'll follow a standard pattern for this and just generate a unique
-number each time we need a new name.
-
-Then, we can package together all of the state we'd like to thread around
-our program while translating.
+You probably don't need to read any of the awful monad tutorials out
+there just to use these! The important point is that we have this type
+alias, `EnvMonad`, which you'll see throughout this module. It marks
+pieces of code which have access to the environment and the output.
 
 ```haskell
-data EnvState = EnvState
-    { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
-    , typedefEnvironment :: [(Ident, IntermediateType)]
-    , tagEnvironment :: [(Ident, CType)]
-    , unique :: Int
-    }
+type EnvMonad = ExceptT String (RWS ControlFlow Output EnvState)
 ```
+
+In fact, we're going to wrap up the monad operations in some helper
+functions, and then only use those helpers everywhere else. But first,
+let's define our state and writer types.
+
+
+Output
+------
 
 As we proceed through the C source, we'll accumulate Rust definitions
 that we want to include in the final output. This type simply holds any
@@ -193,37 +172,150 @@ For our output to be a monoid, it needs to specify
             }
     ```
 
-The C language is defined such that a compiler can generate code in a
-single top-to-bottom pass through a translation unit. That is, any uses
-of a name must come after the point in the translation unit where that
-name is first declared.
-
-That's convenient for us, because it means we can easily keep the
-environment in a "state monad", and emit the translated Rust items using
-a "writer monad". These are fancy terms for objects that have some
-simple operations.
-
-- The state monad has `get`, `put`, and `modify` operations that we use
-  to query or update the current enviroment.
-- The writer monad has a `tell` operation we use to add new Rust items
-  to the output.
-
-Actually, we use a combined type, `RWS`, which supports the operations
-of reader, writer, and state monads all in one. We use the reader monad
-for control flow context, which is covered in more detail in the section
-on statements, below.
-
-You probably don't need to read any of the awful monad tutorials out
-there just to use these! The important point is that we have this type
-alias, `EnvMonad`, which you'll see throughout this module. It marks
-pieces of code which have access to the environment and the output.
+`emitItems` adds a list of Rust items to the output.
 
 ```haskell
-type EnvMonad = ExceptT String (RWS ControlFlow Output EnvState)
+emitItems :: [Rust.Item] -> EnvMonad ()
+emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
-In fact, we're going to wrap up the monad operations in some helper
-functions, and then only use these helpers everywhere else.
+```haskell
+useType :: CType -> EnvMonad ()
+useType ty = lift $ tell mempty { usesTypes = declaredNames ty }
+```
+
+`emitIncomplete` records that we saw an incomplete type. For our
+purposes, an incomplete type is anything with a definition we can't
+translate, but we can still allow pointers to values of this type as
+long as nobody tries dereferencing those pointers.
+
+```haskell
+emitIncomplete :: Ident -> EnvMonad CType
+emitIncomplete ident = do
+    lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
+    return (IsIncomplete ident)
+```
+
+`recordBreak`/`recordContinue` take note of the presence of a `break`/
+`continue`:
+
+```haskell
+recordBreak :: EnvMonad ()
+recordBreak = lift $ tell mempty { usesBreak = Any True }
+
+recordContinue :: EnvMonad ()
+recordContinue = lift $ tell mempty { usesContinue = Any True }
+```
+
+
+Global state
+------------
+
+The above `Output` type, used in the writer monad, accumulates
+bottom-up, from the leaves of the AST upward. So as we translate a
+particular expression, say, we can look at the output from its
+subexpressions, but we aren't allowed to examine any output from
+adjacent expressions, statements, or functions.
+
+By contrast, sometimes we need to look at information we computed from
+arbitrary places earlier in the source code. For that we'll use a state
+monad to save whatever we might need later.
+
+Let's divide state into two categories: what we'll call "global" and
+"scope-limited" state. Changes to scope-limited state, covered below,
+get undone whenever we leave the C scope that caused those changes.
+Global state, on the other hand, is permanent.
+
+Sometimes we need to construct a unique name, because the Rust pattern
+we want to generate requires a name someplace where C did not require
+one. We'll follow a standard idiom for this and just generate a unique
+number each time we need a new name.
+
+```haskell
+newtype GlobalState = GlobalState
+    { unique :: Int
+    }
+```
+
+`uniqueName` generates a new name with the given base and a new unique
+number:
+
+```haskell
+uniqueName :: String -> EnvMonad String
+uniqueName base = modifyGlobal $ \ st ->
+    (st { unique = unique st + 1 }, base ++ show (unique st))
+```
+
+
+Scope-limited state
+-------------------
+
+One of the biggest challenges in correctly translating C to Rust is that
+we need to know what type C would give every expression, so we can
+ensure that the Rust equivalent uses the same types. To do that, we need
+to keep track of all the names that are currently in scope, along with
+their type information.
+
+C has three namespaces for variable, function, and type names:
+
+- field names, introduced inside `struct` or `union` definitions;
+- identifiers, introduced by declarations, which may be variables,
+  functions, or typedefs;
+- and tags, introduced with `struct <tag>`, `union <tag>`, or `enum
+  <tag>` (C99 section 6.7.2.3).
+
+For example, here is a legal snippet of C source, using the name `foo`
+in all three ways:
+
+```c
+typedef struct foo { struct foo *foo; } foo;
+```
+
+Within a scope, names which are in the same namespace must refer to the
+same thing. For example, you can't declare both a `struct x` and an
+`enum x` in the same scope, because they both use the same tag.
+Similarly, you can't declare a `typedef` and a variable with the same
+name in the same scope, because both declare identifiers.
+
+Rust divides namespaces a different way. In Rust, types are in one
+namespace--not just `struct` and `enum` types, as in C, but also type
+aliases. Variables and functions are in another namespace. (Unit-like
+and tuple-like structs are actually in _both_ namespaces, though
+fortunately Corrode never generates those kinds of structs.)
+
+Fortunately, language-c does the hard work for us of disambiguating
+these different uses of identical-looking names. As we'll see later,
+whenever an identifier occurs, we can tell which namespace to use for it
+from the AST context in which it appeared.
+
+We'll come back to our internal representation of C types at the end of
+this module.
+
+The identifiers, typedefs, and tags that are visible at any given point
+in the program are limited by C's scoping rules. We package them up into
+a type. This type also carries a reference to the `GlobalState` value
+defined above.
+
+```haskell
+data EnvState = EnvState
+    { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
+    , typedefEnvironment :: [(Ident, IntermediateType)]
+    , tagEnvironment :: [(Ident, CType)]
+    , globalState :: GlobalState
+    }
+```
+
+`modifyGlobal` updates the global state according to a specified
+transformation, and returns a value computed by that transformation.
+
+```haskell
+modifyGlobal :: (GlobalState -> (GlobalState, a)) -> EnvMonad a
+modifyGlobal f = lift $ do
+    st <- get
+    let (global', a) = f (globalState st)
+    put st { globalState = global' }
+    return a
+```
 
 Some names are special in C or special in Rust, or both. We rename those
 as we encounter them. At the moment, only `main` gets this special
@@ -242,9 +334,9 @@ applyRenames ident = case identToString ident of
     name -> name
 ```
 
-`getIdent` looks up a name from the given namespace in the environment,
-and returns the type information we have for it, or `Nothing` if we
-haven't seen a declaration for that name yet.
+`get*Ident` looks up a name from the appropriate namespace in the
+environment, and returns the type information we have for it, or
+`Nothing` if we haven't seen a declaration for that name yet.
 
 ```haskell
 getSymbolIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
@@ -289,7 +381,7 @@ getTagIdent ident = lift $ do
     return $ lookup ident env
 ```
 
-`addIdent` saves type information into the environment.
+`add*Ident` saves type information into the environment.
 
 ```haskell
 addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad String
@@ -305,29 +397,6 @@ addTagIdent :: Ident -> CType -> EnvMonad String
 addTagIdent ident ty = lift $ do
     modify $ \ st -> st { tagEnvironment = (ident, ty) : tagEnvironment st }
     return (identToString ident)
-```
-
-`uniqueName` generates a new name with the given base and a new unique
-number:
-
-```haskell
-uniqueName :: String -> EnvMonad String
-uniqueName base = lift $ do
-    st <- get
-    put (st { unique = unique st + 1 })
-    return (base ++ show (unique st))
-```
-
-`emitItems` adds a list of Rust items to the output.
-
-```haskell
-emitItems :: [Rust.Item] -> EnvMonad ()
-emitItems items = lift $ tell mempty { outputItems = items }
-```
-
-```haskell
-useType :: CType -> EnvMonad ()
-useType ty = lift $ tell mempty { usesTypes = declaredNames ty }
 ```
 
 `addExternIdent` saves type information into the environment like
@@ -356,29 +425,6 @@ addExternIdent node ident ty mkItem = do
         Nothing -> do
             name <- addSymbolIdent ident ty
             lift $ tell mempty { outputExterns = [(mkItem name, snd ty)] }
-```
-
-`emitIncomplete` records that we saw an incomplete type. For our
-purposes, an incomplete type is anything with a definition we can't
-translate, but we can still allow pointers to values of this type as
-long as nobody tries dereferencing those pointers.
-
-```haskell
-emitIncomplete :: Ident -> EnvMonad CType
-emitIncomplete ident = do
-    lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
-    return (IsIncomplete ident)
-```
-
-`recordBreak`/`recordContinue` take note of the presence of a `break`/
-`continue`:
-
-```haskell
-recordBreak :: EnvMonad ()
-recordBreak = lift $ tell mempty { usesBreak = Any True }
-
-recordContinue :: EnvMonad ()
-recordContinue = lift $ tell mempty { usesContinue = Any True }
 ```
 
 
@@ -468,7 +514,9 @@ Specifically, we:
         { symbolEnvironment = []
         , typedefEnvironment = []
         , tagEnvironment = []
-        , unique = 1
+        , globalState = GlobalState
+            { unique = 1
+            }
         }
     (err, _, output) = runRWS (runExceptT (mapM_ perDecl decls)) initFlow initState
 ```
@@ -1857,7 +1905,7 @@ statementsToBlock stmts = Rust.Block stmts Nothing
 
 `scope` runs the translation steps in `m`, but then throws away any
 changes that `m` made to the environment. Any items added to the output
-are kept, though.
+are kept, though, as are any global state changes.
 
 ```haskell
 scope :: EnvMonad a -> EnvMonad a
@@ -1866,11 +1914,7 @@ scope m = do
     old <- lift get
     a <- m
     -- Restore the environment to its state before running m.
-    lift (modify (\ st -> st
-        { symbolEnvironment = symbolEnvironment old
-        , typedefEnvironment = typedefEnvironment old
-        , tagEnvironment = tagEnvironment old
-        }))
+    lift (modify (\ st -> old { globalState = globalState st }))
     return a
 ```
 
