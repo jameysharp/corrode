@@ -504,9 +504,9 @@ Specifically, we:
 
 ```haskell
     initFlow = ControlFlow
-        { functionReturnType = flip badSource "return statement outside function"
-        , onBreak = flip badSource "break outside loop"
-        , onContinue = flip badSource "continue outside loop"
+        { functionReturnType = Nothing
+        , onBreak = Nothing
+        , onContinue = Nothing
         }
     initState = EnvState
         { symbolEnvironment = []
@@ -1297,7 +1297,7 @@ Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
 ```haskell
-    let setRetTy flow = flow { functionReturnType = const (return retTy) }
+    let setRetTy flow = flow { functionReturnType = Just retTy }
     mapExceptT (local setRetTy) $ scope $ do
 ```
 
@@ -1559,9 +1559,9 @@ that context up in a simple data type.
 
 ```haskell
 data ControlFlow = ControlFlow
-    { functionReturnType :: CStat -> EnvMonad CType
-    , onBreak :: CStat -> EnvMonad Rust.Expr
-    , onContinue :: CStat -> EnvMonad Rust.Expr
+    { functionReturnType :: Maybe CType
+    , onBreak :: Maybe Rust.Expr
+    , onContinue :: Maybe Rust.Expr
     }
 ```
 
@@ -1809,8 +1809,8 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = recordContinue >> pure . Rust.Stmt <$> getFlow stmt onContinue
-interpretStatement stmt@(CBreak _) = recordBreak >> pure . Rust.Stmt <$> getFlow stmt onBreak
+interpretStatement stmt@(CCont _) = recordContinue >> pure . Rust.Stmt <$> getFlow stmt "continue outside loop" onContinue
+interpretStatement stmt@(CBreak _) = recordBreak >> pure . Rust.Stmt <$> getFlow stmt "break outside loop" onBreak
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1822,7 +1822,7 @@ type.
 
 ```haskell
 interpretStatement stmt@(CReturn expr _) = do
-    retTy <- getFlow stmt functionReturnType
+    retTy <- getFlow stmt "return statement outside function" functionReturnType
     expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
     return [Rust.Stmt (Rust.Return expr')]
 ```
@@ -1836,16 +1836,16 @@ translation for yet.
 interpretStatement stmt = unimplemented stmt
 ```
 
-The fields in `ControlFlow` are monadic actions which take a C statement
-as an argument, so that if there's an error we can report which
-statement was at fault. `getFlow` is a helper function to thread
-everything through correctly.
+The fields in `ControlFlow` aren't always valid. `getFlow` is a helper
+function that checks whether the requested control-flow fact is
+currently valid, returning it if so, or reporting a syntax error on the
+offending statement otherwise.
 
 ```haskell
-getFlow :: CStat -> (ControlFlow -> CStat -> EnvMonad a) -> EnvMonad a
-getFlow stmt kind = do
+getFlow :: CStat -> String -> (ControlFlow -> Maybe a) -> EnvMonad a
+getFlow stmt msg kind = do
     val <- lift (asks kind)
-    val stmt
+    maybe (badSource stmt msg) return val
 ```
 
 Inside loops above, we needed to update the translation to use if either
@@ -1860,7 +1860,7 @@ loopScope b c =
     mapExceptT (censor (\ output -> output { usesBreak = mempty, usesContinue = mempty })) .
     liftListen (listens (\ output -> (usesBreak output, usesContinue output))) .
     mapExceptT (local (\ flow ->
-        flow { onBreak = const (return b), onContinue = const (return c) }))
+        flow { onBreak = Just b, onContinue = Just c }))
 ```
 
 
