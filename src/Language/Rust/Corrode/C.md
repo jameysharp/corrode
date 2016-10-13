@@ -27,6 +27,7 @@ useful data structures and control flow abstractions.
 module Language.Rust.Corrode.C (interpretTranslationUnit) where
 
 import Control.Monad
+import Control.Monad.ST
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
@@ -37,6 +38,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
 import Data.Monoid
 import Data.List
+import Data.STRef
 import qualified Data.Set as Set
 import Language.C
 import Language.C.Data.Ident
@@ -96,7 +98,7 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad = ExceptT String (RWS ControlFlow Output EnvState)
+type EnvMonad s = ExceptT String (RWST ControlFlow Output (EnvState s) (ST s))
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
@@ -173,12 +175,12 @@ For our output to be a monoid, it needs to specify
 `emitItems` adds a list of Rust items to the output.
 
 ```haskell
-emitItems :: [Rust.Item] -> EnvMonad ()
+emitItems :: [Rust.Item] -> EnvMonad s ()
 emitItems items = lift $ tell mempty { outputItems = items }
 ```
 
 ```haskell
-useType :: CType -> EnvMonad ()
+useType :: CType -> EnvMonad s ()
 useType ty = lift $ tell mempty { usesTypes = declaredNames ty }
 ```
 
@@ -188,7 +190,7 @@ translate, but we can still allow pointers to values of this type as
 long as nobody tries dereferencing those pointers.
 
 ```haskell
-emitIncomplete :: Ident -> EnvMonad CType
+emitIncomplete :: Ident -> EnvMonad s CType
 emitIncomplete ident = do
     lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
     return (IsIncomplete ident)
@@ -198,10 +200,10 @@ emitIncomplete ident = do
 `continue`:
 
 ```haskell
-recordBreak :: EnvMonad ()
+recordBreak :: EnvMonad s ()
 recordBreak = lift $ tell mempty { usesBreak = Any True }
 
-recordContinue :: EnvMonad ()
+recordContinue :: EnvMonad s ()
 recordContinue = lift $ tell mempty { usesContinue = Any True }
 ```
 
@@ -239,7 +241,7 @@ newtype GlobalState = GlobalState
 number:
 
 ```haskell
-uniqueName :: String -> EnvMonad String
+uniqueName :: String -> EnvMonad s String
 uniqueName base = modifyGlobal $ \ st ->
     (st { unique = unique st + 1 }, base ++ show (unique st))
 ```
@@ -295,11 +297,10 @@ a type. This type also carries a reference to the `GlobalState` value
 defined above.
 
 ```haskell
-data EnvState = EnvState
-    { symbolEnvironment :: [(Ident, (Rust.Mutable, CType))]
+data EnvState s = EnvState
+    { symbolEnvironment :: [(Ident, EnvMonad s (Rust.Mutable, CType))]
     , typedefEnvironment :: [(Ident, IntermediateType)]
     , tagEnvironment :: [(Ident, CType)]
-    , externSymbols :: Map.Map Ident Rust.ExternItem
     , globalState :: GlobalState
     }
 ```
@@ -308,7 +309,7 @@ data EnvState = EnvState
 transformation, and returns a value computed by that transformation.
 
 ```haskell
-modifyGlobal :: (GlobalState -> (GlobalState, a)) -> EnvMonad a
+modifyGlobal :: (GlobalState -> (GlobalState, a)) -> EnvMonad s a
 modifyGlobal f = lift $ do
     st <- get
     let (global', a) = f (globalState st)
@@ -338,17 +339,13 @@ environment, and returns the type information we have for it, or
 `Nothing` if we haven't seen a declaration for that name yet.
 
 ```haskell
-getSymbolIdent :: Ident -> EnvMonad (String, Maybe (Rust.Mutable, CType))
+getSymbolIdent :: Ident -> EnvMonad s (String, Maybe (Rust.Mutable, CType))
 getSymbolIdent ident = do
     env <- lift get
     let name = applyRenames ident
     case lookup ident (symbolEnvironment env) of
-        Just ty -> do
-            case Map.lookup ident (externSymbols env) of
-                Nothing -> return ()
-                Just extern -> do
-                    useType (snd ty)
-                    lift $ tell mempty { outputExterns = Map.singleton name extern }
+        Just symbol -> do
+            ty <- symbol
             return (name, Just ty)
         Nothing -> return $ fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
     where
@@ -375,12 +372,12 @@ getSymbolIdent ident = do
             )))
         ]
 
-getTypedefIdent :: Ident -> EnvMonad (String, Maybe IntermediateType)
+getTypedefIdent :: Ident -> EnvMonad s (String, Maybe IntermediateType)
 getTypedefIdent ident = lift $ do
     env <- gets typedefEnvironment
     return (identToString ident, lookup ident env)
 
-getTagIdent :: Ident -> EnvMonad (Maybe CType)
+getTagIdent :: Ident -> EnvMonad s (Maybe CType)
 getTagIdent ident = lift $ do
     env <- gets tagEnvironment
     return $ lookup ident env
@@ -389,16 +386,21 @@ getTagIdent ident = lift $ do
 `add*Ident` saves type information into the environment.
 
 ```haskell
-addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad String
-addSymbolIdent ident ty = lift $ do
-    modify $ \ st -> st { symbolEnvironment = (ident, ty) : symbolEnvironment st }
+addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad s String
+addSymbolIdent ident ty = do
+    addSymbolIdentAction ident (const (return ty))
     return (applyRenames ident)
 
-addTypedefIdent :: Ident -> IntermediateType -> EnvMonad ()
+addSymbolIdentAction :: Ident -> (String -> EnvMonad s (Rust.Mutable, CType)) -> EnvMonad s ()
+addSymbolIdentAction ident action = lift $ do
+    let name = applyRenames ident
+    modify $ \ st -> st { symbolEnvironment = (ident, action name) : symbolEnvironment st }
+
+addTypedefIdent :: Ident -> IntermediateType -> EnvMonad s ()
 addTypedefIdent ident ty = lift $ do
     modify $ \ st -> st { typedefEnvironment = (ident, ty) : typedefEnvironment st }
 
-addTagIdent :: Ident -> CType -> EnvMonad String
+addTagIdent :: Ident -> CType -> EnvMonad s String
 addTagIdent ident ty = lift $ do
     modify $ \ st -> st { tagEnvironment = (ident, ty) : tagEnvironment st }
     return (identToString ident)
@@ -418,11 +420,16 @@ addExternIdent
     :: Ident
     -> (Rust.Mutable, CType)
     -> (String -> Rust.ExternItem)
-    -> EnvMonad ()
+    -> EnvMonad s ()
 addExternIdent ident ty mkItem = do
-    name <- addSymbolIdent ident ty
-    lift $ modify $ \ st ->
-        st { externSymbols = Map.insert ident (mkItem name) (externSymbols st) }
+    doneRef <- lift $ lift $ newSTRef False
+    addSymbolIdentAction ident $ \ name -> do
+        done <- lift $ lift $ readSTRef doneRef
+        unless done $ do
+            lift $ lift $ writeSTRef doneRef True
+            useType (snd ty)
+            lift $ tell mempty { outputExterns = Map.singleton name (mkItem name) }
+        return ty
 ```
 
 
@@ -434,7 +441,7 @@ Corrode can't translate to Rust, and we should report as much helpful
 explanation as possible when that happens.
 
 ```haskell
-noTranslation :: (Pretty node, Pos node) => node -> String -> EnvMonad a
+noTranslation :: (Pretty node, Pos node) => node -> String -> EnvMonad s a
 noTranslation node msg = throwE $ concat
     [ show (posOf node)
     , ": "
@@ -448,7 +455,7 @@ In some cases, we should be able to translate the given input, but the
 translation just hasn't been implemented yet.
 
 ```haskell
-unimplemented :: (Pretty node, Pos node) => node -> EnvMonad a
+unimplemented :: (Pretty node, Pos node) => node -> EnvMonad s a
 unimplemented node = noTranslation node "Corrode doesn't handle this yet"
 ```
 
@@ -457,7 +464,7 @@ syntactically valid. Corrode does not promise to detect all of these
 cases, but we can call `badSource` when we do detect such an error.
 
 ```haskell
-badSource :: (Pretty node, Pos node) => node -> String -> EnvMonad a
+badSource :: (Pretty node, Pos node) => node -> String -> EnvMonad s a
 badSource node msg = noTranslation node
     ("illegal " ++ msg ++ "; check whether a real C compiler accepts this")
 ```
@@ -512,12 +519,11 @@ Specifically, we:
         { symbolEnvironment = []
         , typedefEnvironment = []
         , tagEnvironment = []
-        , externSymbols = Map.empty
         , globalState = GlobalState
             { unique = 1
             }
         }
-    (err, _, output) = runRWS (runExceptT (mapM_ perDecl decls)) initFlow initState
+    (err, output) = runST (evalRWST (runExceptT (mapM_ perDecl decls)) initFlow initState)
 ```
 
 With the initial environment set up, we can descend to the next level of
@@ -751,7 +757,7 @@ declaration. It returns a list of bindings constructed using
 `MakeBinding`, and also updates the environment and output as needed.
 
 ```haskell
-interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad [b]
+interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad s [b]
 interpretDeclarations (fromItem, makeBinding) declaration@(CDecl specs decls _) = do
 ```
 
@@ -900,7 +906,7 @@ to initialize and the C initializer, produce a Rust expression that
 corresponds to the C expression that would have been initialized:
 
 ```haskell
-interpretInitializer :: CType -> CInit -> EnvMonad Rust.Expr
+interpretInitializer :: CType -> CInit -> EnvMonad s Rust.Expr
 ```
 
 Unfortunately, we have to delay the actual implementation of this
@@ -1001,12 +1007,12 @@ Then, given a list of designators and the type we are currently in, we can
 compute the most general possible current object.
 
 ```haskell
-objectFromDesignators :: CType -> [CDesignator] -> EnvMonad CurrentObject
+objectFromDesignators :: CType -> [CDesignator] -> EnvMonad s CurrentObject
 objectFromDesignators _ [] = pure Nothing
 objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
     where
 
-    go :: CType -> [CDesignator] -> Designator -> EnvMonad Designator
+    go :: CType -> [CDesignator] -> Designator -> EnvMonad s Designator
     go _ [] obj = pure obj
     go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
         case span (\ (field, _) -> identToString ident /= field) fields of
@@ -1073,7 +1079,7 @@ When we have a list of expressions, we start by parsing all of the
 designators into our internal representation.
 
 ```haskell
-translateInitList :: CType -> CInitList -> EnvMonad Initializer
+translateInitList :: CType -> CInitList -> EnvMonad s Initializer
 translateInitList ty list = do
 
     objectsAndInitializers <- forM list $ \ (desigs, initial) -> do
@@ -1126,7 +1132,7 @@ initialized.
 resolveCurrentObject
     :: (CurrentObject, Initializer)
     -> (CurrentObject, CInit)
-    -> EnvMonad (CurrentObject, Initializer)
+    -> EnvMonad s (CurrentObject, Initializer)
 resolveCurrentObject (obj0, prior) (obj1, cinitial) = case obj1 `mplus` obj0 of
     Nothing -> return (Nothing, prior)
     Just obj -> do
@@ -1240,7 +1246,7 @@ Function definitions
 A C function definition translates to a single Rust item.
 
 ```haskell
-interpretFunction :: CFunDef -> EnvMonad Rust.Item
+interpretFunction :: CFunDef -> EnvMonad s Rust.Item
 interpretFunction (CFunDef specs declr@(CDeclr mident _ _ _ _) _ body _) = do
 ```
 
@@ -1369,7 +1375,7 @@ above) and emit a wrapper function that gets the command line arguments
 and environment and passes them to the renamed `main`.
 
 ```haskell
-wrapMain :: CDeclr -> String -> [CType] -> EnvMonad ()
+wrapMain :: CDeclr -> String -> [CType] -> EnvMonad s ()
 wrapMain declr realName argTypes = do
 ```
 
@@ -1572,7 +1578,7 @@ just a Rust expression), we end up being able to get rid of superfluous
 curly braces.
 
 ```haskell
-interpretStatement :: CStat -> EnvMonad [Rust.Stmt]
+interpretStatement :: CStat -> EnvMonad s [Rust.Stmt]
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -1842,7 +1848,7 @@ currently valid, returning it if so, or reporting a syntax error on the
 offending statement otherwise.
 
 ```haskell
-getFlow :: CStat -> String -> (ControlFlow -> Maybe a) -> EnvMonad a
+getFlow :: CStat -> String -> (ControlFlow -> Maybe a) -> EnvMonad s a
 getFlow stmt msg kind = do
     val <- lift (asks kind)
     maybe (badSource stmt msg) return val
@@ -1855,7 +1861,7 @@ expressions. It also keeps track of whether those constructs ended up being
 used.
 
 ```haskell
-loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad a -> EnvMonad (a, (Any, Any))
+loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad s a -> EnvMonad s (a, (Any, Any))
 loopScope b c =
     mapExceptT (censor (\ output -> output { usesBreak = mempty, usesContinue = mempty })) .
     liftListen (listens (\ output -> (usesBreak output, usesContinue output))) .
@@ -1872,7 +1878,7 @@ as well as nested statements. `interpretBlockItem` produces a sequence
 of zero or more Rust statements for each compound block item.
 
 ```haskell
-interpretBlockItem :: CBlockItem -> EnvMonad [Rust.Stmt]
+interpretBlockItem :: CBlockItem -> EnvMonad s [Rust.Stmt]
 interpretBlockItem (CBlockStmt stmt) = interpretStatement stmt
 interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
 interpretBlockItem item = unimplemented item
@@ -1907,7 +1913,7 @@ changes that `m` made to the environment. Any items added to the output
 are kept, though, as are any global state changes.
 
 ```haskell
-scope :: EnvMonad a -> EnvMonad a
+scope :: EnvMonad s a -> EnvMonad s a
 scope m = do
     -- Save the current environment.
     old <- lift get
@@ -1950,7 +1956,7 @@ expressions, we have to generate extra Rust code if the result is
 needed.
 
 ```haskell
-interpretExpr :: Bool -> CExpr -> EnvMonad Result
+interpretExpr :: Bool -> CExpr -> EnvMonad s Result
 ```
 
 C's comma operator evaluates its left-hand expressions for their side
@@ -2498,7 +2504,7 @@ wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
     _ -> r
 wrapping r = r
 
-binop :: CExpr -> CBinaryOp -> Result -> Result -> EnvMonad Result
+binop :: CExpr -> CBinaryOp -> Result -> Result -> EnvMonad s Result
 binop expr op lhs rhs = fmap wrapping $ case op of
     CMulOp -> promote expr Rust.Mul lhs rhs
     CDivOp -> promote expr Rust.Div lhs rhs
@@ -2542,7 +2548,7 @@ isSimple (Rust.Var{}) = True
 isSimple (Rust.Deref p) = isSimple p
 isSimple _ = False
 
-compound :: CExpr -> Bool -> Bool -> CAssignOp -> Result -> Result -> EnvMonad Result
+compound :: CExpr -> Bool -> Bool -> CAssignOp -> Result -> Result -> EnvMonad s Result
 compound expr returnOld demand op lhs rhs = do
     let op' = case op of
             CAssignOp -> Nothing
@@ -2834,7 +2840,7 @@ promote
     :: (Pretty node, Pos node)
     => node
     -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> Result -> Result -> EnvMonad Result
+    -> Result -> Result -> EnvMonad s Result
 promote node op a b = case usual (resultType a) (resultType b) of
     Just rt -> return Result
         { resultType = rt
@@ -2885,7 +2891,7 @@ promotePtr
     :: (Pretty node, Pos node)
     => node
     -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
-    -> Result -> Result -> EnvMonad Result
+    -> Result -> Result -> EnvMonad s Result
 promotePtr node op a b = case (resultType a, resultType b) of
     (IsPtr _ _, _) -> ptrs
     (_, IsPtr _ _) -> ptrs
@@ -3052,7 +3058,7 @@ process we add any nested declarations of new `struct`, `union`, or
 `enum` types to the environment.
 
 ```haskell
-baseTypeOf :: [CDeclSpec] -> EnvMonad (Maybe CStorageSpec, IntermediateType)
+baseTypeOf :: [CDeclSpec] -> EnvMonad s (Maybe CStorageSpec, IntermediateType)
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
     let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
@@ -3253,7 +3259,7 @@ there and modify it according to whatever type specifiers are present.
 ```haskell
     singleSpec other = foldrM arithmetic (IsInt Signed (BitWidth 32)) other
 
-    arithmetic :: CTypeSpec -> CType -> EnvMonad CType
+    arithmetic :: CTypeSpec -> CType -> EnvMonad s CType
     arithmetic (CSignedType _) (IsInt _ width) = return (IsInt Signed width)
     arithmetic (CUnsigType _) (IsInt _ width) = return (IsInt Unsigned width)
     arithmetic (CCharType _) _ = return charType
@@ -3272,7 +3278,7 @@ simple type in zero or more derived types, each of which can be a
 pointer, an array, or a function type.
 
 ```haskell
-derivedTypeOf :: IntermediateType -> CDeclr -> EnvMonad IntermediateType
+derivedTypeOf :: IntermediateType -> CDeclr -> EnvMonad s IntermediateType
 derivedTypeOf basetype declr@(CDeclr _ derived _ _ _) = foldrM derive basetype derived
     where
 ```
@@ -3348,7 +3354,7 @@ Several places above need to check whether any type qualifiers are
 mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
-typeName :: CDecl -> EnvMonad (Rust.Mutable, CType)
+typeName :: CDecl -> EnvMonad s (Rust.Mutable, CType)
 typeName decl@(CDecl spec declarators _) = do
     (storage, base) <- baseTypeOf spec
     case storage of
