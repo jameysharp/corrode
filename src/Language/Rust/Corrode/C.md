@@ -520,9 +520,7 @@ the abstract syntax tree, where the language-c types tell us there are
 three possible kinds for each declaration:
 
 ```haskell
-    perDecl (CFDefExt f) = do
-        f' <- interpretFunction f
-        emitItems [f']
+    perDecl (CFDefExt f) = interpretFunction f
     perDecl (CDeclExt decl') = do
         binds <- interpretDeclarations makeStaticBinding decl'
         emitItems binds
@@ -1236,7 +1234,7 @@ Function definitions
 A C function definition translates to a single Rust item.
 
 ```haskell
-interpretFunction :: CFunDef -> EnvMonad s Rust.Item
+interpretFunction :: CFunDef -> EnvMonad s ()
 interpretFunction (CFunDef specs declr@(CDeclr mident _ _ _ _) _ body _) = do
 ```
 
@@ -1256,44 +1254,31 @@ function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    IntermediateType
-        { typeIsFunc = isFunc
-        , typeRep = funTy } <- derivedTypeOf baseTy declr
+    let go name (_mut, funTy) = do
 ```
 
-This must be a function type, not a function pointer or a non-function.
 Definitions of variadic functions are not allowed because Rust does not
 support them.
 
 ```haskell
-    unless isFunc (badSource declr "function definition")
-    (retTy, args) <- case funTy of
-        IsFunc _ _ True -> unimplemented declr
-        IsFunc retTy args False -> return (retTy, args)
-        _ -> badSource declr "function definition"
-```
-
-Add this function to the globals before evaluating its body so recursive
-calls work. (Note that function definitions can't be anonymous.)
-
-```haskell
-    name <- case mident of
-        Nothing -> badSource declr "anonymous function definition"
-        Just ident -> addSymbolIdent ident (Rust.Mutable, funTy)
+            (retTy, args) <- case funTy of
+                IsFunc _ _ True -> unimplemented declr
+                IsFunc retTy args False -> return (retTy, args)
+                _ -> badSource declr "function definition"
 ```
 
 Translating `main` requires special care; see `wrapMain` below.
 
 ```haskell
-    when (name == "_c_main") (wrapMain declr name (map snd args))
+            when (name == "_c_main") (wrapMain declr name (map snd args))
 ```
 
 Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
 ```haskell
-    let setRetTy flow = flow { functionReturnType = Just retTy }
-    mapExceptT (local setRetTy) $ scope $ do
+            let setRetTy flow = flow { functionReturnType = Just retTy }
+            f' <- mapExceptT (local setRetTy) $ scope $ do
 ```
 
 Add each formal parameter into the new environment, as a symbol.
@@ -1306,20 +1291,20 @@ Add each formal parameter into the new environment, as a symbol.
 > original program.
 
 ```haskell
-        formals <- sequence
-            [ case arg of
-                Just (mut, argident) -> do
-                    argname <- addSymbolIdent argident (mut, ty)
-                    return (mut, Rust.VarName argname, toRustType ty)
-                Nothing -> badSource declr "anonymous parameter"
-            | (arg, ty) <- args
-            ]
+                formals <- sequence
+                    [ case arg of
+                        Just (mut, argident) -> do
+                            argname <- addSymbolIdent argident (mut, ty)
+                            return (mut, Rust.VarName argname, toRustType ty)
+                        Nothing -> badSource declr "anonymous parameter"
+                    | (arg, ty) <- args
+                    ]
 ```
 
 Interpret the body of the function.
 
 ```haskell
-        body' <- interpretStatement body
+                body' <- interpretStatement body
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
@@ -1333,10 +1318,35 @@ the result of the function, this generated block never has a final
 expression.
 
 ```haskell
-        let attrs = [Rust.Attribute "no_mangle"]
-        return (Rust.Item attrs vis
-            (Rust.Function [Rust.UnsafeFn] name formals (toRustRetType retTy)
-                (statementsToBlock body')))
+                let attrs = [Rust.Attribute "no_mangle"]
+                return (Rust.Item attrs vis
+                    (Rust.Function [Rust.UnsafeFn] name formals (toRustRetType retTy)
+                        (statementsToBlock body')))
+
+            emitItems [f']
+```
+
+Add this function to the globals before evaluating its body so recursive
+calls work. (Note that function definitions can't be anonymous.)
+
+```haskell
+    ident <- case mident of
+        Nothing -> badSource declr "anonymous function definition"
+        Just ident -> return ident
+
+    let funTy itype = (Rust.Immutable, typeRep itype)
+    deferred <- fmap (fmap funTy) (derivedDeferredTypeOf baseTy declr)
+    case vis of
+        Rust.Public -> do
+            ty <- deferred
+            name <- addSymbolIdent ident ty
+            go name ty
+        Rust.Private -> do
+            action <- runOnce $ do
+                ty <- deferred
+                go (applyRenames ident) ty
+                return ty
+            addSymbolIdentAction ident action
 ```
 
 
