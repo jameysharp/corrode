@@ -3317,9 +3317,11 @@ derivedTypeOf :: EnvMonad s IntermediateType -> CDeclr -> EnvMonad s Intermediat
 derivedTypeOf deferred declr = join (derivedDeferredTypeOf deferred declr)
 
 derivedDeferredTypeOf :: EnvMonad s IntermediateType -> CDeclr -> EnvMonad s (EnvMonad s IntermediateType)
-derivedDeferredTypeOf deferred declr@(CDeclr _ derived _ _ _) = return $ do
-    basetype <- deferred
-    foldrM derive basetype derived
+derivedDeferredTypeOf deferred declr@(CDeclr _ derived _ _ _) = do
+    derived' <- mapM derive derived
+    return $ do
+        basetype <- deferred
+        foldrM ($) basetype derived'
     where
 ```
 
@@ -3327,32 +3329,32 @@ In our internal type representation, `IsFunc` is a function _pointer_.
 So if we see a `CPtrDeclr` followed by a `CFunDeclr`, we should eat the
 pointer.
 
-```haskell
-    derive (CPtrDeclr _ _) itype@(IntermediateType { typeIsFunc = True }) = return itype { typeIsFunc = False }
-```
-
 If we see a `CArrDeclr` or `CFunDeclr` before a `CFunDeclr`, that's an
 error; there must be an intervening pointer.
 
 ```haskell
-    derive _ (IntermediateType { typeIsFunc = True }) =
-        badSource declr "use of function type"
-    derive (CPtrDeclr quals _) itype = return itype
-        { typeMutable = mutable quals
-        , typeRep = IsPtr (typeMutable itype) (typeRep itype)
-        }
-    derive (CArrDeclr quals _ _) itype = return itype
-        { typeMutable = mutable quals
-        , typeRep = IsPtr (typeMutable itype) (typeRep itype)
-        }
+    derive (CPtrDeclr quals _) = return $ \ itype ->
+        if typeIsFunc itype
+        then return itype { typeIsFunc = False }
+        else return itype
+            { typeMutable = mutable quals
+            , typeRep = IsPtr (typeMutable itype) (typeRep itype)
+            }
+    derive (CArrDeclr quals _ _) = return $ \ itype ->
+        if typeIsFunc itype
+        then badSource declr "function as array element type"
+        else return itype
+            { typeMutable = mutable quals
+            , typeRep = IsPtr (typeMutable itype) (typeRep itype)
+            }
 ```
 
 > **TODO**: Handling old-style function declarations is probably not
 > _too_ difficult...
 
 ```haskell
-    derive (CFunDeclr (Left _) _ _) _ = unimplemented declr
-    derive (CFunDeclr (Right (args, variadic)) _ _) itype = do
+    derive (CFunDeclr (Left _) _ _) = unimplemented declr
+    derive (CFunDeclr (Right (args, variadic)) _ _) = do
         args' <- sequence
             [ do
                 (storage, base') <- baseTypeOf argspecs
@@ -3360,18 +3362,16 @@ error; there must be an intervening pointer.
                     Nothing -> return ()
                     Just (CRegister _) -> return ()
                     Just s -> badSource s "storage class specifier on argument"
-                case declr' of
-                    [] -> do
-                        base'' <- base'
-                        return (Nothing, typeRep base'')
+                (argname, argTy) <- case declr' of
+                    [] -> return (Nothing, base')
                     [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
-                        IntermediateType
-                            { typeMutable = mut
-                            , typeIsFunc = isFunc
-                            , typeRep = ty } <- derivedTypeOf base' argdeclr
-                        when isFunc (badSource arg "function as function argument")
-                        return (fmap ((,) mut) argname, ty)
+                        argTy <- derivedDeferredTypeOf base' argdeclr
+                        return (argname, argTy)
                     _ -> badSource arg "function argument"
+                return $ do
+                    itype <- argTy
+                    when (typeIsFunc itype) (badSource arg "function as function argument")
+                    return (fmap ((,) (typeMutable itype)) argname, typeRep itype)
             | arg@(CDecl argspecs declr' _) <-
 ```
 
@@ -3383,10 +3383,13 @@ mean the function takes no arguments.
                 [CDecl [CTypeSpec (CVoidType _)] [] _] -> []
                 _ -> args
             ]
-        return itype
-            { typeIsFunc = True
-            , typeRep = IsFunc (typeRep itype) args' variadic
-            }
+        return $ \ itype -> do
+            when (typeIsFunc itype) (badSource declr "function as function return type")
+            args'' <- sequence args'
+            return itype
+                { typeIsFunc = True
+                , typeRep = IsFunc (typeRep itype) args'' variadic
+                }
 ```
 
 Several places above need to check whether any type qualifiers are
