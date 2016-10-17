@@ -2525,7 +2525,14 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         (_, IsPtr _ _) -> return rhs { result = Rust.MethodCall (result rhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs] }
         _ -> promote expr Rust.Add lhs rhs
     CSubOp -> case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> unimplemented expr
+        (IsPtr _ _, IsPtr _ _) -> do
+            let ty = IsInt Signed WordWidth
+            let size = rustSizeOfType (toRustType (compatiblePtr (resultType lhs) (resultType rhs)))
+            return Result
+                { resultType = ty
+                , resultMutable = Rust.Immutable
+                , result = (Rust.MethodCall (castTo ty lhs) (Rust.VarName "wrapping_sub") [castTo ty rhs]) / castTo ty size
+                }
         (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
         _ -> promote expr Rust.Sub lhs rhs
     CShlOp -> shift Rust.ShiftL
