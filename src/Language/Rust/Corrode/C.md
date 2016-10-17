@@ -331,37 +331,44 @@ environment, and returns the type information we have for it, or
 `Nothing` if we haven't seen a declaration for that name yet.
 
 ```haskell
-getSymbolIdent :: Ident -> EnvMonad s (String, Maybe (Rust.Mutable, CType))
+getSymbolIdent :: Ident -> EnvMonad s (Maybe Result)
 getSymbolIdent ident = do
     env <- lift get
     let name = applyRenames ident
     case lookup ident (symbolEnvironment env) of
         Just symbol -> do
-            ty <- symbol
-            return (name, Just ty)
-        Nothing -> return $ fromMaybe (name, Nothing) $ lookup (identToString ident) builtinSymbols
+            (mut, ty) <- symbol
+            return $ Just Result
+                { resultType = ty
+                , resultMutable = mut
+                , result = Rust.Path $ Rust.PathSegments $ case ty of
+                    IsEnum enum -> [enum, name]
+                    _ -> [name]
+                }
+        Nothing -> return $ lookup (identToString ident) builtinSymbols
     where
     builtinSymbols =
-        [ ("__builtin_bswap" ++ show w,
-            ("u" ++ show w ++ "::swap_bytes",
-                Just (Rust.Immutable,
-                    IsFunc (IsInt Unsigned (BitWidth w))
-                        [(Nothing, IsInt Unsigned (BitWidth w))] False
-            )))
+        [ ("__builtin_bswap" ++ show w, Result
+            { resultType = IsFunc (IsInt Unsigned (BitWidth w))
+                [(Nothing, IsInt Unsigned (BitWidth w))] False
+            , resultMutable = Rust.Immutable
+            , result = Rust.Path (Rust.PathSegments ["u" ++ show w, "swap_bytes"])
+            })
         | w <- [16, 32, 64]
         ]
         ++
-        [ ("__FILE__",
-            ("file!().as_ptr()",
-                Just (Rust.Immutable,
-                    IsPtr Rust.Immutable charType
-            )))
-        ,
-          ("__LINE__",
-            ("line!()",
-                Just (Rust.Immutable,
-                    IsInt Unsigned (BitWidth 32)
-            )))
+        [ ("__FILE__", Result
+            { resultType = IsPtr Rust.Immutable charType
+            , resultMutable = Rust.Immutable
+            , result = Rust.MethodCall (
+                    Rust.Call (Rust.Var (Rust.VarName "file!")) []
+                ) (Rust.VarName "as_ptr") []
+            })
+        , ("__LINE__", Result
+            { resultType = IsInt Unsigned (BitWidth 32)
+            , resultMutable = Rust.Immutable
+            , result = Rust.Call (Rust.Var (Rust.VarName "line!")) []
+            })
         ]
 
 getTypedefIdent :: Ident -> EnvMonad s (String, Maybe (EnvMonad s IntermediateType))
@@ -2308,21 +2315,8 @@ pointer.
 
 ```haskell
 interpretExpr _ expr@(CVar ident _) = do
-    (name, sym) <- getSymbolIdent ident
-    case sym of
-        Just (mut, ty@(IsEnum enum)) -> do
-            return Result
-                { resultType = ty
-                , resultMutable = mut
-                , result = Rust.Path (Rust.PathSegments [enum, name])
-                }
-        Just (mut, ty) -> do
-            return Result
-                { resultType = ty
-                , resultMutable = mut
-                , result = Rust.Var (Rust.VarName name)
-                }
-        Nothing -> badSource expr "undefined variable"
+    sym <- getSymbolIdent ident
+    maybe (badSource expr "undefined variable") return sym
 ```
 
 C literals (integer, floating-point, character, and string) translate to
