@@ -2592,7 +2592,8 @@ compound expr returnOld demand op lhs rhs = do
             CAndAssOp -> Just CAndOp
             CXorAssOp -> Just CXorOp
             COrAssOp  -> Just COrOp
-        (bindings1, dereflhs, boundrhs) = if isSimple (result lhs)
+        duplicateLHS = isJust op' || demand
+        (bindings1, dereflhs, boundrhs) = if not duplicateLHS || isSimple (result lhs)
             then ([], lhs, rhs)
             else
                 let lhsvar = Rust.VarName "_lhs"
