@@ -2315,7 +2315,7 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
                 Just (IsStruct _ fields) -> return fields
                 _ -> badSource expr "member access of incomplete type"
         _ -> badSource expr "member access of non-struct"
-    let field = identToString ident
+    let field = applyRenames ident
     ty <- case lookup field fields of
         Just ty -> return ty
         Nothing -> badSource expr "request for non-existent field"
@@ -3180,7 +3180,7 @@ only reporting an error if this struct is actually used.
             forM decls $ \ decl -> case decl of
                 (Just declr@(CDeclr (Just field) _ _ _ _), Nothing, Nothing) -> do
                     deferred <- derivedDeferredTypeOf base declr
-                    return (identToString field, deferred)
+                    return (applyRenames field, deferred)
                 (_, Nothing, Just _size) -> do
                     return ("<bitfield>", unimplemented declaration)
                 _ -> badSource declaration "field in struct"
