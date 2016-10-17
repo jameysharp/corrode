@@ -3083,6 +3083,8 @@ runOnce action = do
         cache <- lift $ lift $ readSTRef cacheRef
         case cache of
             Left todo -> do
+                lift $ lift $ writeSTRef cacheRef $ Left $
+                    fail "internal error: runOnce action depends on itself, leading to an infinite loop"
                 val <- todo
                 lift $ lift $ writeSTRef cacheRef (Right val)
                 return val
