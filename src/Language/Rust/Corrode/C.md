@@ -334,10 +334,10 @@ environment, and returns the type information we have for it, or
 getSymbolIdent :: Ident -> EnvMonad s (Maybe Result)
 getSymbolIdent ident = do
     env <- lift get
-    let name = applyRenames ident
     case lookup ident (symbolEnvironment env) of
         Just symbol -> do
             (mut, ty) <- symbol
+            let name = applyRenames ident
             return $ Just Result
                 { resultType = ty
                 , resultMutable = mut
@@ -345,8 +345,22 @@ getSymbolIdent ident = do
                     IsEnum enum -> [enum, name]
                     _ -> [name]
                 }
-        Nothing -> return $ lookup (identToString ident) builtinSymbols
+        Nothing -> case identToString ident of
+            "__func__" -> getFunctionName ""
+            "__FUNCTION__" -> getFunctionName ""
+            "__PRETTY_FUNCTION__" -> getFunctionName "top level"
+            name -> return $ lookup name builtinSymbols
     where
+    getFunctionName def = do
+        name <- lift (asks functionName)
+        let name' = fromMaybe def name
+        return $ Just Result
+            { resultType = IsPtr Rust.Immutable charType
+            , resultMutable = Rust.Immutable
+            , result = Rust.MethodCall (
+                    Rust.Lit (Rust.LitRep ("b\"" ++ name' ++ "\\0\""))
+                ) (Rust.VarName "as_ptr") []
+            }
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w, Result
             { resultType = IsFunc (IsInt Unsigned (BitWidth w))
@@ -508,6 +522,7 @@ Specifically, we:
 ```haskell
     initFlow = ControlFlow
         { functionReturnType = Nothing
+        , functionName = Nothing
         , onBreak = Nothing
         , onContinue = Nothing
         }
@@ -1284,7 +1299,10 @@ Open a new scope for the body of this function, while making the return
 type available so we can correctly translate `return` statements.
 
 ```haskell
-            let setRetTy flow = flow { functionReturnType = Just retTy }
+            let setRetTy flow = flow
+                    { functionReturnType = Just retTy
+                    , functionName = Just name
+                    }
             f' <- mapExceptT (local setRetTy) $ scope $ do
 ```
 
@@ -1572,6 +1590,7 @@ that context up in a simple data type.
 ```haskell
 data ControlFlow = ControlFlow
     { functionReturnType :: Maybe CType
+    , functionName :: Maybe String
     , onBreak :: Maybe Rust.Expr
     , onContinue :: Maybe Rust.Expr
     }
