@@ -1345,7 +1345,7 @@ expression.
 ```haskell
                 let attrs = [Rust.Attribute "no_mangle"]
                 return (Rust.Item attrs vis
-                    (Rust.Function [Rust.UnsafeFn] name formals (toRustRetType retTy)
+                    (Rust.Function [Rust.UnsafeFn, Rust.ExternABI Nothing] name formals (toRustRetType retTy)
                         (statementsToBlock body')))
 
             emitItems [f']
