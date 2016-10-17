@@ -2057,15 +2057,27 @@ C's cast operator corresponds exactly to Rust's cast operator. The
 syntax is quite different but the semantics are the same. Note that the
 result of a cast is never a legal l-value.
 
+In C, casting the result of an expression to `void` is an idiom for
+explicitly ignoring the result, meaning the expression is only intended
+to be evaluated for its side effects. It's commonly used in older code
+to suppress over-zealous compiler warnings, and continues to be used in
+certain special cases such as glibc's implementation of the assert
+macro. A naïve translation of this idiom produces invalid Rust, so we
+special-case it to simply evaluate the subexpression without demanding
+its result.
+
 ```haskell
 interpretExpr _ (CCast decl expr _) = do
     (_mut, ty) <- typeName decl
-    expr' <- interpretExpr True expr
-    return Result
-        { resultType = ty
-        , resultMutable = Rust.Immutable
-        , result = Rust.Cast (result expr') (toRustType ty)
-        }
+    case ty of
+        IsVoid -> interpretExpr False expr
+        _ -> do
+            expr' <- interpretExpr True expr
+            return Result
+                { resultType = ty
+                , resultMutable = Rust.Immutable
+                , result = Rust.Cast (result expr') (toRustType ty)
+                }
 ```
 
 We de-sugar the pre/post-increment/decrement operators into compound
