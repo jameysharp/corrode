@@ -213,89 +213,106 @@ data AssignOp
     | (:<<=)
     | (:>>=)
 
+-- If a block is at the beginning of a statement, Rust parses it as if
+-- it were followed by a semicolon. If we didn't intend to put an
+-- implicit semicolon there, then we need to wrap the block in
+-- parentheses. The top-most expression doesn't need parentheses, but
+-- otherwise the first block encountered by following left children down
+-- the AST does. Any sub-expression that has an operator or keyword in
+-- front of it is not a left child.
+--
+-- If we get this wrong, Rust will either mis-parse the expression (if
+-- we don't have enough parentheses) or warn about excess parentheses.
+-- So it's worth going to some trouble to get this right.
+data ExprPosition = TopExpr | LeftExpr | RightExpr
+
 instance Pretty Expr where
-    pPrintPrec l d e' = case e' of
-        Lit x -> pPrint x
-        Var x -> pPrint x
-        Path x -> pPrint x
-        StructExpr str fields base -> sep
+    pPrintPrec _ = go TopExpr
+        where
+        leftParens LeftExpr body = parens body
+        leftParens _ body = body
+        left TopExpr = LeftExpr
+        left pos = pos
+
+        go _ _ (Lit x) = pPrint x
+        go _ _ (Var x) = pPrint x
+        go _ _ (Path x) = pPrint x
+        go _ _ (StructExpr str fields base) = sep
             ( text str <+> text "{"
-            : punctuate (text ",") ([ nest 4 (text name <> text ":" <+> pPrint val) | (name, val) <- fields ] ++ maybe [] (\b -> [ text ".." <> pPrint b ]) base)
+            : punctuate (text ",") ([ nest 4 (text name <> text ":" <+> go RightExpr 0 val) | (name, val) <- fields ] ++ maybe [] (\b -> [ text ".." <> go RightExpr 0 b ]) base)
             ++ [text "}"]
             )
-        Call f args -> cat
-            ( pPrintPrec l 14 f <> text "("
-            : punctuate (text ",") (map (nest 4 . pPrint) args)
+        go pos _ (Call f args) = cat
+            ( go (left pos) 14 f <> text "("
+            : punctuate (text ",") (map (nest 4 . go RightExpr 0) args)
             ++ [text ")"]
             )
-        MethodCall self f args -> cat
-            ( pPrintPrec l 13 self <> text "." <> pPrint f <> text "("
-            : punctuate (text ",") (map (nest 4 . pPrint) args)
+        go pos _ (MethodCall self f args) = cat
+            ( go (left pos) 13 self <> text "." <> pPrint f <> text "("
+            : punctuate (text ",") (map (nest 4 . go RightExpr 0) args)
             ++ [text ")"]
             )
-        Lambda args body ->
+        go _ _ (Lambda args body) =
             let args' = sep (punctuate (text ",") (map pPrint args))
-            in text "|" <> args' <> text "|" <+> pPrint body
-        Member obj field -> maybeParens (d > 13) (pPrintPrec l 13 obj <> text "." <> pPrint field)
-        -- If a block is at the beginning of a statement, Rust parses it
-        -- as if it were followed by a semicolon. Parenthesizing all
-        -- block expressions is excessive but correct.
-        BlockExpr x -> text "(" <> pPrintBlock empty x <> text ")"
-        UnsafeExpr x -> pPrintBlock (text "unsafe") x
-        IfThenElse c t f -> (if any hasStmt clauses then vcat else sep) (concatMap body clauses ++ [text "}"])
+            in text "|" <> args' <> text "|" <+> go RightExpr 0 body
+        go pos d (Member obj field) = maybeParens (d > 13) (go (left pos) 13 obj <> text "." <> pPrint field)
+        go pos _ (BlockExpr x) = leftParens pos (pPrintBlock empty x)
+        go pos _ (UnsafeExpr x) = leftParens pos (pPrintBlock (text "unsafe") x)
+        go pos _ (IfThenElse c t f) = leftParens pos ((if any hasStmt clauses then vcat else sep) (concatMap body clauses ++ [text "}"]))
             where
-            clauses = (text "if" <+> pPrint c <+> text "{", t) : ladder f
+            clauses = (text "if" <+> go RightExpr 0 c <+> text "{", t) : ladder f
             hasStmt (_, Block [] _) = False
             hasStmt _ = True
-            body (pre, Block ss e) = pre : map (nest 4) (map pPrint ss ++ [maybe empty pPrint e])
+            body (pre, Block ss e) = pre : map (nest 4) (map pPrint ss ++ [maybe empty (go RightExpr 0) e])
             ladder (Block [] Nothing) = []
             ladder (Block [] (Just (IfThenElse c' t' f'))) = elseIf c' t' f'
             ladder (Block [Stmt (IfThenElse c' t' f')] Nothing) = elseIf c' t' f'
             ladder f' = [(text "}" <+> text "else" <+> text "{", f')]
-            elseIf c' t' f' = (text "} else if" <+> pPrint c' <+> text "{", t') : ladder f'
-        Loop lt b -> pPrintBlock (optLabel lt <+> text "loop") b
-        While lt c b -> pPrintBlock (optLabel lt <+> text "while" <+> pPrint c) b
-        For lt v i b -> pPrintBlock (optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> pPrint i) b
-        Break lt -> text "break" <+> maybe empty pPrint lt
-        Continue lt -> text "continue" <+> maybe empty pPrint lt
-        Return Nothing -> text "return"
-        Return (Just e) -> hang (text "return") 4 (pPrint e)
+            elseIf c' t' f' = (text "} else if" <+> go RightExpr 0 c' <+> text "{", t') : ladder f'
+        go pos _ (Loop lt b) = leftParens pos (pPrintBlock (optLabel lt <+> text "loop") b)
+        go pos _ (While lt c b) = leftParens pos (pPrintBlock (optLabel lt <+> text "while" <+> go RightExpr 0 c) b)
+        go pos _ (For lt v i b) = leftParens pos (pPrintBlock (optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> go RightExpr 0 i) b)
+        go _ _ (Break lt) = text "break" <+> maybe empty pPrint lt
+        go _ _ (Continue lt) = text "continue" <+> maybe empty pPrint lt
+        go _ _ (Return Nothing) = text "return"
+        go _ _ (Return (Just e)) = hang (text "return") 4 (go RightExpr 0 e)
         -- operators:
-        Neg       e -> unary 12 "-" e
-        Deref     e -> unary 12 "*" e
-        Not       e -> unary 12 "!" e
-        Borrow m  e -> unary 12 (case m of Immutable -> "&"; Mutable -> "&mut ") e
-        Cast   e t -> maybeParens (d > 11) (pPrintPrec l 11 e <+> text "as" <+> parens (pPrint t))
-        Mul    a b -> binary 10 a "*" b
-        Div    a b -> binary 10 a "/" b
-        Mod    a b -> binary 10 a "%" b
-        Add    a b -> binary  9 a "+" b
-        Sub    a b -> binary  9 a "-" b
-        ShiftL a b -> binary  8 a "<<" b
-        ShiftR a b -> binary  8 a ">>" b
-        And    a b -> binary  7 a "&" b
-        Xor    a b -> binary  6 a "^" b
-        Or     a b -> binary  5 a "|" b
-        CmpLT  a b -> nonass  4 a "<" b
-        CmpGT  a b -> nonass  4 a ">" b
-        CmpLE  a b -> nonass  4 a "<=" b
-        CmpGE  a b -> nonass  4 a ">=" b
-        CmpEQ  a b -> nonass  4 a "==" b
-        CmpNE  a b -> nonass  4 a "!=" b
-        LAnd   a b -> binary  3 a "&&" b
-        LOr    a b -> binary  2 a "||" b
-        Range  a b -> binary  1 a ".." b
-        Assign a op b -> binary 1 a (assignOp op ++ "=") b
-        where
+        go _   d (Neg       e) = unary     d 12 "-" e
+        go _   d (Deref     e) = unary     d 12 "*" e
+        go _   d (Not       e) = unary     d 12 "!" e
+        go _   d (Borrow m  e) = unary     d 12 (case m of Immutable -> "&"; Mutable -> "&mut ") e
+        go pos d (Cast   e t) = maybeParens (d > 11) (go (left pos) 11 e <+> text "as" <+> parens (pPrint t))
+        go pos d (Mul    a b) = binary pos d 10 a "*" b
+        go pos d (Div    a b) = binary pos d 10 a "/" b
+        go pos d (Mod    a b) = binary pos d 10 a "%" b
+        go pos d (Add    a b) = binary pos d  9 a "+" b
+        go pos d (Sub    a b) = binary pos d  9 a "-" b
+        go pos d (ShiftL a b) = binary pos d  8 a "<<" b
+        go pos d (ShiftR a b) = binary pos d  8 a ">>" b
+        go pos d (And    a b) = binary pos d  7 a "&" b
+        go pos d (Xor    a b) = binary pos d  6 a "^" b
+        go pos d (Or     a b) = binary pos d  5 a "|" b
+        go pos d (CmpLT  a b) = nonass pos d  4 a "<" b
+        go pos d (CmpGT  a b) = nonass pos d  4 a ">" b
+        go pos d (CmpLE  a b) = nonass pos d  4 a "<=" b
+        go pos d (CmpGE  a b) = nonass pos d  4 a ">=" b
+        go pos d (CmpEQ  a b) = nonass pos d  4 a "==" b
+        go pos d (CmpNE  a b) = nonass pos d  4 a "!=" b
+        go pos d (LAnd   a b) = binary pos d  3 a "&&" b
+        go pos d (LOr    a b) = binary pos d  2 a "||" b
+        go pos d (Range  a b) = binary pos d  1 a ".." b
+        go pos d (Assign a op b) = binary pos d 1 a (assignOp op ++ "=") b
+
         optLabel = maybe empty (\ label -> pPrint label <> text ":")
 
-        unary n op e = maybeParens (d > n) (text op <> pPrintPrec l n e)
+        unary d n op e = maybeParens (d > n) (text op <> go RightExpr n e)
+
         -- If a same-precedence operator appears nested on the right,
         -- then it needs parens, so increase the precedence there.
-        binary n a op b = maybeParens (d > n) (pPrintPrec l n a <+> text op <+> pPrintPrec l (n + 1) b)
+        binary pos d n a op b = maybeParens (d > n) (go (left pos) n a <+> text op <+> go RightExpr (n + 1) b)
 
         -- Non-associative operators need parens if they're nested.
-        nonass n a op b = maybeParens (d >= n) (pPrintPrec l n a <+> text op <+> pPrintPrec l n b)
+        nonass pos d n a op b = maybeParens (d >= n) (go (left pos) n a <+> text op <+> go RightExpr n b)
 
         assignOp (:=) = ""
         assignOp (:+=) = "+"
