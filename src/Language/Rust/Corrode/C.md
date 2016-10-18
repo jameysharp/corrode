@@ -224,8 +224,9 @@ one. We'll follow a standard idiom for this and just generate a unique
 number each time we need a new name.
 
 ```haskell
-newtype GlobalState = GlobalState
+data GlobalState = GlobalState
     { unique :: Int
+    , usedForwardRefs :: Set.Set Ident
     }
 ```
 
@@ -236,6 +237,17 @@ number:
 uniqueName :: String -> EnvMonad s String
 uniqueName base = modifyGlobal $ \ st ->
     (st { unique = unique st + 1 }, base ++ show (unique st))
+```
+
+When a forward-declaration is referenced but we haven't seen the later
+definition yet, we need to keep track of the fact that eventually we'll
+need that symbol, so we can force it to be translated once we finally do
+see it.
+
+```haskell
+useForwardRef :: Ident -> EnvMonad s ()
+useForwardRef ident = modifyGlobal $ \ st ->
+    (st { usedForwardRefs = Set.insert ident (usedForwardRefs st) }, ())
 ```
 
 
@@ -532,6 +544,7 @@ Specifically, we:
         , tagEnvironment = []
         , globalState = GlobalState
             { unique = 1
+            , usedForwardRefs = Set.empty
             }
         }
     (err, output) = runST (evalRWST (runExceptT (mapM_ perDecl decls)) initFlow initState)
@@ -834,6 +847,7 @@ to have the function's type signature in the environment though.
             (Just (CStatic _), CFunDeclr{} : _) -> do
                 addSymbolIdentAction ident $ do
                     itype <- deferred
+                    useForwardRef ident
                     return (typeMutable itype, typeRep itype)
                 return Nothing
 ```
@@ -1360,17 +1374,18 @@ calls work. (Note that function definitions can't be anonymous.)
 
     let funTy itype = (Rust.Immutable, typeRep itype)
     deferred <- fmap (fmap funTy) (derivedDeferredTypeOf baseTy declr argtypes)
+    alreadyUsed <- lift $ gets (usedForwardRefs . globalState)
     case vis of
-        Rust.Public -> do
-            ty <- deferred
-            name <- addSymbolIdent ident ty
-            go name ty
-        Rust.Private -> do
+        Rust.Private | ident `Set.notMember` alreadyUsed -> do
             action <- runOnce $ do
                 ty <- deferred
                 go (applyRenames ident) ty
                 return ty
             addSymbolIdentAction ident action
+        _ -> do
+            ty <- deferred
+            name <- addSymbolIdent ident ty
+            go name ty
 ```
 
 
