@@ -302,7 +302,7 @@ defined above.
 
 ```haskell
 data EnvState s = EnvState
-    { symbolEnvironment :: [(Ident, EnvMonad s (Rust.Mutable, CType))]
+    { symbolEnvironment :: [(Ident, EnvMonad s Result)]
     , typedefEnvironment :: [(Ident, EnvMonad s IntermediateType)]
     , tagEnvironment :: [(Ident, EnvMonad s CType)]
     , globalState :: GlobalState
@@ -347,16 +347,7 @@ getSymbolIdent :: Ident -> EnvMonad s (Maybe Result)
 getSymbolIdent ident = do
     env <- lift get
     case lookup ident (symbolEnvironment env) of
-        Just symbol -> do
-            (mut, ty) <- symbol
-            let name = applyRenames ident
-            return $ Just Result
-                { resultType = ty
-                , resultMutable = mut
-                , result = Rust.Path $ Rust.PathSegments $ case ty of
-                    IsEnum enum -> [enum, name]
-                    _ -> [name]
-                }
+        Just symbol -> fmap Just symbol
         Nothing -> case identToString ident of
             "__func__" -> getFunctionName ""
             "__FUNCTION__" -> getFunctionName ""
@@ -412,11 +403,16 @@ getTagIdent ident = lift $ do
 
 ```haskell
 addSymbolIdent :: Ident -> (Rust.Mutable, CType) -> EnvMonad s String
-addSymbolIdent ident ty = do
-    addSymbolIdentAction ident (return ty)
-    return (applyRenames ident)
+addSymbolIdent ident (mut, ty) = do
+    let name = applyRenames ident
+    addSymbolIdentAction ident $ return Result
+        { resultType = ty
+        , resultMutable = mut
+        , result = Rust.Path (Rust.PathSegments [name])
+        }
+    return name
 
-addSymbolIdentAction :: Ident -> EnvMonad s (Rust.Mutable, CType) -> EnvMonad s ()
+addSymbolIdentAction :: Ident -> EnvMonad s Result -> EnvMonad s ()
 addSymbolIdentAction ident action = lift $ do
     modify $ \ st -> st { symbolEnvironment = (ident, action) : symbolEnvironment st }
 
@@ -450,7 +446,7 @@ addExternIdent ident deferred mkItem = do
         itype <- deferred
         let ty = (typeMutable itype, typeRep itype)
         lift $ tell mempty { outputExterns = Map.singleton name (mkItem name ty) }
-        return ty
+        return (typeToResult itype (Rust.Path (Rust.PathSegments [name])))
     addSymbolIdentAction ident action
 ```
 
@@ -848,7 +844,7 @@ to have the function's type signature in the environment though.
                 addSymbolIdentAction ident $ do
                     itype <- deferred
                     useForwardRef ident
-                    return (typeMutable itype, typeRep itype)
+                    return (typeToResult itype (Rust.Path (Rust.PathSegments [applyRenames ident])))
                 return Nothing
 ```
 
@@ -1290,7 +1286,7 @@ function in C. We just ignore whether it was present; there's no place
 we can put a `mut` keyword in the generated Rust.
 
 ```haskell
-    let go name (_mut, funTy) = do
+    let go name funTy = do
 ```
 
 Definitions of variadic functions are not allowed because Rust does not
@@ -1372,20 +1368,21 @@ calls work. (Note that function definitions can't be anonymous.)
         Nothing -> badSource declr "anonymous function definition"
         Just ident -> return ident
 
-    let funTy itype = (Rust.Immutable, typeRep itype)
+    let name = applyRenames ident
+    let funTy itype = typeToResult itype (Rust.Path (Rust.PathSegments [name]))
     deferred <- fmap (fmap funTy) (derivedDeferredTypeOf baseTy declr argtypes)
     alreadyUsed <- lift $ gets (usedForwardRefs . globalState)
     case vis of
         Rust.Private | ident `Set.notMember` alreadyUsed -> do
             action <- runOnce $ do
                 ty <- deferred
-                go (applyRenames ident) ty
+                go name (resultType ty)
                 return ty
             addSymbolIdentAction ident action
         _ -> do
             ty <- deferred
-            name <- addSymbolIdent ident ty
-            go name ty
+            addSymbolIdentAction ident $ return ty
+            go name (resultType ty)
 ```
 
 
@@ -1983,6 +1980,15 @@ data Result = Result
     { resultType :: CType
     , resultMutable :: Rust.Mutable
     , result :: Rust.Expr
+    }
+```
+
+```haskell
+typeToResult :: IntermediateType -> Rust.Expr -> Result
+typeToResult itype expr = Result
+    { resultType = typeRep itype
+    , resultMutable = typeMutable itype
+    , result = expr
     }
 ```
 
@@ -3426,8 +3432,12 @@ above.
             return (IsEnum name)
 
         forM_ items $ \ (ident, _mexpr) -> addSymbolIdentAction ident $ do
-            ty <- deferred
-            return (Rust.Immutable, ty)
+            IsEnum name <- deferred
+            return Result
+                { resultType = IsEnum name
+                , resultMutable = Rust.Immutable
+                , result = Rust.Path (Rust.PathSegments [name, applyRenames ident])
+                }
 
         case mident of
             Just ident -> addTagIdent ident deferred
