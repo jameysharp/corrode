@@ -242,11 +242,17 @@ instance Pretty Expr where
         -- block expressions is excessive but correct.
         BlockExpr x -> text "(" <> pPrintBlock empty x <> text ")"
         UnsafeExpr x -> pPrintBlock (text "unsafe") x
-        IfThenElse c t f -> pPrintBlock (text "if" <+> pPrint c) t <+> case f of
-            Block [] Nothing -> empty
-            Block [] (Just n@(IfThenElse{})) -> text "else" <+> pPrint n
-            Block [Stmt n@(IfThenElse{})] Nothing -> text "else" <+> pPrint n
-            _ -> pPrintBlock (text "else") f
+        IfThenElse c t f -> (if any hasStmt clauses then vcat else sep) (concatMap body clauses ++ [text "}"])
+            where
+            clauses = (text "if" <+> pPrint c <+> text "{", t) : ladder f
+            hasStmt (_, Block [] _) = False
+            hasStmt _ = True
+            body (pre, Block ss e) = pre : map (nest 4) (map pPrint ss ++ [maybe empty pPrint e])
+            ladder (Block [] Nothing) = []
+            ladder (Block [] (Just (IfThenElse c' t' f'))) = elseIf c' t' f'
+            ladder (Block [Stmt (IfThenElse c' t' f')] Nothing) = elseIf c' t' f'
+            ladder f' = [(text "}" <+> text "else" <+> text "{", f')]
+            elseIf c' t' f' = (text "} else if" <+> pPrint c' <+> text "{", t') : ladder f'
         Loop lt b -> pPrintBlock (optLabel lt <+> text "loop") b
         While lt c b -> pPrintBlock (optLabel lt <+> text "while" <+> pPrint c) b
         For lt v i b -> pPrintBlock (optLabel lt <+> text "for" <+> pPrint v <+> text "in" <+> pPrint i) b
