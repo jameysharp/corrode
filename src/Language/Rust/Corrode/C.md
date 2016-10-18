@@ -802,7 +802,7 @@ initialization expression is optional."
             CDeclr (Just ident) derived _ _ _ -> return (ident, derived)
             _ -> badSource decl "abstract declarator"
 
-        deferred <- derivedDeferredTypeOf baseTy decl
+        deferred <- derivedDeferredTypeOf baseTy decl []
         case (storagespecs, derived) of
 ```
 
@@ -1257,7 +1257,7 @@ A C function definition translates to a single Rust item.
 
 ```haskell
 interpretFunction :: CFunDef -> EnvMonad s ()
-interpretFunction (CFunDef specs declr@(CDeclr mident _ _ _ _) _ body _) = do
+interpretFunction (CFunDef specs declr@(CDeclr mident _ _ _ _) argtypes body _) = do
 ```
 
 Determine whether the function should be visible outside this module
@@ -1359,7 +1359,7 @@ calls work. (Note that function definitions can't be anonymous.)
         Just ident -> return ident
 
     let funTy itype = (Rust.Immutable, typeRep itype)
-    deferred <- fmap (fmap funTy) (derivedDeferredTypeOf baseTy declr)
+    deferred <- fmap (fmap funTy) (derivedDeferredTypeOf baseTy declr argtypes)
     case vis of
         Rust.Public -> do
             ty <- deferred
@@ -3288,7 +3288,7 @@ only reporting an error if this struct is actually used.
                 Nothing -> return ()
             forM decls $ \ decl -> case decl of
                 (Just declr@(CDeclr (Just field) _ _ _ _), Nothing, Nothing) -> do
-                    deferred <- derivedDeferredTypeOf base declr
+                    deferred <- derivedDeferredTypeOf base declr []
                     return (applyRenames field, deferred)
                 (_, Nothing, Just _size) -> do
                     return ("<bitfield>", unimplemented declaration)
@@ -3446,10 +3446,14 @@ pointer, an array, or a function type.
 
 ```haskell
 derivedTypeOf :: EnvMonad s IntermediateType -> CDeclr -> EnvMonad s IntermediateType
-derivedTypeOf deferred declr = join (derivedDeferredTypeOf deferred declr)
+derivedTypeOf deferred declr = join (derivedDeferredTypeOf deferred declr [])
 
-derivedDeferredTypeOf :: EnvMonad s IntermediateType -> CDeclr -> EnvMonad s (EnvMonad s IntermediateType)
-derivedDeferredTypeOf deferred declr@(CDeclr _ derived _ _ _) = do
+derivedDeferredTypeOf
+    :: EnvMonad s IntermediateType
+    -> CDeclr
+    -> [CDecl]
+    -> EnvMonad s (EnvMonad s IntermediateType)
+derivedDeferredTypeOf deferred declr@(CDeclr _ derived _ _ _) argtypes = do
     derived' <- mapM derive derived
     return $ do
         basetype <- deferred
@@ -3481,12 +3485,21 @@ error; there must be an intervening pointer.
             }
 ```
 
-> **TODO**: Handling old-style function declarations is probably not
-> _too_ difficult...
-
 ```haskell
-    derive (CFunDeclr (Left _) _ _) = unimplemented declr
-    derive (CFunDeclr (Right (args, variadic)) _ _) = do
+    derive (CFunDeclr foo _ _) = do
+        let preAnsiArgs = Map.fromList
+                [ (argname, CDecl argspecs [(Just declr', Nothing, Nothing)] pos)
+                | CDecl argspecs declrs _ <- argtypes
+                , (Just declr'@(CDeclr (Just argname) _ _ _ pos), Nothing, Nothing) <- declrs
+                ]
+        (args, variadic) <- case foo of
+            Right (args, variadic) -> return (args, variadic)
+            Left argnames -> do
+                argdecls <- forM argnames $ \ argname ->
+                    case Map.lookup argname preAnsiArgs of
+                    Nothing -> badSource declr ("undeclared argument " ++ show (identToString argname))
+                    Just arg -> return arg
+                return (argdecls, False)
         args' <- sequence
             [ do
                 (storage, base') <- baseTypeOf argspecs
@@ -3497,7 +3510,7 @@ error; there must be an intervening pointer.
                 (argname, argTy) <- case declr' of
                     [] -> return (Nothing, base')
                     [(Just argdeclr@(CDeclr argname _ _ _ _), Nothing, Nothing)] -> do
-                        argTy <- derivedDeferredTypeOf base' argdeclr
+                        argTy <- derivedDeferredTypeOf base' argdeclr []
                         return (argname, argTy)
                     _ -> badSource arg "function argument"
                 return $ do
