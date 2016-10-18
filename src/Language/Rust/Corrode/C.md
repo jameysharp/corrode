@@ -2755,6 +2755,7 @@ that inserts a cast if and only if we need one.
 ```haskell
 castTo :: CType -> Result -> Rust.Expr
 castTo target source | resultType source == target = result source
+castTo IsBool source = toBool source
 castTo target source = Rust.Cast (result source) (toRustType target)
 ```
 
