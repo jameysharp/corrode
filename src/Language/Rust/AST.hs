@@ -224,7 +224,7 @@ instance Pretty Expr where
             ++ [text "}"]
             )
         Call f args -> cat
-            ( pPrintPrec l 13 f <> text "("
+            ( pPrintPrec l 14 f <> text "("
             : punctuate (text ",") (map (nest 4 . pPrint) args)
             ++ [text ")"]
             )
@@ -236,7 +236,7 @@ instance Pretty Expr where
         Lambda args body ->
             let args' = sep (punctuate (text ",") (map pPrint args))
             in text "|" <> args' <> text "|" <+> pPrint body
-        Member obj field -> pPrintPrec l 13 obj <> text "." <> pPrint field
+        Member obj field -> maybeParens (d > 13) (pPrintPrec l 13 obj <> text "." <> pPrint field)
         -- If a block is at the beginning of a statement, Rust parses it
         -- as if it were followed by a semicolon. Parenthesizing all
         -- block expressions is excessive but correct.
