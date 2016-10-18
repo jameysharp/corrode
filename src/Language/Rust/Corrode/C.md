@@ -2148,6 +2148,7 @@ on whether the pointer was to a mutable value.
                 , resultMutable = mut'
                 , result = Rust.Deref (result expr')
                 }
+            IsFunc{} -> return expr'
             _ -> badSource node "dereference of non-pointer"
 ```
 
