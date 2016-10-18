@@ -2704,6 +2704,8 @@ conservative guess of `False`.
 
 ```haskell
     hasNoSideEffects (Rust.Var{}) = True
+    hasNoSideEffects (Rust.Path{}) = True
+    hasNoSideEffects (Rust.Member e _) = hasNoSideEffects e
     hasNoSideEffects (Rust.Deref p) = hasNoSideEffects p
     hasNoSideEffects _ = False
 ```
