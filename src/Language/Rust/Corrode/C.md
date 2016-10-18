@@ -334,6 +334,7 @@ applyRenames ident = case identToString ident of
     "let" -> "let_"
     "main" -> "_c_main"
     "match" -> "match_"
+    "proc" -> "proc_"
     "type" -> "type_"
     name -> name
 ```
