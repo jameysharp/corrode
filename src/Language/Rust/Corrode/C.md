@@ -2572,12 +2572,14 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     comparison op' = do
         res <- promotePtr expr op' lhs rhs
         return res { resultType = IsBool }
+```
 
-isSimple :: Rust.Expr -> Bool
-isSimple (Rust.Var{}) = True
-isSimple (Rust.Deref p) = isSimple p
-isSimple _ = False
+Assignment expressions, including the unary increment and decrement
+operators, have pretty complicated semantics in C. First, we reduce
+compound assignments (e.g. `x += ...`) into simple assignments with the
+corresponding binary operator (`x = x + ...`).
 
+```haskell
 compound :: CExpr -> Bool -> Bool -> CAssignOp -> Result -> Result -> EnvMonad s Result
 compound expr returnOld demand op lhs rhs = do
     let op' = case op of
@@ -2592,8 +2594,45 @@ compound expr returnOld demand op lhs rhs = do
             CAndAssOp -> Just CAndOp
             CXorAssOp -> Just CXorOp
             COrAssOp  -> Just COrOp
-        duplicateLHS = isJust op' || demand
-        (bindings1, dereflhs, boundrhs) = if not duplicateLHS || isSimple (result lhs)
+```
+
+Some C assignments need to be translated to multiple Rust statements
+where we have to use the left-hand expression multiple times. We'll
+duplicate the left-hand side if either:
+
+1. the assignment is a compound assignment, because the Rust compound
+   assignment operators don't support many of the operand type
+   combinations that the C compound assignment operators do;
+2. or the surrounding expression uses the result of the assignment, in
+   which case we have to both read and write the l-value in separate
+   statements, because Rust assignment operators always evaluate to
+   `()`.
+
+```haskell
+    let duplicateLHS = isJust op' || demand
+```
+
+However, if the left-hand expression might have side effects, then we
+must not duplicate those effects. In that case we need to use a more
+complicated translation:
+
+- We let-bind a mutable borrow of the result of evaluating the left-hand
+  side. That way we can dereference the borrow multiple times without
+  evaluating the expression again.
+
+- But the right-hand side expression might use variables that we'll
+  borrow when capturing the left-hand side, so we have to make sure we
+  evaluate the right-hand side _first_ or Rust's borrow-checker may
+  complain. So we generate a let-binding for the right-hand side as
+  well.
+
+To avoid using the complicated translation for the common cases, we use
+`hasNoSideEffects` (see below) to check whether an expression is
+guaranteed not to have side effects.
+
+```haskell
+    let (bindings1, dereflhs, boundrhs) =
+            if not duplicateLHS || hasNoSideEffects (result lhs)
             then ([], lhs, rhs)
             else
                 let lhsvar = Rust.VarName "_lhs"
@@ -2601,18 +2640,45 @@ compound expr returnOld demand op lhs rhs = do
                 in ([ Rust.Let Rust.Immutable rhsvar Nothing (Just (result rhs))
                     , Rust.Let Rust.Immutable lhsvar Nothing (Just (Rust.Borrow Rust.Mutable (result lhs)))
                     ], lhs { result = Rust.Deref (Rust.Var lhsvar) }, rhs { result = Rust.Var rhsvar })
-        (bindings2, ret) = if not demand
+    rhs' <- case op' of
+        Just o -> binop expr o dereflhs boundrhs
+        Nothing -> return boundrhs
+    let assignment = Rust.Assign (result dereflhs) (Rust.:=) (castTo (resultType lhs) rhs')
+```
+
+Next we have to figure out what this assignment was supposed to evaluate
+to, unless the surrounding expression doesn't use the result, in which
+case we don't bother. In practice, most assignments in C programs are
+evaluated only for their side effects, not their result, so we can
+substantially simplify the code we generate by detecting that case.
+
+However, for those few assignments where the result is needed, we have
+to determine whether the result is the newly assigned value (as in
+assignments and pre-increment/decrement operators) or the old value (as
+in post-increment/decrement operators). In the latter case, we let-bind
+a copy of the old value before performing the assignment.
+
+```haskell
+    let (bindings2, ret) =
+            if not demand
             then ([], Nothing)
             else if not returnOld
             then ([], Just (result dereflhs))
             else
                 let oldvar = Rust.VarName "_old"
                 in ([Rust.Let Rust.Immutable oldvar Nothing (Just (result dereflhs))], Just (Rust.Var oldvar))
-    assignment <- Rust.Assign (result dereflhs) (Rust.:=) <$> fmap (castTo (resultType lhs)) (
-            case op' of
-            Just o -> binop expr o dereflhs boundrhs
-            Nothing -> return boundrhs
-        )
+```
+
+Now we put together the generated let-bindings, assignment statement,
+and result expression, and check whether we need a block expression to
+wrap them all up.
+
+If there's no result expression (because the result isn't used), then we
+generate a `void`-typed result. If, in addition, there are no
+let-bindings, then we don't need a block expression at all and can just
+return the assignment expression by itself.
+
+```haskell
     return $ case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
         b@(Rust.Block body Nothing) -> Result
             { resultType = IsVoid
@@ -2622,7 +2688,27 @@ compound expr returnOld demand op lhs rhs = do
                 _ -> Rust.BlockExpr b
             }
         b -> lhs { result = Rust.BlockExpr b }
+    where
+```
 
+We compute a conservative approximation to the question of whether an
+expression has side effects. `hasNoSideEffects` only returns `True` if
+we can be absolutely sure that the expression does not have side
+effects, but may return `False` even for expressions that further
+inspection would show are safe to duplicate.
+
+This is not a general-purpose side-effect checker either. It only
+processes expressions that might appear in an l-value, because that's
+all we currently use it for. For anything else, it would return a
+conservative guess of `False`.
+
+```haskell
+    hasNoSideEffects (Rust.Var{}) = True
+    hasNoSideEffects (Rust.Deref p) = hasNoSideEffects p
+    hasNoSideEffects _ = False
+```
+
+```haskell
 rustSizeOfType :: Rust.Type -> Result
 rustSizeOfType (Rust.TypeName ty) = Result
         { resultType = IsInt Unsigned WordWidth
