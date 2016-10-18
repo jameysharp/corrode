@@ -1265,9 +1265,9 @@ based on whether it is declared `static`.
 
 ```haskell
     (storage, baseTy) <- baseTypeOf specs
-    vis <- case storage of
-        Nothing -> return Rust.Public
-        Just (CStatic _) -> return Rust.Private
+    (attrs, vis) <- case storage of
+        Nothing -> return ([Rust.Attribute "no_mangle"], Rust.Public)
+        Just (CStatic _) -> return ([], Rust.Private)
         Just s -> badSource s "storage class specifier for function"
 ```
 
@@ -1343,7 +1343,6 @@ the result of the function, this generated block never has a final
 expression.
 
 ```haskell
-                let attrs = [Rust.Attribute "no_mangle"]
                 return (Rust.Item attrs vis
                     (Rust.Function [Rust.UnsafeFn, Rust.ExternABI Nothing] name formals (toRustRetType retTy)
                         (statementsToBlock body')))
