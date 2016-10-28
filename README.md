@@ -28,10 +28,15 @@ admin.
 
 Ensure that you have GHC and the `cabal-install` tool installed by following
 the [directions on haskell.org](https://www.haskell.org/downloads#minimal).
-After that, you can build `corrode` by navigating to the `corrode` directory
-and typing
+You'll also need to have the `happy` and `alex` tools available in order to
+build `corrode`: you can install them with the `cabal-install` tool, as well.
+Once you have installed the `cabal-install` tool, you can build `corrode` by
+navigating to the `corrode` directory, installing the `happy` and `alex` tools,
+and then building and installing the `corrode` package:
 
 ```
+cabal install happy
+cabal install alex
 cabal install
 ```
 
