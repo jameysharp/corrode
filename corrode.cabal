@@ -47,4 +47,5 @@ executable corrode-cfg
   build-depends:       base >=4.8,
                        corrode,
                        language-c >=0.4 && <0.6,
+                       pretty,
                        transformers >=0.2

@@ -1,40 +1,18 @@
-module Language.Rust.Corrode.CFG.C (dumpCFGs) where
+module Language.Rust.Corrode.CFG.C (functionCFG) where
 
 import Control.Applicative
-import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.Foldable
 import Data.Maybe
 import Language.C
 import Language.Rust.Corrode.CFG
-import Text.PrettyPrint
-
-dumpCFGs :: CTranslUnit -> IO ()
-dumpCFGs (CTranslUnit decls _) = mapM_ perDecl decls
-    where
-    perDecl (CFDefExt f) = dumpFunction f
-    perDecl _ = return ()
 
 type CSourceCFGT = Reader ControlFlow
 type CSourceBuildCFGT = BuildCFGT CSourceCFGT [CExpr] CExpr
 
-dumpFunction :: CFunDef -> IO ()
-dumpFunction (CFunDef _ declr _ body _) = do
-    let (CFG entry blocks) = simplifiedCFG
-
-    putStrLn (render (pretty declr) ++ ": " ++ show entry)
-    forM_ (reverse blocks) $ \ (label, BasicBlock stmts term) -> do
-        putStrLn (show label ++ ":")
-        putStrLn (render (nest 4 (vcat (map pretty stmts))))
-        case term of
-            Unreachable -> putStrLn "    // unreachable"
-            Branch to -> putStrLn ("    goto " ++ show to ++ ";")
-            CondBranch cond true false -> putStrLn (render (nest 4 ifstmt))
-                where
-                ifstmt = text "if(" <> pretty cond <> text ") goto " <> text (show true) <> text "; else goto " <> text (show false) <> text ";"
-        putStrLn ""
-
+functionCFG :: CFunDef -> CFG [CExpr] CExpr
+functionCFG (CFunDef _ _ _ body _) = simplifiedCFG
     where
     builder = buildCFG $ do
         (early, term) <- walkStatement body ([], Unreachable)
