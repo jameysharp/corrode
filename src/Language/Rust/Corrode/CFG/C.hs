@@ -5,6 +5,7 @@ import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.Foldable
+import Data.Maybe
 import Language.C
 import Language.Rust.Corrode.CFG
 import Text.PrettyPrint
@@ -16,7 +17,7 @@ dumpCFGs (CTranslUnit decls _) = mapM_ perDecl decls
     perDecl _ = return ()
 
 type CSourceCFGT = Reader ControlFlow
-type CSourceBuildCFGT = BuildCFGT CSourceCFGT [CStat] CExpr
+type CSourceBuildCFGT = BuildCFGT CSourceCFGT [CExpr] CExpr
 
 dumpFunction :: CFunDef -> IO ()
 dumpFunction (CFunDef _ declr _ body _) = do
@@ -25,7 +26,7 @@ dumpFunction (CFunDef _ declr _ body _) = do
     putStrLn (render (pretty declr) ++ ": " ++ show entry)
     forM_ (reverse blocks) $ \ (label, BasicBlock stmts term) -> do
         putStrLn (show label ++ ":")
-        putStrLn (render (vcat (map pretty stmts)))
+        putStrLn (render (nest 4 (vcat (map pretty stmts))))
         case term of
             Unreachable -> putStrLn "    // unreachable"
             Branch to -> putStrLn ("    goto " ++ show to ++ ";")
@@ -60,7 +61,10 @@ data ControlFlow = ControlFlow
 localControlFlow :: ControlFlow -> CSourceBuildCFGT a -> CSourceBuildCFGT a
 localControlFlow flow = mapBuildCFGT (local (const flow))
 
-walkStatement :: CStat -> ([CStat], Terminator CExpr) -> CSourceBuildCFGT ([CStat], Terminator CExpr)
+walkStatement :: CStat -> ([CExpr], Terminator CExpr) -> CSourceBuildCFGT ([CExpr], Terminator CExpr)
+walkStatement (CExpr (Just expr) _) (rest, end) = return (expr : rest, end)
+walkStatement (CExpr Nothing _) (rest, end) = return (rest, end)
+
 walkStatement (CCompound [] items _) (rest, end) = foldrM walkBlockItem (rest, end) items
 walkStatement (CIf cond trueStmt mfalseStmt _) (rest, end) = do
     after <- newLabel
@@ -99,13 +103,13 @@ walkStatement (CWhile cond body doWhile _) (rest, end) = do
 
     return ([], Branch (if doWhile then bodyLabel else headerLabel))
 
-walkStatement (CFor initial mcond mincr body node) (rest, end) = do
+walkStatement (CFor initial mcond mincr body _) (rest, end) = do
     after <- newLabel
     addBlock after rest end
 
     headerLabel <- newLabel
     incrLabel <- newLabel
-    addBlock incrLabel (stmtExpr node mincr) (Branch headerLabel)
+    addBlock incrLabel (maybeToList mincr) (Branch headerLabel)
 
     let flow = ControlFlow
             { breakLabel = Just after
@@ -122,7 +126,7 @@ walkStatement (CFor initial mcond mincr body node) (rest, end) = do
         Nothing -> Branch bodyLabel
 
     return $ case initial of
-        Left mexpr -> (stmtExpr node mexpr, Branch headerLabel)
+        Left mexpr -> (maybeToList mexpr, Branch headerLabel)
         Right _ -> ([], Branch headerLabel)
 
 walkStatement (CCont _) _ = do
@@ -133,12 +137,8 @@ walkStatement (CBreak _) _ = do
     Just label <- lift (asks breakLabel)
     return ([], Branch label)
 
-walkStatement stmt (rest, end) = return (stmt : rest, end)
+walkStatement (CReturn _mexpr _) _ = return ([], Unreachable)
 
-stmtExpr :: NodeInfo -> Maybe CExpr -> [CStat]
-stmtExpr _ Nothing = []
-stmtExpr node (Just expr) = [CExpr (Just expr) node]
-
-walkBlockItem :: CBlockItem -> ([CStat], Terminator CExpr) -> CSourceBuildCFGT ([CStat], Terminator CExpr)
+walkBlockItem :: CBlockItem -> ([CExpr], Terminator CExpr) -> CSourceBuildCFGT ([CExpr], Terminator CExpr)
 walkBlockItem (CBlockStmt stmt) (rest, end) = walkStatement stmt (rest, end)
 walkBlockItem _ (rest, end) = return (rest, end)
