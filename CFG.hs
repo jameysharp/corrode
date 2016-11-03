@@ -32,20 +32,8 @@ main = dieOnError $ do
 
     lift $ forM_ decls $ \ decl -> case decl of
         CFDefExt f@(CFunDef _ declr _ _ _) -> do
-            let (CFG entry blocks) = functionCFG f
-
-            putStrLn (render (pretty declr) ++ ": " ++ show entry)
-            forM_ (reverse blocks) $ \ (label, BasicBlock stmts term) -> do
-                putStrLn (show label ++ ":")
-                putStrLn (render (nest 4 (vcat (map pretty stmts))))
-                case term of
-                    Unreachable -> putStrLn "    // unreachable"
-                    Branch to -> putStrLn ("    goto " ++ show to ++ ";")
-                    CondBranch cond true false -> putStrLn (render (nest 4 ifstmt))
-                        where
-                        ifstmt = text "if(" <> pretty cond <> text ") goto " <> text (show true) <> text "; else goto " <> text (show false) <> text ";"
-                putStrLn ""
-
+            putStrLn (render (pretty declr) ++ ":")
+            putStrLn (render (prettyCFG (vcat . map pretty) pretty (functionCFG f)))
         _ -> return ()
 
 dieOnError :: ExceptT String IO a -> IO a

@@ -10,6 +10,7 @@ import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.Array.ST.Safe
 import Data.Maybe
+import Text.PrettyPrint.HughesPJClass
 
 type Label = Int
 data Terminator c
@@ -18,6 +19,21 @@ data Terminator c
     | CondBranch c Label Label
 data BasicBlock s c = BasicBlock s (Terminator c)
 data CFG s c = CFG Label [(Label, BasicBlock s c)]
+
+prettyCFG :: (s -> Doc) -> (c -> Doc) -> CFG s c -> Doc
+prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
+    (text "start @" <> text (show entry)) : blocks'
+    where
+    blocks' = do
+        (label, BasicBlock stmts term) <- reverse blocks
+        let blockHead = text (show label) <> text ":"
+        let blockBody = fmtS stmts
+        let blockTail = case term of
+                Unreachable -> text "// unreachable"
+                Branch to -> text ("goto " ++ show to ++ ";")
+                CondBranch cond true false ->
+                    text "if(" <> fmtC cond <> text ") goto " <> text (show true) <> text "; else goto " <> text (show false) <> text ";"
+        blockHead : map (nest 4) [blockBody, blockTail] ++ [text ""]
 
 data BuildState s c = BuildState
     { buildLabel :: Label
@@ -127,7 +143,7 @@ emptyBlock start = do
             let true' = fromMaybe true afterTrue
             let false' = fromMaybe false afterFalse
             return (BasicBlock startBody (CondBranch cond true' false'))
-        _ -> empty
+        _ -> mzero
     where
     nextLabel next = do
         BasicBlock nextBody (Branch after) <- block next
