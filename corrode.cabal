@@ -14,8 +14,7 @@ library
                        Language.Rust.AST,
                        Language.Rust.Idiomatic,
                        Language.Rust.Corrode.C,
-                       Language.Rust.Corrode.CFG,
-                       Language.Rust.Corrode.CFG.C
+                       Language.Rust.Corrode.CFG
   ghc-options:         -Wall -fwarn-incomplete-uni-patterns -pgmL markdown-unlit
   default-language:    Haskell2010
   build-depends:       base >=4.8,
@@ -37,15 +36,5 @@ executable corrode
                        filepath,
                        language-c >=0.4 && <0.6,
                        markdown-unlit,
-                       pretty,
-                       transformers >=0.2
-
-executable corrode-cfg
-  main-is:             CFG.hs
-  ghc-options:         -Wall
-  default-language:    Haskell2010
-  build-depends:       base >=4.8,
-                       corrode,
-                       language-c >=0.4 && <0.6,
                        pretty,
                        transformers >=0.2

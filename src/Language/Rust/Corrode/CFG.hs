@@ -10,7 +10,7 @@ import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.Array.ST.Safe
 import Data.Maybe
-import Text.PrettyPrint.HughesPJClass
+import Text.PrettyPrint.HughesPJClass hiding (empty)
 
 type Label = Int
 data Terminator c
@@ -63,18 +63,19 @@ data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
     , transformEntries :: STUArray st Label Int
     }
-type TransformCFG st s c a = ReaderT (TransformState st s c) (MaybeT (ST st)) a
+type TransformCFG' st s c = ReaderT (TransformState st s c) (MaybeT (ST st))
+newtype TransformCFG s c = TransformCFG { unTransformCFG :: forall st. Label -> TransformCFG' st s c (BasicBlock s c) }
 
-runTransformCFG :: (forall st. Label -> TransformCFG st s c (BasicBlock s c)) -> CFG s c -> CFG s c
-runTransformCFG transform (CFG start blocks) = runST $ do
+runTransformCFG :: [TransformCFG s c] -> CFG s c -> CFG s c
+runTransformCFG transforms (CFG start blocks) = runST $ do
     let labels = map fst blocks
     let bounds = (minimum labels, maximum labels)
     partial <- TransformState <$> newArray bounds Nothing <*> newArray bounds 0
     writeArray (transformEntries partial) start 1
     forM_ blocks $ \ (label, b@(BasicBlock _ terminator)) -> do
         writeArray (transformBlocks partial) label (Just b)
-        updateEntries (transformEntries partial) (+1) terminator
-    applyTransform partial
+        updateEntries (modifyArray (transformEntries partial) (+1)) terminator
+    applyTransforms partial
     finalBlocks <- getAssocs (transformBlocks partial)
     finalEntries <- getElems (transformEntries partial)
     return $ CFG start
@@ -83,54 +84,66 @@ runTransformCFG transform (CFG start blocks) = runST $ do
         , e > 0
         ]
     where
-    modifyArray a i f = do
+    modifyArray a f i = do
         old <- readArray a i
         writeArray a i (f old)
-    updateEntries _ _ Unreachable = return ()
-    updateEntries a f (Branch target) = modifyArray a target f
-    updateEntries a f (CondBranch _ true false) = do
-        modifyArray a true f
-        modifyArray a false f
-    applyTransform partial = do
+    updateEntries _ Unreachable = return ()
+    updateEntries f (Branch target) = f target
+    updateEntries f (CondBranch _ true false) = do
+        f true
+        f false
+    checkDead :: TransformState st s c -> Label -> ST st ()
+    checkDead partial label = do
+        entries <- readArray (transformEntries partial) label
+        when (entries == 0) $ do
+            old <- readArray (transformBlocks partial) label
+            case old of
+                Just (BasicBlock _ term) ->
+                    updateEntries (modifyArray (transformEntries partial) (subtract 1)) term
+                Nothing -> return ()
+            writeArray (transformBlocks partial) label Nothing
+    applyTransforms partial = foldr (applyTransform partial) (return ()) transforms
+    applyTransform partial transform next = do
         blocks' <- getAssocs (transformBlocks partial)
         changes <- forM blocks' $ \ (label, mblock) -> case mblock of
             Nothing -> return False
             Just (BasicBlock _ oldTerminator) -> do
-                block' <- runMaybeT (runReaderT (transform label) partial)
+                block' <- runMaybeT (runReaderT (unTransformCFG transform label) partial)
                 case block' of
                     Nothing -> return False
                     Just (b@(BasicBlock _ terminator)) -> do
-                        updateEntries (transformEntries partial) (subtract 1) oldTerminator
-                        updateEntries (transformEntries partial) (+ 1) terminator
+                        updateEntries (modifyArray (transformEntries partial) (+ 1)) terminator
+                        updateEntries (modifyArray (transformEntries partial) (subtract 1)) oldTerminator
+                        updateEntries (checkDead partial) oldTerminator
                         writeArray (transformBlocks partial) label (Just b)
                         return True
-        if or changes then applyTransform partial else return ()
+        if or changes then applyTransforms partial else next
 
-block :: Label -> TransformCFG st s c (BasicBlock s c)
+block :: Label -> TransformCFG' st s c (BasicBlock s c)
 block label = do
     blocks <- asks transformBlocks
     lift $ MaybeT $ readArray blocks label
 
-entryPoints :: Label -> TransformCFG st s c Int
+entryPoints :: Label -> TransformCFG' st s c Int
 entryPoints label = do
     entries <- asks transformEntries
     lift $ lift $ readArray entries label
 
-sameTarget :: Terminator c -> Terminator c -> TransformCFG st s c (Terminator c)
+sameTarget :: Terminator c -> Terminator c -> TransformCFG' st s c (Terminator c)
 sameTarget Unreachable b = return b
 sameTarget a Unreachable = return a
 sameTarget (Branch a) (Branch b) | a == b = return (Branch a)
 sameTarget _ _ = fail "different branch targets"
 
-singleUse :: Monoid s => Label -> TransformCFG st s c (BasicBlock s c)
-singleUse start = do
+singleUse :: Monoid s => TransformCFG s c
+singleUse = TransformCFG $ \ start -> do
     BasicBlock startBody (Branch next) <- block start
     1 <- entryPoints next
     BasicBlock nextBody nextTerminator <- block next
     return (BasicBlock (startBody `mappend` nextBody) nextTerminator)
 
-emptyBlock :: Foldable f => Label -> TransformCFG st (f s) c (BasicBlock (f s) c)
-emptyBlock start = do
+emptyBlock :: Foldable f => TransformCFG (f s) c
+emptyBlock = TransformCFG $ \ start -> do
     BasicBlock startBody startTerminator <- block start
     case startTerminator of
         Branch next -> do
@@ -150,40 +163,31 @@ emptyBlock start = do
         guard (null nextBody)
         return after
 
-uselessIf :: Monoid s => (c -> s) -> Label -> TransformCFG st s c (BasicBlock s c)
-uselessIf mkStmt start = do
+ifThenElse :: Monoid s => (c -> s -> s -> s) -> TransformCFG s c
+ifThenElse mkIf = TransformCFG $ \ start -> do
     BasicBlock before (CondBranch cond trueBlock falseBlock) <- block start
-    guard (trueBlock == falseBlock)
-    return (BasicBlock (before `mappend` mkStmt cond) (Branch trueBlock))
-
-ifThen :: Monoid s => (c -> s -> s) -> Label -> TransformCFG st s c (BasicBlock s c)
-ifThen mkIf start = do
-    BasicBlock before (CondBranch cond trueBlock falseBlock) <- block start
-    1 <- entryPoints trueBlock
-    BasicBlock trueBody trueTerminator <- block trueBlock
-    after <- sameTarget (Branch falseBlock) trueTerminator
-    return (BasicBlock (before `mappend` mkIf cond trueBody) after)
-
-ifThenElse :: Monoid s => (c -> s -> s -> s) -> Label -> TransformCFG st s c (BasicBlock s c)
-ifThenElse mkIf start = do
-    BasicBlock before (CondBranch cond trueBlock falseBlock) <- block start
-    1 <- entryPoints trueBlock
-    1 <- entryPoints falseBlock
-    BasicBlock trueBody trueTerminator <- block trueBlock
-    BasicBlock falseBody falseTerminator <- block falseBlock
+    BasicBlock trueBody trueTerminator <- optionalBlock trueBlock
+    BasicBlock falseBody falseTerminator <- optionalBlock falseBlock
     after <- sameTarget trueTerminator falseTerminator
     return (BasicBlock (before `mappend` mkIf cond trueBody falseBody) after)
+    where
+    optionalBlock label = do
+            1 <- entryPoints label
+            block label
+        <|> return (BasicBlock mempty (Branch label))
 
-loopForever :: Monoid s => (s -> s) -> Label -> TransformCFG st s c (BasicBlock s c)
-loopForever mkLoop start = do
+loopForever :: Monoid s => (s -> s) -> TransformCFG s c
+loopForever mkLoop = TransformCFG $ \ start -> do
     BasicBlock body (Branch after) <- block start
     guard (start == after)
     return (BasicBlock (mkLoop body) Unreachable)
 
-while :: Monoid s => (s -> c -> s -> s) -> Label -> TransformCFG st s c (BasicBlock s c)
-while mkWhile start = do
+while :: Monoid s => (c -> b) -> (c -> b) -> (s -> b -> s -> s) -> TransformCFG s c
+while pos neg mkWhile = TransformCFG $ \ start -> do
     BasicBlock preCond (CondBranch cond trueBlock falseBlock) <- block start
-    1 <- entryPoints trueBlock
-    BasicBlock trueBody (Branch afterTrue) <- block trueBlock
-    guard (start == afterTrue)
-    return (BasicBlock (mkWhile preCond cond trueBody) (Branch falseBlock))
+    let isLoop mkCond label other = do
+            1 <- entryPoints label
+            BasicBlock body (Branch after) <- block label
+            guard (start == after)
+            return (BasicBlock (mkWhile preCond (mkCond cond) body) (Branch other))
+    isLoop pos trueBlock falseBlock <|> isLoop neg falseBlock trueBlock

@@ -36,15 +36,15 @@ import Data.Foldable
 import qualified Data.Map.Lazy as Map
 import qualified Data.IntMap.Strict as IntMap
 import Data.Maybe
-import Data.Monoid
 import Data.List
 import Data.STRef
 import qualified Data.Set as Set
 import Language.C
 import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
+import Language.Rust.Corrode.CFG
 import Numeric
-import Text.PrettyPrint
+import Text.PrettyPrint.HughesPJClass hiding (Pretty)
 ```
 
 This translation proceeds in a syntax-directed way. That is, we just
@@ -116,18 +116,11 @@ For example, a `struct` might be defined inside a declaration that's
 inside a loop that's inside a function. We need to get that struct out
 to its own item in Rust.
 
-Similarly, when inside of a loop, we'd like to keep track of whether a
-break or continue statement was used so we can avoid generating
-unnecessary code to deal with edge cases&mdash;see the case of
-`interpretStatement (CFor ..)`.
-
 ```haskell
 data Output = Output
     { outputItems :: [Rust.Item]
     , outputExterns :: Map.Map String Rust.ExternItem
     , outputIncomplete :: Set.Set String
-    , usesBreak :: Any
-    , usesContinue :: Any
     }
 ```
 
@@ -151,8 +144,6 @@ For our output to be a monoid, it needs to specify
             { outputItems = mempty
             , outputExterns = mempty
             , outputIncomplete = mempty
-            , usesBreak = mempty
-            , usesContinue = mempty
             }
     ```
 
@@ -164,8 +155,6 @@ For our output to be a monoid, it needs to specify
             { outputItems = outputItems a `mappend` outputItems b
             , outputExterns = outputExterns a `mappend` outputExterns b
             , outputIncomplete = outputIncomplete a `mappend` outputIncomplete b
-            , usesBreak = usesBreak a `mappend` usesBreak b
-            , usesContinue = usesContinue a `mappend` usesContinue b
             }
     ```
 
@@ -186,17 +175,6 @@ emitIncomplete :: Ident -> EnvMonad s CType
 emitIncomplete ident = do
     lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
     return (IsIncomplete ident)
-```
-
-`recordBreak`/`recordContinue` take note of the presence of a `break`/
-`continue`:
-
-```haskell
-recordBreak :: EnvMonad s ()
-recordBreak = lift $ tell mempty { usesBreak = Any True }
-
-recordContinue :: EnvMonad s ()
-recordContinue = lift $ tell mempty { usesContinue = Any True }
 ```
 
 
@@ -1340,7 +1318,7 @@ Add each formal parameter into the new environment, as a symbol.
 Interpret the body of the function.
 
 ```haskell
-                body' <- interpretStatement body
+                body' <- cfgToRust declr (interpretStatement body (return ([], Unreachable)))
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
@@ -1603,8 +1581,8 @@ that context up in a simple data type.
 data ControlFlow = ControlFlow
     { functionReturnType :: Maybe CType
     , functionName :: Maybe String
-    , onBreak :: Maybe Rust.Expr
-    , onContinue :: Maybe Rust.Expr
+    , onBreak :: Maybe Label
+    , onContinue :: Maybe Label
     }
 ```
 
@@ -1615,7 +1593,9 @@ just a Rust expression), we end up being able to get rid of superfluous
 curly braces.
 
 ```haskell
-interpretStatement :: CStat -> EnvMonad s [Rust.Stmt]
+type CSourceBuildCFGT s = BuildCFGT (EnvMonad s) [Rust.Stmt] Result
+
+interpretStatement :: CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -1626,7 +1606,7 @@ If the statement is empty, as in just a semicolon, we don't need to
 produce any statements.
 
 ```haskell
-interpretStatement (CExpr Nothing _) = return []
+interpretStatement (CExpr Nothing _) next = next
 ```
 
 Otherwise, the first argument to `interpretExpr` indicates whether the
@@ -1634,9 +1614,10 @@ expression appears in a context where its result matters. In a statement
 expression, the result is discarded, so we pass `False`.
 
 ```haskell
-interpretStatement (CExpr (Just expr) _) = do
-    expr' <- interpretExpr False expr
-    return [Rust.Stmt (result expr')]
+interpretStatement (CExpr (Just expr) _) next = do
+    expr' <- lift $ interpretExpr False expr
+    (rest, end) <- next
+    return (Rust.Stmt (result expr') : rest, end)
 ```
 
 We could have a "compound statement", also known as a "block". A
@@ -1648,10 +1629,8 @@ usual rule of not simplifying the generated Rust and simply ignore the
 "statement".
 
 ```haskell
-interpretStatement (CCompound [] [] _) = return []
-interpretStatement (CCompound [] items _) = scope $ do
-    stmts <- concat <$> mapM interpretBlockItem items
-    return [Rust.Stmt (Rust.BlockExpr (statementsToBlock stmts))]
+interpretStatement (CCompound [] items _) next = mapBuildCFGT scope $ do
+    foldr interpretBlockItem next items
 ```
 
 This statement could be an `if` statement, with its conditional
@@ -1670,11 +1649,26 @@ so we don't care whether the original program used a compound statement in
 that branch or not.
 
 ```haskell
-interpretStatement (CIf c t mf _) = do
-    c' <- interpretExpr True c
-    t' <- interpretStatement t
-    f' <- maybe (return []) interpretStatement mf
-    return [Rust.Stmt (Rust.IfThenElse (toBool c') (statementsToBlock t') (statementsToBlock f'))]
+interpretStatement (CIf c t mf _) next = do
+    c' <- lift $ interpretExpr True c
+    after <- newLabel
+
+    falseLabel <- case mf of
+        Nothing -> return after
+        Just f -> do
+            (falseEntry, falseTerm) <- interpretStatement f (return ([], Branch after))
+            falseLabel <- newLabel
+            addBlock falseLabel falseEntry falseTerm
+            return falseLabel
+
+    (trueEntry, trueTerm) <- interpretStatement t (return ([], Branch after))
+    trueLabel <- newLabel
+    addBlock trueLabel trueEntry trueTerm
+
+    (rest, end) <- next
+    addBlock after rest end
+
+    return ([], CondBranch c' trueLabel falseLabel)
 ```
 
 `while` loops are easy to translate from C to Rust. They have identical
@@ -1683,72 +1677,23 @@ semantics in both languages, aside from differences analagous to the
 loop body must be a block.
 
 ```haskell
-interpretStatement (CWhile c b False _) = do
-    c' <- interpretExpr True c
-    (b', _) <- loopScope
-        (Rust.Break Nothing) (Rust.Continue Nothing)
-        (interpretStatement b)
-    return [Rust.Stmt (Rust.While Nothing (toBool c') (statementsToBlock b'))]
-```
+interpretStatement (CWhile c body doWhile _) next = do
+    c' <- lift $ interpretExpr True c
+    after <- newLabel
 
-`do ... while` loops are a little harder to translate because Rust doesn't have a direct equivalent.
-The basic idea is to translate them like this:
+    headerLabel <- newLabel
+    (bodyEntry, bodyTerm) <- loopScope after headerLabel $
+        interpretStatement body (return ([], Branch headerLabel))
 
-```rust
-loop {
-    ...
-    if !cond {
-        break;
-    }
-}
-```
+    bodyLabel <- newLabel
+    addBlock bodyLabel bodyEntry bodyTerm
 
-However, this doesn't quite work in the presence of `continue` statements
-because the loop condition would be skipped.
-Therefore we use a trick, which is also used to translate `for` loops (see below).
-We create a nested inner loop, with a `break` at the end so that it's only run once.
-Breaking out of that loop enables us to jump directly to the loop condition test.
+    addBlock headerLabel [] (CondBranch c' bodyLabel after)
 
-```rust
-'breakTo: loop {
-    'continueTo: loop {
-        ...
-        break;
-    }
-    if !cond {
-        break;
-    }
-}
-```
+    (rest, end) <- next
+    addBlock after rest end
 
-A `break` statement in C is translated to `break 'breakTo`, breaking out of both loops.
-A `continue` statement in C is translated to `break 'continueTo`,
-which breaks out of the inner loop and continues with the loop condition test, as desired.
-
-```haskell
-interpretStatement (CWhile c b True _) = do
-    breakName <- uniqueName "break"
-    continueName <- uniqueName "continue"
-    let breakTo = Just (Rust.Lifetime breakName)
-    let continueTo = Just (Rust.Lifetime continueName)
-
-    (b', (Any sawBreak, Any sawContinue)) <- loopScope
-        (Rust.Break breakTo) (Rust.Break continueTo)
-        (interpretStatement b)
-    let inner = if sawContinue
-            then let block = Rust.Block (b' ++ [Rust.Stmt (Rust.Break Nothing)]) Nothing
-                in [Rust.Stmt (Rust.Loop continueTo block)]
-            else b'
-
-    c' <- interpretExpr True c
-    let loopTest = Rust.Stmt $ Rust.IfThenElse
-            (toNotBool c')
-            (statementsToBlock [Rust.Stmt (Rust.Break Nothing)])
-            (statementsToBlock [])
-
-    let outerLabel = if sawBreak then breakTo else Nothing
-    let outer = Rust.Loop outerLabel (statementsToBlock (inner ++ [loopTest]))
-    return [Rust.Stmt outer]
+    return ([], Branch (if doWhile then bodyLabel else headerLabel))
 ```
 
 C's `for` loops can be tricky to translate to Rust, which doesn't have
@@ -1760,90 +1705,45 @@ of it, and we're good to go. Note that we need to wrap everything in a
 block if we have `let`-bindings, but not otherwise.
 
 ```haskell
-interpretStatement (CFor initial mcond mincr b _) = scope $ case initial of
-    Left Nothing -> generateLoop
-    Left (Just expr) -> do
-        expr' <- interpretExpr False expr
-        loop <- generateLoop
-        return (Rust.Stmt (result expr') : loop)
-    Right decls -> do
-        decls' <- interpretDeclarations makeLetBinding decls
-        loop <- generateLoop
-        return [Rust.Stmt (Rust.BlockExpr (Rust.Block (decls' ++ loop) Nothing))]
-    where
-```
+interpretStatement (CFor initial mcond mincr body _) next = do
+    after <- newLabel
 
-If the condition is empty, the loop should translate to Rust's infinite
-`loop` expression. Otherwise it translates to a `while` loop with the
-given condition. In either case, we may apply a label to this loop.
+    ret <- mapBuildCFGT scope $ do
+        prefix <- case initial of
+            Left Nothing -> return []
+            Left (Just expr) -> do
+                expr' <- lift $ interpretExpr False expr
+                return (exprToStatements expr')
+            Right decls -> lift $ interpretDeclarations makeLetBinding decls
 
-```haskell
-    loopHead lt b' = case mcond of
-        Nothing -> return [Rust.Stmt (Rust.Loop lt (statementsToBlock b'))]
-        Just cond -> do
-            cond' <- interpretExpr True cond
-            return [Rust.Stmt (Rust.While lt (toBool cond') (statementsToBlock b'))]
-```
+        headerLabel <- newLabel
+        incrLabel <- case mincr of
+            Nothing -> return headerLabel
+            Just incr -> do
+                incr' <- lift $ interpretExpr False incr
+                incrLabel <- newLabel
+                addBlock incrLabel (exprToStatements incr') (Branch headerLabel)
+                return incrLabel
 
-The challenge is that Rust doesn't have a loop form that updates
-variables when an iteration ends and the loop condition is about to run.
-In the presence of `continue` statements, this is a peculiar kind of
-non-local control flow. To avoid duplicating code, we wrap the loop body
-in
+        (bodyEntry, bodyTerm) <- loopScope after incrLabel $
+            interpretStatement body (return ([], Branch incrLabel))
 
-```rust
-    'continueTo: loop { ...; break; }
-```
+        bodyLabel <- newLabel
+        addBlock bodyLabel bodyEntry bodyTerm
 
-which, although it's syntactically an infinite loop, will only run once;
-and transform any continue statements into
+        cond <- case mcond of
+            Just cond -> do
+                cond' <- lift $ interpretExpr True cond
+                return (CondBranch cond' bodyLabel after)
+            Nothing -> return (Branch bodyLabel)
+        addBlock headerLabel [] cond
 
-```rust
-    break 'continueTo;
-```
+        return (prefix, Branch headerLabel)
 
-We then give the outer loop a `'breakTo:` label and transform break
-statements into
+    (rest, end) <- next
+    addBlock after rest end
 
-```rust
-    break 'breakTo;
-```
-
-so that they refer to the outer loop, not the one we inserted.
-
-```haskell
-    generateLoop = case mincr of
-        Just incr -> do
-            breakName <- uniqueName "break"
-            continueName <- uniqueName "continue"
-            let breakTo = Just (Rust.Lifetime breakName)
-            let continueTo = Just (Rust.Lifetime continueName)
-
-            (b', (Any sawBreak, Any sawContinue)) <- loopScope
-                (Rust.Break breakTo) (Rust.Break continueTo)
-                (interpretStatement b)
-            let inner = if sawContinue
-                    then [Rust.Stmt (Rust.Loop continueTo (Rust.Block
-                            (b' ++ [Rust.Stmt (Rust.Break Nothing)])
-                        Nothing))]
-                    else b'
-
-            incr' <- interpretExpr False incr
-            loopHead (if sawBreak then breakTo else Nothing)
-                (inner ++ exprToStatements incr')
-```
-
-We can generate simpler code in the special case that this `for` loop
-has an empty increment expression. In that case, we can translate
-`break`/`continue` statements into simple `break`/`continue`
-expressions, with no magic loops inserted into the body.
-
-```haskell
-        Nothing -> do
-            (b', _) <- loopScope
-                (Rust.Break Nothing) (Rust.Continue Nothing)
-                (interpretStatement b)
-            loopHead Nothing b'
+    return ret
 ```
 
 `continue` and `break` statements translate to whatever expression we
@@ -1852,8 +1752,12 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) = recordContinue >> pure . Rust.Stmt <$> getFlow stmt "continue outside loop" onContinue
-interpretStatement stmt@(CBreak _) = recordBreak >> pure . Rust.Stmt <$> getFlow stmt "break outside loop" onBreak
+interpretStatement stmt@(CCont _) _ = lift $ do
+    label <- getFlow stmt "continue outside loop" onContinue
+    return ([], Branch label)
+interpretStatement stmt@(CBreak _) _ = lift $ do
+    label <- getFlow stmt "break outside loop" onBreak
+    return ([], Branch label)
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1864,10 +1768,10 @@ declared return type, then we need to insert a type-cast to the correct
 type.
 
 ```haskell
-interpretStatement stmt@(CReturn expr _) = do
+interpretStatement stmt@(CReturn expr _) _ = lift $ do
     retTy <- getFlow stmt "return statement outside function" functionReturnType
     expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-    return [Rust.Stmt (Rust.Return expr')]
+    return ([Rust.Stmt (Rust.Return expr')], Unreachable)
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -1876,7 +1780,7 @@ translation for yet.
 > **TODO**: Translate more kinds of statements. `:-)`
 
 ```haskell
-interpretStatement stmt = unimplemented stmt
+interpretStatement stmt _ = lift $ unimplemented stmt
 ```
 
 The fields in `ControlFlow` aren't always valid. `getFlow` is a helper
@@ -1898,13 +1802,89 @@ expressions. It also keeps track of whether those constructs ended up being
 used.
 
 ```haskell
-loopScope :: Rust.Expr -> Rust.Expr -> EnvMonad s a -> EnvMonad s (a, (Any, Any))
+loopScope :: Label -> Label -> CSourceBuildCFGT s a -> CSourceBuildCFGT s a
 loopScope b c =
-    mapExceptT (censor (\ output -> output { usesBreak = mempty, usesContinue = mempty })) .
-    liftListen (listens (\ output -> (usesBreak output, usesContinue output))) .
-    mapExceptT (local (\ flow ->
-        flow { onBreak = Just b, onContinue = Just c }))
+    mapBuildCFGT (mapExceptT (local (\ flow ->
+        flow { onBreak = Just b, onContinue = Just c })))
 ```
+
+Once we've built a control-flow graph for a sequence of statements, we
+need to extract equivalent Rust control flow expressions.
+
+```haskell
+cfgToRust :: (Pretty node, Pos node) => node -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> EnvMonad s [Rust.Stmt]
+cfgToRust node build = do
+    rawCFG <- buildCFG $ do
+        (early, term) <- build
+        entry <- newLabel
+        addBlock entry early term
+        return entry
+```
+
+This is not always possible without either introducing new variables
+that weren't in the original program, or duplicating parts of the code.
+At the moment we choose to report a translation error in those cases,
+and for any other control-flow patterns we don't know how to recognize
+yet.
+
+```haskell
+    case runTransformCFG controlFlowPatterns rawCFG of
+        CFG entry [(label, BasicBlock stmts Unreachable)]
+            | label == entry -> return stmts
+        cfg -> noTranslation node ("unsupported control flow:\n" ++ render (nest 4 (prettyCFG (vcat . map pPrint) (pPrint . result) cfg)) ++ "\nfrom")
+    where
+```
+
+The `CFG` module is agnostic to both source and target languages, so we
+need to tell it which common patterns apply to Rust and how to construct
+the appropriate Rust AST.
+
+Order matters in this list. Every block that matches a particular
+pattern will be transformed before trying the next pattern. It's
+important that `ifThenElse` come after `while`, because otherwise
+perfectly good `while` loops may get transformed into an `if` nested
+inside a `loop`.
+
+```haskell
+    controlFlowPatterns =
+        [ singleUse
+        , emptyBlock
+        , while toBool toNotBool (\ p c b -> [Rust.Stmt (Rust.While Nothing (blockExpr p c) (statementsToBlock b))])
+        , ifThenElse (\ c t f -> [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))])
+        , loopForever (\ b -> [Rust.Stmt (Rust.Loop Nothing (statementsToBlock b))])
+        ]
+    blockExpr [] e = e
+    blockExpr p e = Rust.BlockExpr (Rust.Block p (Just e))
+```
+
+To generate code that's as clear as possible, we handle some interesting
+special cases for `if` statements.
+
+- When both the true and false branches are empty, we don't need an
+  `if`-statement at all. We just need to evaluate the condition for its
+  side effects.
+
+    ```haskell
+        simplifyIf c (Rust.Block [] Nothing) (Rust.Block [] Nothing) =
+            result c
+    ```
+
+- When just the true branch is empty, we should compute the opposite of
+  the condition, and swap the branches. Otherwise we'd get an expression
+  like `if ... {} else { ... }`, which just looks silly. This pattern
+  can show up in surprising places, such as translation of some
+  `continue` statements.
+
+    ```haskell
+        simplifyIf c (Rust.Block [] Nothing) f =
+            Rust.IfThenElse (toNotBool c) f (Rust.Block [] Nothing)
+    ```
+
+- Otherwise, just construct a regular `if` statement.
+
+    ```haskell
+        simplifyIf c t f = Rust.IfThenElse (toBool c) t f
+    ```
 
 
 Blocks and scopes
@@ -1915,10 +1895,13 @@ as well as nested statements. `interpretBlockItem` produces a sequence
 of zero or more Rust statements for each compound block item.
 
 ```haskell
-interpretBlockItem :: CBlockItem -> EnvMonad s [Rust.Stmt]
-interpretBlockItem (CBlockStmt stmt) = interpretStatement stmt
-interpretBlockItem (CBlockDecl decl) = interpretDeclarations makeLetBinding decl
-interpretBlockItem item = unimplemented item
+interpretBlockItem :: CBlockItem -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
+interpretBlockItem (CBlockStmt stmt) next = interpretStatement stmt next
+interpretBlockItem (CBlockDecl decl) next = do
+    decl' <- lift (interpretDeclarations makeLetBinding decl)
+    (rest, end) <- next
+    return (decl' ++ rest, end)
+interpretBlockItem item _ = lift (unimplemented item)
 ```
 
 `exprToStatements` is a helper function which turns a Rust expression
@@ -1941,7 +1924,7 @@ inserting excess pairs of curly braces everywhere.
 
 ```haskell
 statementsToBlock :: [Rust.Stmt] -> Rust.Block
-statementsToBlock [Rust.Stmt (Rust.BlockExpr block)] = block
+statementsToBlock [Rust.Stmt (Rust.BlockExpr stmts)] = stmts
 statementsToBlock stmts = Rust.Block stmts Nothing
 ```
 
@@ -2516,16 +2499,16 @@ GCC's "statement expression" extension translates pretty directly to
 Rust block expressions.
 
 ```haskell
-interpretExpr demand (CStatExpr (CCompound [] stmts _) _) = scope $ do
+interpretExpr demand stat@(CStatExpr (CCompound [] stmts _) _) = scope $ do
     let (effects, final) = case last stmts of
             CBlockStmt (CExpr expr _) | demand -> (init stmts, expr)
             _ -> (stmts, Nothing)
-    effects' <- mapM interpretBlockItem effects
+    effects' <- cfgToRust stat (foldr interpretBlockItem (return ([], Unreachable)) effects)
     final' <- mapM (interpretExpr True) final
     return Result
         { resultType = maybe IsVoid resultType final'
         , resultMutable = maybe Rust.Immutable resultMutable final'
-        , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result final'))
+        , result = Rust.BlockExpr (Rust.Block effects' (fmap result final'))
         }
 ```
 
