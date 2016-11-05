@@ -69,12 +69,14 @@ main = dieOnError $ do
    optimization flags that make GCC define preprocessor symbols.
 
     ```haskell
+        let defines = [Define "_FORTIFY_SOURCE" "0"]
+        let undefines = map Undefine ["__BLOCKS__", "__FILE__", "__LINE__"]
         let args = foldl addCppOption
                 (rawArgs
                     { outputFile = Nothing
                     , extraOptions = filter (not . ("-O" `isPrefixOf`)) (extraOptions rawArgs)
                     })
-                (map Undefine ["__BLOCKS__", "__FILE__", "__LINE__"])
+                (defines ++ undefines)
     ```
 
 1. Run the preprocessor&mdash;except that if the input appears to have
