@@ -71,10 +71,13 @@ main = dieOnError $ do
     ```haskell
         let defines = [Define "_FORTIFY_SOURCE" "0"]
         let undefines = map Undefine ["__BLOCKS__", "__FILE__", "__LINE__"]
+        let warnings = ["-Wno-builtin-macro-redefined"]
         let args = foldl addCppOption
                 (rawArgs
                     { outputFile = Nothing
-                    , extraOptions = filter (not . ("-O" `isPrefixOf`)) (extraOptions rawArgs)
+                    , extraOptions =
+                          (filter (not . ("-O" `isPrefixOf`)) (extraOptions rawArgs)) ++
+                          warnings
                     })
                 (defines ++ undefines)
     ```
