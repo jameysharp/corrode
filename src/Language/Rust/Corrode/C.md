@@ -1036,7 +1036,7 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
     go :: CType -> [CDesignator] -> Designator -> EnvMonad s Designator
     go _ [] obj = pure obj
     go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
-        case span (\ (field, _) -> identToString ident /= field) fields of
+        case span (\ (field, _) -> applyRenames ident /= field) fields of
             (_, []) -> badSource d ("designator for field not in struct " ++ name)
             (earlier, (_, ty') : rest) ->
                 go ty' ds (From ty' (length earlier) (map snd rest) obj)
