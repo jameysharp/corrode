@@ -9,6 +9,7 @@ import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.Array.ST.Safe
+import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
 import Text.PrettyPrint.HughesPJClass hiding (empty)
@@ -27,6 +28,11 @@ instance Functor (Terminator' c) where
     fmap _ Unreachable = Unreachable
     fmap f (Branch l) = Branch (f l)
     fmap f (CondBranch c l1 l2) = CondBranch c (f l1) (f l2)
+
+instance Foldable (Terminator' c) where
+    foldMap _ Unreachable = mempty
+    foldMap f (Branch l) = f l
+    foldMap f (CondBranch _ l1 l2) = f l1 `mappend` f l2
 
 instance Functor (BasicBlock' s) where
     fmap f (BasicBlock b t) = BasicBlock b (f t)
@@ -114,7 +120,7 @@ runTransformCFG transforms (CFG start blocks) = runST $ do
     writeArray (transformEntries partial) start 1
     forM_ (IntMap.toList blocks) $ \ (label, b@(BasicBlock _ terminator)) -> do
         writeArray (transformBlocks partial) label (Just b)
-        updateEntries (modifyArray (transformEntries partial) (+1)) terminator
+        traverse_ (modifyArray (transformEntries partial) (+1)) terminator
     applyTransforms partial
     finalBlocks <- getAssocs (transformBlocks partial)
     finalEntries <- getElems (transformEntries partial)
@@ -127,11 +133,6 @@ runTransformCFG transforms (CFG start blocks) = runST $ do
     modifyArray a f i = do
         old <- readArray a i
         writeArray a i (f old)
-    updateEntries _ Unreachable = return ()
-    updateEntries f (Branch target) = f target
-    updateEntries f (CondBranch _ true false) = do
-        f true
-        f false
     checkDead :: TransformState st s c -> Label -> ST st ()
     checkDead partial label = do
         entries <- readArray (transformEntries partial) label
@@ -139,7 +140,7 @@ runTransformCFG transforms (CFG start blocks) = runST $ do
             old <- readArray (transformBlocks partial) label
             case old of
                 Just (BasicBlock _ term) ->
-                    updateEntries (modifyArray (transformEntries partial) (subtract 1)) term
+                    traverse_ (modifyArray (transformEntries partial) (subtract 1)) term
                 Nothing -> return ()
             writeArray (transformBlocks partial) label Nothing
     applyTransforms partial = foldr (applyTransform partial) (return ()) transforms
@@ -152,9 +153,9 @@ runTransformCFG transforms (CFG start blocks) = runST $ do
                 case block' of
                     Nothing -> return False
                     Just (b@(BasicBlock _ terminator)) -> do
-                        updateEntries (modifyArray (transformEntries partial) (+ 1)) terminator
-                        updateEntries (modifyArray (transformEntries partial) (subtract 1)) oldTerminator
-                        updateEntries (checkDead partial) oldTerminator
+                        traverse_ (modifyArray (transformEntries partial) (+ 1)) terminator
+                        traverse_ (modifyArray (transformEntries partial) (subtract 1)) oldTerminator
+                        traverse_ (checkDead partial) oldTerminator
                         writeArray (transformBlocks partial) label (Just b)
                         return True
         if or changes then applyTransforms partial else next
