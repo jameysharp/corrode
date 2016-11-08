@@ -2560,8 +2560,11 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         _ -> promote expr Rust.Add lhs rhs
     CSubOp -> case (resultType lhs, resultType rhs) of
         (IsPtr _ _, IsPtr _ _) -> do
+            ptrTo <- case compatiblePtr (resultType lhs) (resultType rhs) of
+                IsPtr _ ptrTo -> return ptrTo
+                _ -> badSource expr "pointer subtraction of incompatible pointers"
             let ty = IsInt Signed WordWidth
-            let size = rustSizeOfType (toRustType (compatiblePtr (resultType lhs) (resultType rhs)))
+            let size = rustSizeOfType (toRustType ptrTo)
             return Result
                 { resultType = ty
                 , resultMutable = Rust.Immutable
