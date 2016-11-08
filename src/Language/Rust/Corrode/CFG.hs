@@ -106,6 +106,11 @@ removeEmptyBlocks (CFG start blocks) = CFG (rewrite start) blocks'
     rewriteBlock _ (BasicBlock b term) = Just (BasicBlock b (fmap rewrite term))
     blocks' = IntMap.mapMaybeWithKey rewriteBlock blocks
 
+predecessors :: CFG s c -> IntMap.IntMap IntSet.IntSet
+predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
+    where
+    grow from (BasicBlock _ term) rest = foldr (\ to -> IntMap.insertWith IntSet.union to (IntSet.singleton from)) rest term
+
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
     , transformEntries :: STUArray st Label Int
