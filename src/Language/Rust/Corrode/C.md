@@ -1829,7 +1829,7 @@ yet.
 
 ```haskell
     case runTransformCFG controlFlowPatterns (removeEmptyBlocks rawCFG) of
-        CFG entry [(label, BasicBlock stmts Unreachable)]
+        CFG entry (IntMap.toList -> [(label, BasicBlock stmts Unreachable)])
             | label == entry -> return stmts
         cfg -> noTranslation node ("unsupported control flow:\n" ++ render (nest 4 (prettyCFG (vcat . map pPrint) (pPrint . result) cfg)) ++ "\nfrom")
     where

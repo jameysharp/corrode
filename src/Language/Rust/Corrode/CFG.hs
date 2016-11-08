@@ -21,7 +21,7 @@ data Terminator' c l
 type Terminator c = Terminator' c Label
 data BasicBlock' s t = BasicBlock s t
 type BasicBlock s c = BasicBlock' s (Terminator c)
-data CFG s c = CFG Label [(Label, BasicBlock s c)]
+data CFG s c = CFG Label (IntMap.IntMap (BasicBlock s c))
 
 instance Functor (Terminator' c) where
     fmap _ Unreachable = Unreachable
@@ -36,7 +36,7 @@ prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
     (text "start @" <> text (show entry)) : blocks'
     where
     blocks' = do
-        (label, BasicBlock stmts term) <- reverse blocks
+        (label, BasicBlock stmts term) <- reverse (IntMap.toList blocks)
         let blockHead = text (show label) <> text ":"
         let blockBody = fmtS stmts
         let blockTail = case term of
@@ -48,7 +48,7 @@ prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
 
 data BuildState s c = BuildState
     { buildLabel :: Label
-    , buildBlocks :: [(Label, BasicBlock s c)]
+    , buildBlocks :: IntMap.IntMap (BasicBlock s c)
     }
 type BuildCFGT m s c = StateT (BuildState s c) m
 
@@ -63,11 +63,11 @@ newLabel = do
 
 addBlock :: Monad m => Label -> s -> Terminator c -> BuildCFGT m s c ()
 addBlock label stmt terminator = do
-    modify (\ st -> st { buildBlocks = (label, BasicBlock stmt terminator) : buildBlocks st })
+    modify (\ st -> st { buildBlocks = IntMap.insert label (BasicBlock stmt terminator) (buildBlocks st) })
 
 buildCFG :: Monad m => BuildCFGT m s c Label -> m (CFG s c)
 buildCFG root = do
-    (label, final) <- runStateT root (BuildState 0 [])
+    (label, final) <- runStateT root (BuildState 0 IntMap.empty)
     return (CFG label (buildBlocks final))
 
 removeEmptyBlocks :: Foldable f => CFG (f s) c -> CFG (f s) c
@@ -91,20 +91,14 @@ removeEmptyBlocks (CFG start blocks) = CFG (rewrite start) blocks'
         (empties', done') <- get
         let to' = IntMap.findWithDefault to to done'
         put (empties', IntMap.insert from to' done')
-    rewrites = snd $ execState go
-        (IntMap.fromList
-            [ (from, to)
-            | (from, BasicBlock s (Branch to)) <- blocks
-            , null s
-            ]
-        , IntMap.empty)
+    isBlockEmpty (BasicBlock s (Branch to)) | null s = Just to
+    isBlockEmpty _ = Nothing
+    rewrites = snd $ execState go (IntMap.mapMaybe isBlockEmpty blocks, IntMap.empty)
     rewrite to = IntMap.findWithDefault to to rewrites
     discards = IntMap.keysSet (IntMap.filterWithKey (/=) rewrites)
-    blocks' =
-        [ (from, BasicBlock b (fmap rewrite term))
-        | (from, BasicBlock b term) <- blocks
-        , from `IntSet.notMember` discards
-        ]
+    rewriteBlock from _ | from `IntSet.member` discards = Nothing
+    rewriteBlock _ (BasicBlock b term) = Just (BasicBlock b (fmap rewrite term))
+    blocks' = IntMap.mapMaybeWithKey rewriteBlock blocks
 
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
@@ -115,17 +109,16 @@ newtype TransformCFG s c = TransformCFG { unTransformCFG :: forall st. Label -> 
 
 runTransformCFG :: [TransformCFG s c] -> CFG s c -> CFG s c
 runTransformCFG transforms (CFG start blocks) = runST $ do
-    let labels = map fst blocks
-    let bounds = (minimum labels, maximum labels)
+    let bounds = (fst (IntMap.findMin blocks), fst (IntMap.findMax blocks))
     partial <- TransformState <$> newArray bounds Nothing <*> newArray bounds 0
     writeArray (transformEntries partial) start 1
-    forM_ blocks $ \ (label, b@(BasicBlock _ terminator)) -> do
+    forM_ (IntMap.toList blocks) $ \ (label, b@(BasicBlock _ terminator)) -> do
         writeArray (transformBlocks partial) label (Just b)
         updateEntries (modifyArray (transformEntries partial) (+1)) terminator
     applyTransforms partial
     finalBlocks <- getAssocs (transformBlocks partial)
     finalEntries <- getElems (transformEntries partial)
-    return $ CFG start
+    return $ CFG start $ IntMap.fromDistinctAscList
         [ (label, b)
         | ((label, Just b), e) <- zip finalBlocks finalEntries
         , e > 0
