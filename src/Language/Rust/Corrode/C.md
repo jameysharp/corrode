@@ -1828,7 +1828,7 @@ and for any other control-flow patterns we don't know how to recognize
 yet.
 
 ```haskell
-    case runTransformCFG controlFlowPatterns rawCFG of
+    case runTransformCFG controlFlowPatterns (removeEmptyBlocks rawCFG) of
         CFG entry [(label, BasicBlock stmts Unreachable)]
             | label == entry -> return stmts
         cfg -> noTranslation node ("unsupported control flow:\n" ++ render (nest 4 (prettyCFG (vcat . map pPrint) (pPrint . result) cfg)) ++ "\nfrom")
@@ -1848,7 +1848,6 @@ inside a `loop`.
 ```haskell
     controlFlowPatterns =
         [ singleUse
-        , emptyBlock
         , while toBool toNotBool (\ p c b -> [Rust.Stmt (Rust.While Nothing (blockExpr p c) (statementsToBlock b))])
         , ifThenElse (\ c t f -> [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))])
         , loopForever (\ b -> [Rust.Stmt (Rust.Loop Nothing (statementsToBlock b))])

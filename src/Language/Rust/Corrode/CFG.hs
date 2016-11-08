@@ -9,16 +9,27 @@ import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Data.Array.ST.Safe
-import Data.Maybe
+import qualified Data.IntMap.Lazy as IntMap
+import qualified Data.IntSet as IntSet
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 
 type Label = Int
-data Terminator c
+data Terminator' c l
     = Unreachable
-    | Branch Label
-    | CondBranch c Label Label
-data BasicBlock s c = BasicBlock s (Terminator c)
+    | Branch l
+    | CondBranch c l l
+type Terminator c = Terminator' c Label
+data BasicBlock' s t = BasicBlock s t
+type BasicBlock s c = BasicBlock' s (Terminator c)
 data CFG s c = CFG Label [(Label, BasicBlock s c)]
+
+instance Functor (Terminator' c) where
+    fmap _ Unreachable = Unreachable
+    fmap f (Branch l) = Branch (f l)
+    fmap f (CondBranch c l1 l2) = CondBranch c (f l1) (f l2)
+
+instance Functor (BasicBlock' s) where
+    fmap f (BasicBlock b t) = BasicBlock b (f t)
 
 prettyCFG :: (s -> Doc) -> (c -> Doc) -> CFG s c -> Doc
 prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
@@ -58,6 +69,42 @@ buildCFG :: Monad m => BuildCFGT m s c Label -> m (CFG s c)
 buildCFG root = do
     (label, final) <- runStateT root (BuildState 0 [])
     return (CFG label (buildBlocks final))
+
+removeEmptyBlocks :: Foldable f => CFG (f s) c -> CFG (f s) c
+removeEmptyBlocks (CFG start blocks) = CFG (rewrite start) blocks'
+    where
+    go = do
+        (empties, done) <- get
+        case IntMap.minViewWithKey empties of
+            Nothing -> return ()
+            Just ((from, to), empties') -> do
+                put (empties', done)
+                step from to
+                go
+    step from to = do
+        (empties, done) <- get
+        case IntMap.splitLookup to empties of
+            (_, Nothing, _) -> return ()
+            (e1, Just to', e2) -> do
+                put (e1 `IntMap.union` e2, done)
+                step to to'
+        (empties', done') <- get
+        let to' = IntMap.findWithDefault to to done'
+        put (empties', IntMap.insert from to' done')
+    rewrites = snd $ execState go
+        (IntMap.fromList
+            [ (from, to)
+            | (from, BasicBlock s (Branch to)) <- blocks
+            , null s
+            ]
+        , IntMap.empty)
+    rewrite to = IntMap.findWithDefault to to rewrites
+    discards = IntMap.keysSet (IntMap.filterWithKey (/=) rewrites)
+    blocks' =
+        [ (from, BasicBlock b (fmap rewrite term))
+        | (from, BasicBlock b term) <- blocks
+        , from `IntSet.notMember` discards
+        ]
 
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
@@ -141,27 +188,6 @@ singleUse = TransformCFG $ \ start -> do
     1 <- entryPoints next
     BasicBlock nextBody nextTerminator <- block next
     return (BasicBlock (startBody `mappend` nextBody) nextTerminator)
-
-emptyBlock :: Foldable f => TransformCFG (f s) c
-emptyBlock = TransformCFG $ \ start -> do
-    BasicBlock startBody startTerminator <- block start
-    case startTerminator of
-        Branch next -> do
-            after <- nextLabel next
-            return (BasicBlock startBody (Branch after))
-        CondBranch cond true false -> do
-            afterTrue <- optional (nextLabel true)
-            afterFalse <- optional (nextLabel false)
-            guard (isJust afterTrue || isJust afterFalse)
-            let true' = fromMaybe true afterTrue
-            let false' = fromMaybe false afterFalse
-            return (BasicBlock startBody (CondBranch cond true' false'))
-        _ -> mzero
-    where
-    nextLabel next = do
-        BasicBlock nextBody (Branch after) <- block next
-        guard (null nextBody)
-        return after
 
 ifThenElse :: Monoid s => (c -> s -> s -> s) -> TransformCFG s c
 ifThenElse mkIf = TransformCFG $ \ start -> do
