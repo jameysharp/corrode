@@ -13,6 +13,7 @@ import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
 import Data.List
+import qualified Data.Map.Lazy as Map
 import Data.Maybe
 import Data.Ord
 import Text.PrettyPrint.HughesPJClass hiding (empty)
@@ -173,6 +174,23 @@ nestLoops cfg = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet
     insertLoop (Loops loops) (header, inside) =
         case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) loops of
         (nested, disjoint) -> Loops (IntMap.insert header (inside, Loops nested) disjoint)
+
+data Exit = BreakFrom Label | ContinueTo Label
+    deriving Show
+
+exitEdges :: CFG s c -> Map.Map (Label, Label) Exit
+exitEdges cfg@(CFG _ blocks) = go (nestLoops cfg)
+    where
+    successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
+    go (Loops loops) = Map.unions (map eachLoop (IntMap.toList loops))
+    eachLoop (header, (nodes, nested)) = exits `Map.union` go nested
+        where
+        exits = Map.fromList
+            [ ((from, to), if to == header then ContinueTo to else BreakFrom header)
+            | from <- IntSet.toList nodes
+            , to <- IntMap.findWithDefault [] from successors
+            , to == header || to `IntSet.notMember` nodes
+            ]
 
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
