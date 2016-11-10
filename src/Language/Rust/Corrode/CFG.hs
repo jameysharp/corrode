@@ -139,6 +139,17 @@ dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
     go seen label = IntMap.insert label (update seen label) seen
     check seen label = Just (update seen label) == IntMap.lookup label seen
 
+backEdges :: CFG s c -> Maybe (IntMap.IntMap IntSet.IntSet)
+backEdges cfg = do
+    dom <- dominators cfg
+    return
+        $ IntMap.filter (not . IntSet.null)
+        $ IntMap.intersectionWith IntSet.intersection (flipEdges dom)
+        $ predecessors cfg
+    where
+    flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
+    flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
+
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
     , transformEntries :: STUArray st Label Int
