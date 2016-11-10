@@ -12,7 +12,9 @@ import Data.Array.ST.Safe
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
+import Data.List
 import Data.Maybe
+import Data.Ord
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 
 type Label = Int
@@ -161,6 +163,16 @@ naturalLoops cfg = IntMap.mapWithKey makeLoop (fromMaybe IntMap.empty (backEdges
         if IntSet.null new then return () else do
             put (inLoop `IntSet.union` new)
             growLoop (IntSet.unions (mapMaybe (\ label -> IntMap.lookup label allPredecessors) (IntSet.toList new)))
+
+newtype Loops = Loops (IntMap.IntMap (IntSet.IntSet, Loops))
+    deriving Show
+
+nestLoops :: CFG s c -> Loops
+nestLoops cfg = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList (naturalLoops cfg)))
+    where
+    insertLoop (Loops loops) (header, inside) =
+        case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) loops of
+        (nested, disjoint) -> Loops (IntMap.insert header (inside, Loops nested) disjoint)
 
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
