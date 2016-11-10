@@ -150,6 +150,18 @@ backEdges cfg = do
     flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
     flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
+naturalLoops :: CFG s c -> IntMap.IntMap IntSet.IntSet
+naturalLoops cfg = IntMap.mapWithKey makeLoop (fromMaybe IntMap.empty (backEdges cfg))
+    where
+    makeLoop header inside = execState (growLoop inside) (IntSet.singleton header)
+    allPredecessors = predecessors cfg
+    growLoop toAdd = do
+        inLoop <- get
+        let new = toAdd `IntSet.difference` inLoop
+        if IntSet.null new then return () else do
+            put (inLoop `IntSet.union` new)
+            growLoop (IntSet.unions (mapMaybe (\ label -> IntMap.lookup label allPredecessors) (IntSet.toList new)))
+
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
     , transformEntries :: STUArray st Label Int
