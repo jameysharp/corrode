@@ -12,6 +12,7 @@ import Data.Array.ST.Safe
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
+import Data.Maybe
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 
 type Label = Int
@@ -110,6 +111,33 @@ predecessors :: CFG s c -> IntMap.IntMap IntSet.IntSet
 predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
     where
     grow from (BasicBlock _ term) rest = foldr (\ to -> IntMap.insertWith IntSet.union to (IntSet.singleton from)) rest term
+
+dominators :: CFG s c -> Maybe (IntMap.IntMap IntSet.IntSet)
+dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
+    seen | all (check seen) (IntMap.keys blocks) -> Just seen
+    _ -> Nothing
+    where
+    search label = do
+        (seen, order) <- get
+        if label `IntSet.member` seen then return () else do
+            put (IntSet.insert label seen, order)
+            case IntMap.lookup label blocks of
+                Just (BasicBlock _ term) -> traverse_ search term
+                _ -> return ()
+            modify (\ (seen', order') -> (seen', label : order'))
+    dfs = snd (execState (search start) (IntSet.empty, []))
+
+    update seen label = IntSet.insert label self
+        where
+        allPredecessors = predecessors cfg
+        selfPredecessors = maybe [] IntSet.toList (IntMap.lookup label allPredecessors)
+        predecessorDominators = mapMaybe (\ parent -> IntMap.lookup parent seen) selfPredecessors
+        self = case predecessorDominators of
+            [] -> IntSet.empty
+            _ -> foldr1 IntSet.intersection predecessorDominators
+
+    go seen label = IntMap.insert label (update seen label) seen
+    check seen label = Just (update seen label) == IntMap.lookup label seen
 
 data TransformState st s c = TransformState
     { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
