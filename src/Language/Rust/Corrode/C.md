@@ -1828,11 +1828,12 @@ and for any other control-flow patterns we don't know how to recognize
 yet.
 
 ```haskell
-    case runTransformCFG controlFlowPatterns (removeEmptyBlocks rawCFG) of
-        CFG entry (IntMap.toList -> [(label, BasicBlock stmts Unreachable)])
-            | label == entry -> return stmts
-        cfg -> noTranslation node ("unsupported control flow:\n" ++ render (nest 4 (prettyCFG (vcat . map pPrint) (pPrint . result) cfg)) ++ "\nfrom")
+    let cfg = removeEmptyBlocks rawCFG
+    case structureCFG mkBreak mkContinue mkLoop mkIf cfg of
+        Right stmts -> return stmts
+        Left msg -> noTranslation node (msg ++ ":\n" ++ render (nest 4 (prettyRustCFG cfg)) ++ "\nfrom")
     where
+    prettyRustCFG cfg = prettyCFG (vcat . map pPrint) (pPrint . result) cfg
 ```
 
 The `CFG` module is agnostic to both source and target languages, so we
@@ -1846,14 +1847,11 @@ perfectly good `while` loops may get transformed into an `if` nested
 inside a `loop`.
 
 ```haskell
-    controlFlowPatterns =
-        [ singleUse
-        , while toBool toNotBool (\ p c b -> [Rust.Stmt (Rust.While Nothing (blockExpr p c) (statementsToBlock b))])
-        , ifThenElse (\ c t f -> [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))])
-        , loopForever (\ b -> [Rust.Stmt (Rust.Loop Nothing (statementsToBlock b))])
-        ]
-    blockExpr [] e = e
-    blockExpr p e = Rust.BlockExpr (Rust.Block p (Just e))
+    loopLabel l = Rust.Lifetime ("loop" ++ show l)
+    mkBreak l = [Rust.Stmt (Rust.Break (Just (loopLabel l)))]
+    mkContinue l = [Rust.Stmt (Rust.Continue (Just (loopLabel l)))]
+    mkLoop l b = [Rust.Stmt (Rust.Loop (Just (loopLabel l)) (statementsToBlock b))]
+    mkIf c t f = [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))]
 ```
 
 To generate code that's as clear as possible, we handle some interesting

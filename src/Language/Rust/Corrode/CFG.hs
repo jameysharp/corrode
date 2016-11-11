@@ -1,14 +1,7 @@
 {-# LANGUAGE Rank2Types #-}
 module Language.Rust.Corrode.CFG where
 
-import Control.Applicative
-import Control.Monad
-import Control.Monad.ST
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.Maybe
-import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
-import Data.Array.ST.Safe
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
@@ -192,108 +185,54 @@ exitEdges cfg@(CFG _ blocks) = go (nestLoops cfg)
             , to == header || to `IntSet.notMember` nodes
             ]
 
-data TransformState st s c = TransformState
-    { transformBlocks :: STArray st Label (Maybe (BasicBlock s c))
-    , transformEntries :: STUArray st Label Int
-    }
-type TransformCFG' st s c = ReaderT (TransformState st s c) (MaybeT (ST st))
-newtype TransformCFG s c = TransformCFG { unTransformCFG :: forall st. Label -> TransformCFG' st s c (BasicBlock s c) }
-
-runTransformCFG :: [TransformCFG s c] -> CFG s c -> CFG s c
-runTransformCFG transforms (CFG start blocks) = runST $ do
-    let bounds = (fst (IntMap.findMin blocks), fst (IntMap.findMax blocks))
-    partial <- TransformState <$> newArray bounds Nothing <*> newArray bounds 0
-    writeArray (transformEntries partial) start 1
-    forM_ (IntMap.toList blocks) $ \ (label, b@(BasicBlock _ terminator)) -> do
-        writeArray (transformBlocks partial) label (Just b)
-        traverse_ (modifyArray (transformEntries partial) (+1)) terminator
-    applyTransforms partial
-    finalBlocks <- getAssocs (transformBlocks partial)
-    finalEntries <- getElems (transformEntries partial)
-    return $ CFG start $ IntMap.fromDistinctAscList
-        [ (label, b)
-        | ((label, Just b), e) <- zip finalBlocks finalEntries
-        , e > 0
+structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG s c -> Either String s
+structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = closed (nestLoops cfg) start
+    where
+    exits = exitEdges cfg
+    allPredecessors = IntMap.differenceWith (\ big little -> Just (IntSet.difference big little)) (predecessors cfg) (IntMap.fromListWith IntSet.union [ (to, IntSet.singleton from) | (from, to) <- Map.keys exits ])
+    sameEdge _ (Right a) (Right b) | a == b = Right a
+    sameEdge header _ _ = Left ("multiple break targets from " ++ show header)
+    breakFroms = IntMap.fromListWithKey sameEdge
+        [ (header, Right to)
+        | ((_, to), BreakFrom header) <- Map.toList exits
         ]
-    where
-    modifyArray a f i = do
-        old <- readArray a i
-        writeArray a i (f old)
-    checkDead :: TransformState st s c -> Label -> ST st ()
-    checkDead partial label = do
-        entries <- readArray (transformEntries partial) label
-        when (entries == 0) $ do
-            old <- readArray (transformBlocks partial) label
-            case old of
-                Just (BasicBlock _ term) ->
-                    traverse_ (modifyArray (transformEntries partial) (subtract 1)) term
-                Nothing -> return ()
-            writeArray (transformBlocks partial) label Nothing
-    applyTransforms partial = foldr (applyTransform partial) (return ()) transforms
-    applyTransform partial transform next = do
-        blocks' <- getAssocs (transformBlocks partial)
-        changes <- forM blocks' $ \ (label, mblock) -> case mblock of
-            Nothing -> return False
-            Just (BasicBlock _ oldTerminator) -> do
-                block' <- runMaybeT (runReaderT (unTransformCFG transform label) partial)
-                case block' of
-                    Nothing -> return False
-                    Just (b@(BasicBlock _ terminator)) -> do
-                        traverse_ (modifyArray (transformEntries partial) (+ 1)) terminator
-                        traverse_ (modifyArray (transformEntries partial) (subtract 1)) oldTerminator
-                        traverse_ (checkDead partial) oldTerminator
-                        writeArray (transformBlocks partial) label (Just b)
-                        return True
-        if or changes then applyTransforms partial else next
-
-block :: Label -> TransformCFG' st s c (BasicBlock s c)
-block label = do
-    blocks <- asks transformBlocks
-    lift $ MaybeT $ readArray blocks label
-
-entryPoints :: Label -> TransformCFG' st s c Int
-entryPoints label = do
-    entries <- asks transformEntries
-    lift $ lift $ readArray entries label
-
-sameTarget :: Terminator c -> Terminator c -> TransformCFG' st s c (Terminator c)
-sameTarget Unreachable b = return b
-sameTarget a Unreachable = return a
-sameTarget (Branch a) (Branch b) | a == b = return (Branch a)
-sameTarget _ _ = fail "different branch targets"
-
-singleUse :: Monoid s => TransformCFG s c
-singleUse = TransformCFG $ \ start -> do
-    BasicBlock startBody (Branch next) <- block start
-    1 <- entryPoints next
-    BasicBlock nextBody nextTerminator <- block next
-    return (BasicBlock (startBody `mappend` nextBody) nextTerminator)
-
-ifThenElse :: Monoid s => (c -> s -> s -> s) -> TransformCFG s c
-ifThenElse mkIf = TransformCFG $ \ start -> do
-    BasicBlock before (CondBranch cond trueBlock falseBlock) <- block start
-    BasicBlock trueBody trueTerminator <- optionalBlock trueBlock
-    BasicBlock falseBody falseTerminator <- optionalBlock falseBlock
-    after <- sameTarget trueTerminator falseTerminator
-    return (BasicBlock (before `mappend` mkIf cond trueBody falseBody) after)
-    where
-    optionalBlock label = do
-            1 <- entryPoints label
-            block label
-        <|> return (BasicBlock mempty (Branch label))
-
-loopForever :: Monoid s => (s -> s) -> TransformCFG s c
-loopForever mkLoop = TransformCFG $ \ start -> do
-    BasicBlock body (Branch after) <- block start
-    guard (start == after)
-    return (BasicBlock (mkLoop body) Unreachable)
-
-while :: Monoid s => (c -> b) -> (c -> b) -> (s -> b -> s -> s) -> TransformCFG s c
-while pos neg mkWhile = TransformCFG $ \ start -> do
-    BasicBlock preCond (CondBranch cond trueBlock falseBlock) <- block start
-    let isLoop mkCond label other = do
-            1 <- entryPoints label
-            BasicBlock body (Branch after) <- block label
-            guard (start == after)
-            return (BasicBlock (mkWhile preCond (mkCond cond) body) (Branch other))
-    isLoop pos trueBlock falseBlock <|> isLoop neg falseBlock trueBlock
+    closed loops label = do
+        (body, rest) <- go loops label
+        case rest of
+            Nothing -> return body
+            Just after -> Left ("unexpected edge from " ++ show label ++ " to " ++ show after)
+    go (Loops loops) label =
+        case IntMap.lookup label loops of
+        Just (_, nested) -> do
+            body <- closed nested label
+            let loop = mkLoop label body
+            case IntMap.lookup label breakFroms of
+                Nothing -> return (loop, Nothing)
+                Just mafter -> do
+                    after <- mafter
+                    (rest1, rest2) <- go (Loops loops) after
+                    return (loop `mappend` rest1, rest2)
+        Nothing -> do
+            BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
+            (rest1, rest2) <- case term of
+                Unreachable -> return (mempty, Nothing)
+                Branch to -> next 1 to
+                CondBranch c t f -> do
+                    (t', afterT) <- next 1 t
+                    (f', afterF) <- next 1 f
+                    case (afterT, afterF) of
+                        (Just (nextT, branchesT), Just (nextF, branchesF)) | nextT == nextF -> do
+                            (rest1, rest2) <- next (branchesT + branchesF) nextT
+                            return (mkIf c t' f' `mappend` rest1, rest2)
+                        (Nothing, Nothing) -> return (mkIf c t' mempty `mappend` f', Nothing)
+                        _ -> Left ("unsupported conditional branch from " ++ show label ++ " to " ++ show afterT ++ " and " ++ show afterF)
+            return (body `mappend` rest1, rest2)
+        where
+        next branches to = case Map.lookup (label, to) exits of
+            Nothing ->
+                let p = IntMap.findWithDefault IntSet.empty to allPredecessors in
+                if IntSet.size p == branches
+                then go (Loops loops) to
+                else return (mempty, Just (to, branches))
+            Just (BreakFrom header) -> return (mkBreak header, Nothing)
+            Just (ContinueTo header) -> return (mkContinue header, Nothing)
