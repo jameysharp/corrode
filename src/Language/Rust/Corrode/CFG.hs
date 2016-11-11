@@ -190,10 +190,10 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = closed (nes
     where
     exits = exitEdges cfg
     allPredecessors = IntMap.differenceWith (\ big little -> Just (IntSet.difference big little)) (predecessors cfg) (IntMap.fromListWith IntSet.union [ (to, IntSet.singleton from) | (from, to) <- Map.keys exits ])
-    sameEdge _ (Right a) (Right b) | a == b = Right a
-    sameEdge header _ _ = Left ("multiple break targets from " ++ show header)
-    breakFroms = IntMap.fromListWithKey sameEdge
-        [ (header, Right to)
+    sameEdge [a] [b] | a == b = [a]
+    sameEdge a b = a ++ b
+    breakFroms = IntMap.fromListWith sameEdge
+        [ (header, [to])
         | ((_, to), BreakFrom header) <- Map.toList exits
         ]
     closed loops label = do
@@ -208,10 +208,11 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = closed (nes
             let loop = mkLoop label body
             case IntMap.lookup label breakFroms of
                 Nothing -> return (loop, Nothing)
-                Just mafter -> do
-                    after <- mafter
+                Just [after] -> do
                     (rest1, rest2) <- go (Loops loops) after
                     return (loop `mappend` rest1, rest2)
+                Just targets ->
+                    Left ("multiple break targets from " ++ show label ++ ": " ++ show targets)
         Nothing -> do
             BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
             (rest1, rest2) <- case term of
