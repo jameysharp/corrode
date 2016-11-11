@@ -88,9 +88,7 @@ simple operations.
   to the output.
 
 Actually, we use a combined type, `RWS`, which supports the operations
-of reader, writer, and state monads all in one. We use the reader monad
-for control flow context, which is covered in more detail in the section
-on statements, below.
+of reader, writer, and state monads all in one.
 
 You probably don't need to read any of the awful monad tutorials out
 there just to use these! The important point is that we have this type
@@ -98,12 +96,23 @@ alias, `EnvMonad`, which you'll see throughout this module. It marks
 pieces of code which have access to the environment and the output.
 
 ```haskell
-type EnvMonad s = ExceptT String (RWST ControlFlow Output (EnvState s) (ST s))
+type EnvMonad s = ExceptT String (RWST FunctionContext Output (EnvState s) (ST s))
 ```
 
 In fact, we're going to wrap up the monad operations in some helper
 functions, and then only use those helpers everywhere else. But first,
 let's define our state and writer types.
+
+
+Context
+-------
+
+```haskell
+data FunctionContext = FunctionContext
+    { functionReturnType :: Maybe CType
+    , functionName :: Maybe String
+    }
+```
 
 
 Output
@@ -507,11 +516,9 @@ Specifically, we:
   translation.
 
 ```haskell
-    initFlow = ControlFlow
+    initFlow = FunctionContext
         { functionReturnType = Nothing
         , functionName = Nothing
-        , onBreak = Nothing
-        , onContinue = Nothing
         }
     initState = EnvState
         { symbolEnvironment = []
@@ -1573,15 +1580,13 @@ pointer stored in a global variable named `environ` for this argument.
 Statements
 ==========
 
-In order to interpret `return`, `break`, and `continue` statements, we
-need a bit of extra context, which we'll discuss as we go. Let's wrap
-that context up in a simple data type.
+In order to interpret `break` and `continue` statements, we need a bit
+of extra context, which we'll discuss as we go. Let's wrap that context
+up in a simple data type.
 
 ```haskell
-data ControlFlow = ControlFlow
-    { functionReturnType :: Maybe CType
-    , functionName :: Maybe String
-    , onBreak :: Maybe Label
+data OuterLabels = OuterLabels
+    { onBreak :: Maybe Label
     , onContinue :: Maybe Label
     }
 ```
@@ -1593,7 +1598,7 @@ just a Rust expression), we end up being able to get rid of superfluous
 curly braces.
 
 ```haskell
-type CSourceBuildCFGT s = BuildCFGT (EnvMonad s) [Rust.Stmt] Result
+type CSourceBuildCFGT s = BuildCFGT (RWST OuterLabels [()] () (EnvMonad s)) [Rust.Stmt] Result
 
 interpretStatement :: CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 ```
@@ -1624,7 +1629,7 @@ expression, the result is discarded, so we pass `False`.
 
 ```haskell
 interpretStatement (CExpr (Just expr) _) next = do
-    expr' <- lift $ interpretExpr False expr
+    expr' <- lift $ lift $ interpretExpr False expr
     (rest, end) <- next
     return (Rust.Stmt (result expr') : rest, end)
 ```
@@ -1638,7 +1643,7 @@ usual rule of not simplifying the generated Rust and simply ignore the
 "statement".
 
 ```haskell
-interpretStatement (CCompound [] items _) next = mapBuildCFGT scope $ do
+interpretStatement (CCompound [] items _) next = mapBuildCFGT (mapRWST scope) $ do
     foldr interpretBlockItem next items
 ```
 
@@ -1659,7 +1664,7 @@ that branch or not.
 
 ```haskell
 interpretStatement (CIf c t mf _) next = do
-    c' <- lift $ interpretExpr True c
+    c' <- lift $ lift $ interpretExpr True c
     after <- newLabel
 
     falseLabel <- case mf of
@@ -1687,11 +1692,11 @@ loop body must be a block.
 
 ```haskell
 interpretStatement (CWhile c body doWhile _) next = do
-    c' <- lift $ interpretExpr True c
+    c' <- lift $ lift $ interpretExpr True c
     after <- newLabel
 
     headerLabel <- newLabel
-    (bodyEntry, bodyTerm) <- loopScope after headerLabel $
+    (bodyEntry, bodyTerm) <- setBreak after $ setContinue headerLabel $
         interpretStatement body (return ([], Branch headerLabel))
 
     bodyLabel <- newLabel
@@ -1717,24 +1722,24 @@ block if we have `let`-bindings, but not otherwise.
 interpretStatement (CFor initial mcond mincr body _) next = do
     after <- newLabel
 
-    ret <- mapBuildCFGT scope $ do
+    ret <- mapBuildCFGT (mapRWST scope) $ do
         prefix <- case initial of
             Left Nothing -> return []
             Left (Just expr) -> do
-                expr' <- lift $ interpretExpr False expr
+                expr' <- lift $ lift $ interpretExpr False expr
                 return (exprToStatements expr')
-            Right decls -> lift $ interpretDeclarations makeLetBinding decls
+            Right decls -> lift $ lift $ interpretDeclarations makeLetBinding decls
 
         headerLabel <- newLabel
         incrLabel <- case mincr of
             Nothing -> return headerLabel
             Just incr -> do
-                incr' <- lift $ interpretExpr False incr
+                incr' <- lift $ lift $ interpretExpr False incr
                 incrLabel <- newLabel
                 addBlock incrLabel (exprToStatements incr') (Branch headerLabel)
                 return incrLabel
 
-        (bodyEntry, bodyTerm) <- loopScope after incrLabel $
+        (bodyEntry, bodyTerm) <- setBreak after $ setContinue incrLabel $
             interpretStatement body (return ([], Branch incrLabel))
 
         bodyLabel <- newLabel
@@ -1742,7 +1747,7 @@ interpretStatement (CFor initial mcond mincr body _) next = do
 
         cond <- case mcond of
             Just cond -> do
-                cond' <- lift $ interpretExpr True cond
+                cond' <- lift $ lift $ interpretExpr True cond
                 return (CondBranch cond' bodyLabel after)
             Nothing -> return (Branch bodyLabel)
         addBlock headerLabel [] cond
@@ -1761,12 +1766,16 @@ translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) _ = lift $ do
-    label <- getFlow stmt "continue outside loop" onContinue
-    return ([], Branch label)
-interpretStatement stmt@(CBreak _) _ = lift $ do
-    label <- getFlow stmt "break outside loop" onBreak
-    return ([], Branch label)
+interpretStatement stmt@(CCont _) _ = do
+    val <- lift (asks onContinue)
+    case val of
+        Just label -> return ([], Branch label)
+        Nothing -> lift $ lift $ badSource stmt "continue outside loop"
+interpretStatement stmt@(CBreak _) _ = do
+    val <- lift (asks onBreak)
+    case val of
+        Just label -> return ([], Branch label)
+        Nothing -> lift $ lift $ badSource stmt "break outside loop"
 ```
 
 `return` statements are pretty straightforward&mdash;translate the
@@ -1777,10 +1786,13 @@ declared return type, then we need to insert a type-cast to the correct
 type.
 
 ```haskell
-interpretStatement stmt@(CReturn expr _) _ = lift $ do
-    retTy <- getFlow stmt "return statement outside function" functionReturnType
-    expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-    return ([Rust.Stmt (Rust.Return expr')], Unreachable)
+interpretStatement stmt@(CReturn expr _) _ = lift $ lift $ do
+    val <- lift (asks functionReturnType)
+    case val of
+        Nothing -> badSource stmt "return statement outside function" 
+        Just retTy -> do
+            expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
+            return ([Rust.Stmt (Rust.Return expr')], Unreachable)
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -1789,32 +1801,22 @@ translation for yet.
 > **TODO**: Translate more kinds of statements. `:-)`
 
 ```haskell
-interpretStatement stmt _ = lift $ unimplemented stmt
-```
-
-The fields in `ControlFlow` aren't always valid. `getFlow` is a helper
-function that checks whether the requested control-flow fact is
-currently valid, returning it if so, or reporting a syntax error on the
-offending statement otherwise.
-
-```haskell
-getFlow :: CStat -> String -> (ControlFlow -> Maybe a) -> EnvMonad s a
-getFlow stmt msg kind = do
-    val <- lift (asks kind)
-    maybe (badSource stmt msg) return val
+interpretStatement stmt _ = lift $ lift $ unimplemented stmt
 ```
 
 Inside loops above, we needed to update the translation to use if either
-`break` or `continue` statements show up. `loopScope` runs the provided
-translation action using an updated pair of `break`/`continue`
-expressions. It also keeps track of whether those constructs ended up being
-used.
+`break` or `continue` statements show up. These functions run the
+provided translation action using updated `break`/`continue`
+expressions.
 
 ```haskell
-loopScope :: Label -> Label -> CSourceBuildCFGT s a -> CSourceBuildCFGT s a
-loopScope b c =
-    mapBuildCFGT (mapExceptT (local (\ flow ->
-        flow { onBreak = Just b, onContinue = Just c })))
+setBreak :: Label -> CSourceBuildCFGT s a -> CSourceBuildCFGT s a
+setBreak label =
+    mapBuildCFGT (local (\ flow -> flow { onBreak = Just label }))
+
+setContinue :: Label -> CSourceBuildCFGT s a -> CSourceBuildCFGT s a
+setContinue label =
+    mapBuildCFGT (local (\ flow -> flow { onContinue = Just label }))
 ```
 
 Once we've built a control-flow graph for a sequence of statements, we
@@ -1823,11 +1825,12 @@ need to extract equivalent Rust control flow expressions.
 ```haskell
 cfgToRust :: (Pretty node, Pos node) => node -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> EnvMonad s [Rust.Stmt]
 cfgToRust node build = do
-    rawCFG <- buildCFG $ do
-        (early, term) <- build
-        entry <- newLabel
-        addBlock entry early term
-        return entry
+    let builder = buildCFG $ do
+            (early, term) <- build
+            entry <- newLabel
+            addBlock entry early term
+            return entry
+    (rawCFG, (), []) <- runRWST builder (OuterLabels Nothing Nothing) ()
 ```
 
 This is not always possible without either introducing new variables
@@ -1904,10 +1907,10 @@ of zero or more Rust statements for each compound block item.
 interpretBlockItem :: CBlockItem -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 interpretBlockItem (CBlockStmt stmt) next = interpretStatement stmt next
 interpretBlockItem (CBlockDecl decl) next = do
-    decl' <- lift (interpretDeclarations makeLetBinding decl)
+    decl' <- lift $ lift (interpretDeclarations makeLetBinding decl)
     (rest, end) <- next
     return (decl' ++ rest, end)
-interpretBlockItem item _ = lift (unimplemented item)
+interpretBlockItem item _ = lift $ lift (unimplemented item)
 ```
 
 `exprToStatements` is a helper function which turns a Rust expression
