@@ -1598,15 +1598,14 @@ just a Rust expression), we end up being able to get rid of superfluous
 curly braces.
 
 ```haskell
-type CSourceBuildCFGT s = BuildCFGT (RWST OuterLabels [()] () (EnvMonad s)) [Rust.Stmt] Result
+type CSourceBuildCFGT s = BuildCFGT (RWST OuterLabels [()] (Map.Map Ident Label) (EnvMonad s)) [Rust.Stmt] Result
 
 interpretStatement :: CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 ```
 
 ```haskell
-interpretStatement (CLabel _ident body _ _) next = do
-    label <- newLabel
-    -- TODO: associate this ident with this label
+interpretStatement (CLabel ident body _ _) next = do
+    label <- gotoLabel ident
     (rest, end) <- interpretStatement body next
     addBlock label rest end
     return ([], Branch label)
@@ -1760,18 +1759,27 @@ interpretStatement (CFor initial mcond mincr body _) next = do
     return ret
 ```
 
+```haskell
+interpretStatement (CGoto ident _) next = do
+    _ <- next
+    label <- gotoLabel ident
+    return ([], Branch label)
+```
+
 `continue` and `break` statements translate to whatever expression we
 decided on in the surrounding context. For example, `continue` might
 translate to `break 'continueTo` if our nearest enclosing loop is a
 `for` loop.
 
 ```haskell
-interpretStatement stmt@(CCont _) _ = do
+interpretStatement stmt@(CCont _) next = do
+    _ <- next
     val <- lift (asks onContinue)
     case val of
         Just label -> return ([], Branch label)
         Nothing -> lift $ lift $ badSource stmt "continue outside loop"
-interpretStatement stmt@(CBreak _) _ = do
+interpretStatement stmt@(CBreak _) next = do
+    _ <- next
     val <- lift (asks onBreak)
     case val of
         Just label -> return ([], Branch label)
@@ -1786,13 +1794,15 @@ declared return type, then we need to insert a type-cast to the correct
 type.
 
 ```haskell
-interpretStatement stmt@(CReturn expr _) _ = lift $ lift $ do
-    val <- lift (asks functionReturnType)
-    case val of
-        Nothing -> badSource stmt "return statement outside function" 
-        Just retTy -> do
-            expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-            return ([Rust.Stmt (Rust.Return expr')], Unreachable)
+interpretStatement stmt@(CReturn expr _) next = do
+    _ <- next
+    lift $ lift $ do
+        val <- lift (asks functionReturnType)
+        case val of
+            Nothing -> badSource stmt "return statement outside function" 
+            Just retTy -> do
+                expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
+                return ([Rust.Stmt (Rust.Return expr')], Unreachable)
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -1819,6 +1829,24 @@ setContinue label =
     mapBuildCFGT (local (\ flow -> flow { onContinue = Just label }))
 ```
 
+C allows `goto` statements and their corresponding labels to appear in
+any order. So the first time we encounter the name of a C label, we
+assign it a CFG label, regardless of whether that's in a labeled
+statement or a `goto` statement. Then we save the CFG label we chose so
+we can make sure to use the same one for all future references.
+
+```haskell
+gotoLabel :: Ident -> CSourceBuildCFGT s Label
+gotoLabel ident = do
+    labels <- lift get
+    case Map.lookup ident labels of
+        Nothing -> do
+            label <- newLabel
+            lift (put (Map.insert ident label labels))
+            return label
+        Just label -> return label
+```
+
 Once we've built a control-flow graph for a sequence of statements, we
 need to extract equivalent Rust control flow expressions.
 
@@ -1830,7 +1858,7 @@ cfgToRust node build = do
             entry <- newLabel
             addBlock entry early term
             return entry
-    (rawCFG, (), []) <- runRWST builder (OuterLabels Nothing Nothing) ()
+    (rawCFG, []) <- evalRWST builder (OuterLabels Nothing Nothing) Map.empty
 ```
 
 This is not always possible without either introducing new variables
