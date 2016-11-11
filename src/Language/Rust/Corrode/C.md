@@ -1598,6 +1598,15 @@ type CSourceBuildCFGT s = BuildCFGT (EnvMonad s) [Rust.Stmt] Result
 interpretStatement :: CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 ```
 
+```haskell
+interpretStatement (CLabel _ident body _ _) next = do
+    label <- newLabel
+    -- TODO: associate this ident with this label
+    (rest, end) <- interpretStatement body next
+    addBlock label rest end
+    return ([], Branch label)
+```
+
 A C statement might be as simple as a "statement expression", which
 amounts to a C expression followed by a semicolon. In that case we can
 translate the statement by just translating the expression.
