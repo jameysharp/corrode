@@ -846,7 +846,7 @@ duplicates later.
                         let formals =
                                 [ (Rust.VarName argName, toRustType argTy)
                                 | (idx, (mname, argTy)) <- zip [1 :: Int ..] args
-                                , let argName = maybe ("arg" ++ show idx) (identToString . snd) mname
+                                , let argName = maybe ("arg" ++ show idx) (applyRenames . snd) mname
                                 ]
                         in Rust.ExternFn name formals variadic (toRustRetType retTy)
                     _ -> error (show ident ++ " is both a function and not a function?")
