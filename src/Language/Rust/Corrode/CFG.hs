@@ -109,10 +109,8 @@ predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
     where
     grow from (BasicBlock _ term) rest = foldr (\ to -> IntMap.insertWith IntSet.union to (IntSet.singleton from)) rest term
 
-dominators :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
-dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
-    seen | all (check seen) (IntMap.keys blocks) -> Right seen
-    _ -> Left "irreducible control flow"
+depthFirstOrder :: CFG s c -> [Label]
+depthFirstOrder (CFG start blocks) = snd (execState (search start) (IntSet.empty, []))
     where
     search label = do
         (seen, order) <- get
@@ -122,8 +120,12 @@ dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
                 Just (BasicBlock _ term) -> traverse_ search term
                 _ -> return ()
             modify (\ (seen', order') -> (seen', label : order'))
-    dfs = snd (execState (search start) (IntSet.empty, []))
 
+dominators :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
+dominators cfg@(CFG _ blocks) = case foldl go IntMap.empty (depthFirstOrder cfg) of
+    seen | all (check seen) (IntMap.keys blocks) -> Right seen
+    _ -> Left "irreducible control flow"
+    where
     update seen label = IntSet.insert label self
         where
         allPredecessors = predecessors cfg
