@@ -1868,7 +1868,7 @@ and for any other control-flow patterns we don't know how to recognize
 yet.
 
 ```haskell
-    let cfg = removeEmptyBlocks rawCFG
+    let cfg = depthFirstOrder (removeEmptyBlocks rawCFG)
     case structureCFG mkBreak mkContinue mkLoop mkIf cfg of
         Right stmts -> return stmts
         Left msg -> noTranslation node (msg ++ ":\n" ++ render (nest 4 (prettyRustCFG cfg)) ++ "\nfrom")

@@ -21,7 +21,10 @@ data Terminator' c l
 type Terminator c = Terminator' c Label
 data BasicBlock' s t = BasicBlock s t
 type BasicBlock s c = BasicBlock' s (Terminator c)
-data CFG s c = CFG Label (IntMap.IntMap (BasicBlock s c))
+
+data Unordered
+data DepthFirst
+data CFG k s c = CFG Label (IntMap.IntMap (BasicBlock s c))
 
 instance Functor (Terminator' c) where
     fmap _ Unreachable = Unreachable
@@ -36,12 +39,12 @@ instance Foldable (Terminator' c) where
 instance Functor (BasicBlock' s) where
     fmap f (BasicBlock b t) = BasicBlock b (f t)
 
-prettyCFG :: (s -> Doc) -> (c -> Doc) -> CFG s c -> Doc
+prettyCFG :: (s -> Doc) -> (c -> Doc) -> CFG k s c -> Doc
 prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
     (text "start @" <> text (show entry)) : blocks'
     where
     blocks' = do
-        (label, BasicBlock stmts term) <- reverse (IntMap.toList blocks)
+        (label, BasicBlock stmts term) <- IntMap.toList blocks
         let blockHead = text (show label) <> text ":"
         let blockBody = fmtS stmts
         let blockTail = case term of
@@ -70,12 +73,12 @@ addBlock :: Monad m => Label -> s -> Terminator c -> BuildCFGT m s c ()
 addBlock label stmt terminator = do
     modify (\ st -> st { buildBlocks = IntMap.insert label (BasicBlock stmt terminator) (buildBlocks st) })
 
-buildCFG :: Monad m => BuildCFGT m s c Label -> m (CFG s c)
+buildCFG :: Monad m => BuildCFGT m s c Label -> m (CFG Unordered s c)
 buildCFG root = do
     (label, final) <- runStateT root (BuildState 0 IntMap.empty)
     return (CFG label (buildBlocks final))
 
-removeEmptyBlocks :: Foldable f => CFG (f s) c -> CFG (f s) c
+removeEmptyBlocks :: Foldable f => CFG k (f s) c -> CFG Unordered (f s) c
 removeEmptyBlocks (CFG start blocks) = CFG (rewrite start) blocks'
     where
     go = do
@@ -105,13 +108,13 @@ removeEmptyBlocks (CFG start blocks) = CFG (rewrite start) blocks'
     rewriteBlock _ (BasicBlock b term) = Just (BasicBlock b (fmap rewrite term))
     blocks' = IntMap.mapMaybeWithKey rewriteBlock blocks
 
-predecessors :: CFG s c -> IntMap.IntMap IntSet.IntSet
+predecessors :: CFG k s c -> IntMap.IntMap IntSet.IntSet
 predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
     where
     grow from (BasicBlock _ term) rest = foldr (\ to -> IntMap.insertWith IntSet.union to (IntSet.singleton from)) rest term
 
-depthFirstOrder :: CFG s c -> [Label]
-depthFirstOrder (CFG start blocks) = snd (execState (search start) (IntSet.empty, []))
+depthFirstOrder :: CFG k s c -> CFG DepthFirst s c
+depthFirstOrder (CFG start blocks) = CFG start' blocks'
     where
     search label = do
         (seen, order) <- get
@@ -121,9 +124,15 @@ depthFirstOrder (CFG start blocks) = snd (execState (search start) (IntSet.empty
                 Just (BasicBlock _ term) -> traverse_ search term
                 _ -> return ()
             modify (\ (seen', order') -> (seen', label : order'))
+    final = snd (execState (search start) (IntSet.empty, []))
+    start' = 0
+    mapping = IntMap.fromList (zip final [start'..])
+    rewrite label = IntMap.findWithDefault (error "basic block disappeared") label mapping
+    rewriteBlock label (BasicBlock body term) = (label, BasicBlock body (fmap rewrite term))
+    blocks' = IntMap.fromList (IntMap.elems (IntMap.intersectionWith rewriteBlock mapping blocks))
 
-dominators :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
-dominators cfg@(CFG _ blocks) = case foldl go IntMap.empty (depthFirstOrder cfg) of
+dominators :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
+dominators cfg@(CFG _ blocks) = case foldl go IntMap.empty (IntMap.keys blocks) of
     seen | all (check seen) (IntMap.keys blocks) -> Right seen
     _ -> Left "irreducible control flow"
     where
@@ -139,7 +148,7 @@ dominators cfg@(CFG _ blocks) = case foldl go IntMap.empty (depthFirstOrder cfg)
     go seen label = IntMap.insert label (update seen label) seen
     check seen label = Just (update seen label) == IntMap.lookup label seen
 
-backEdges :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
+backEdges :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
 backEdges cfg = do
     dom <- dominators cfg
     return
@@ -150,7 +159,7 @@ backEdges cfg = do
     flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
     flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
-naturalLoops :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
+naturalLoops :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
 naturalLoops cfg = do
     back <- backEdges cfg
     return (IntMap.mapWithKey makeLoop back)
@@ -167,7 +176,7 @@ naturalLoops cfg = do
 newtype Loops = Loops (IntMap.IntMap (IntSet.IntSet, Loops))
     deriving Show
 
-nestLoops :: CFG s c -> Either String Loops
+nestLoops :: CFG DepthFirst s c -> Either String Loops
 nestLoops cfg = do
     loops <- naturalLoops cfg
     return (foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList loops)))
@@ -179,7 +188,7 @@ nestLoops cfg = do
 data Exit = BreakFrom Label | Continue
     deriving Show
 
-exitEdges :: CFG s c -> Loops -> Map.Map (Label, Label) Exit
+exitEdges :: CFG k s c -> Loops -> Map.Map (Label, Label) Exit
 exitEdges (CFG _ blocks) = go
     where
     successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
@@ -193,7 +202,7 @@ exitEdges (CFG _ blocks) = go
             , to == header || to `IntSet.notMember` nodes
             ]
 
-unifyBreaks :: CFG s c -> Loops -> (IntMap.IntMap Label, Map.Map (Label, Label) Exit)
+unifyBreaks :: CFG k s c -> Loops -> (IntMap.IntMap Label, Map.Map (Label, Label) Exit)
 unifyBreaks cfg loops = (breaks, Map.fromList exits')
     where
     exits = exitEdges cfg loops
@@ -203,16 +212,14 @@ unifyBreaks cfg loops = (breaks, Map.fromList exits')
             Continue -> Right (to, IntSet.singleton from)
         | ((from, to), exit) <- Map.toList exits
         ]
-    order = IntMap.fromList (zip (depthFirstOrder cfg) [0 :: Int ..])
-    unify targets = fst (maximumBy (comparing snd) (IntMap.toList (order `IntMap.intersection` IntMap.fromSet id targets)))
     combine = IntMap.fromListWith IntSet.union
-    breaks = IntMap.map unify (combine breakList)
+    breaks = IntMap.map IntSet.findMax (combine breakList)
     continues = combine continueList
     advancing = IntMap.differenceWith (\ a b -> Just (IntSet.difference a b)) (predecessors cfg) continues
     exits' = [ ((from, to), Continue) | (to, froms) <- IntMap.toList continues, from <- IntSet.toList froms ]
         ++ [ ((from, to), BreakFrom header) | (header, to) <- IntMap.toList breaks, from <- maybe [] IntSet.toList (IntMap.lookup to advancing) ]
 
-structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG s c -> Either String s
+structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG DepthFirst s c -> Either String s
 structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
     loops <- nestLoops cfg
     closed (unifyBreaks cfg loops) loops start
