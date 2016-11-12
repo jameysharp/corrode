@@ -3,6 +3,7 @@ module Language.Rust.Corrode.CFG where
 
 import Control.Monad
 import Control.Monad.Trans.State
+import Data.Either
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
@@ -175,7 +176,7 @@ nestLoops cfg = do
         case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) loops of
         (nested, disjoint) -> Loops (IntMap.insert header (inside, Loops nested) disjoint)
 
-data Exit = BreakFrom Label | ContinueTo Label
+data Exit = BreakFrom Label | Continue
     deriving Show
 
 exitEdges :: CFG s c -> Loops -> Map.Map (Label, Label) Exit
@@ -186,35 +187,52 @@ exitEdges (CFG _ blocks) = go
     eachLoop (header, (nodes, nested)) = exits `Map.union` go nested
         where
         exits = Map.fromList
-            [ ((from, to), if to == header then ContinueTo to else BreakFrom header)
+            [ ((from, to), if to == header then Continue else BreakFrom header)
             | from <- IntSet.toList nodes
             , to <- IntMap.findWithDefault [] from successors
             , to == header || to `IntSet.notMember` nodes
             ]
 
+unifyBreaks :: CFG s c -> Loops -> (IntMap.IntMap Label, Map.Map (Label, Label) Exit)
+unifyBreaks cfg loops = (breaks, Map.fromList exits')
+    where
+    exits = exitEdges cfg loops
+    (breakList, continueList) = partitionEithers
+        [ case exit of
+            BreakFrom header -> Left (header, IntSet.singleton to)
+            Continue -> Right (to, IntSet.singleton from)
+        | ((from, to), exit) <- Map.toList exits
+        ]
+    order = IntMap.fromList (zip (depthFirstOrder cfg) [0 :: Int ..])
+    unify targets = fst (maximumBy (comparing snd) (IntMap.toList (order `IntMap.intersection` IntMap.fromSet id targets)))
+    combine = IntMap.fromListWith IntSet.union
+    breaks = IntMap.map unify (combine breakList)
+    continues = combine continueList
+    advancing = IntMap.differenceWith (\ a b -> Just (IntSet.difference a b)) (predecessors cfg) continues
+    exits' = [ ((from, to), Continue) | (to, froms) <- IntMap.toList continues, from <- IntSet.toList froms ]
+        ++ [ ((from, to), BreakFrom header) | (header, to) <- IntMap.toList breaks, from <- maybe [] IntSet.toList (IntMap.lookup to advancing) ]
+
 structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG s c -> Either String s
 structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
     loops <- nestLoops cfg
-    closed (exitEdges cfg loops) loops start
+    closed (unifyBreaks cfg loops) loops start
     where
     allPredecessors = predecessors cfg
-    closed exits loops label = do
-        (body, rest) <- go exits loops label
+    closed (breaks, exits) loops label = do
+        (body, rest) <- go (breaks, exits) loops label
         case rest of
             Nothing -> return body
             Just after -> Left ("unexpected edge from " ++ show label ++ " to " ++ show after)
-    go exits (Loops loops) label =
+    go (breaks, exits) (Loops loops) label =
         case IntMap.lookup label loops of
         Just (_, nested) -> do
-            body <- closed exits nested label
+            body <- closed (breaks, exits) nested label
             let loop = mkLoop label body
-            case nub [ to | ((_, to), BreakFrom header) <- Map.toList exits, header == label ] of
-                [] -> return (loop, Nothing)
-                [after] -> do
-                    (rest1, rest2) <- go exits (Loops loops) after
+            case IntMap.lookup label breaks of
+                Nothing -> return (loop, Nothing)
+                Just after -> do
+                    (rest1, rest2) <- go (breaks, exits) (Loops loops) after
                     return (loop `mappend` rest1, rest2)
-                targets ->
-                    Left ("multiple break targets from " ++ show label ++ ": " ++ show targets)
         Nothing -> do
             BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
             (rest1, rest2) <- case term of
@@ -236,7 +254,7 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
                 let p = IntSet.toList (fromMaybe IntSet.empty (IntMap.lookup to allPredecessors))
                     q = filter (\ from -> Map.notMember (from, to) exits) p
                 in if length q == branches
-                then go exits (Loops loops) to
+                then go (breaks, exits) (Loops loops) to
                 else return (mempty, Just (to, branches))
             Just (BreakFrom header) -> return (mkBreak header, Nothing)
-            Just (ContinueTo header) -> return (mkContinue header, Nothing)
+            Just Continue -> return (mkContinue to, Nothing)
