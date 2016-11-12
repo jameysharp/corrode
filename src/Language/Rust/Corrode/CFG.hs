@@ -108,10 +108,10 @@ predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
     where
     grow from (BasicBlock _ term) rest = foldr (\ to -> IntMap.insertWith IntSet.union to (IntSet.singleton from)) rest term
 
-dominators :: CFG s c -> Maybe (IntMap.IntMap IntSet.IntSet)
+dominators :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
 dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
-    seen | all (check seen) (IntMap.keys blocks) -> Just seen
-    _ -> Nothing
+    seen | all (check seen) (IntMap.keys blocks) -> Right seen
+    _ -> Left "irreducible control flow"
     where
     search label = do
         (seen, order) <- get
@@ -135,7 +135,7 @@ dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
     go seen label = IntMap.insert label (update seen label) seen
     check seen label = Just (update seen label) == IntMap.lookup label seen
 
-backEdges :: CFG s c -> Maybe (IntMap.IntMap IntSet.IntSet)
+backEdges :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
 backEdges cfg = do
     dom <- dominators cfg
     return
@@ -146,8 +146,10 @@ backEdges cfg = do
     flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
     flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
-naturalLoops :: CFG s c -> IntMap.IntMap IntSet.IntSet
-naturalLoops cfg = IntMap.mapWithKey makeLoop (fromMaybe IntMap.empty (backEdges cfg))
+naturalLoops :: CFG s c -> Either String (IntMap.IntMap IntSet.IntSet)
+naturalLoops cfg = do
+    back <- backEdges cfg
+    return (IntMap.mapWithKey makeLoop back)
     where
     makeLoop header inside = execState (growLoop inside) (IntSet.singleton header)
     allPredecessors = predecessors cfg
@@ -161,8 +163,10 @@ naturalLoops cfg = IntMap.mapWithKey makeLoop (fromMaybe IntMap.empty (backEdges
 newtype Loops = Loops (IntMap.IntMap (IntSet.IntSet, Loops))
     deriving Show
 
-nestLoops :: CFG s c -> Loops
-nestLoops cfg = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList (naturalLoops cfg)))
+nestLoops :: CFG s c -> Either String Loops
+nestLoops cfg = do
+    loops <- naturalLoops cfg
+    return (foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList loops)))
     where
     insertLoop (Loops loops) (header, inside) =
         case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) loops of
@@ -171,8 +175,8 @@ nestLoops cfg = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet
 data Exit = BreakFrom Label | ContinueTo Label
     deriving Show
 
-exitEdges :: CFG s c -> Map.Map (Label, Label) Exit
-exitEdges cfg@(CFG _ blocks) = go (nestLoops cfg)
+exitEdges :: CFG s c -> Loops -> Map.Map (Label, Label) Exit
+exitEdges (CFG _ blocks) = go
     where
     successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
     go (Loops loops) = Map.unions (map eachLoop (IntMap.toList loops))
@@ -186,32 +190,27 @@ exitEdges cfg@(CFG _ blocks) = go (nestLoops cfg)
             ]
 
 structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG s c -> Either String s
-structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = closed (nestLoops cfg) start
+structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
+    loops <- nestLoops cfg
+    closed (exitEdges cfg loops) loops start
     where
-    exits = exitEdges cfg
-    allPredecessors = IntMap.differenceWith (\ big little -> Just (IntSet.difference big little)) (predecessors cfg) (IntMap.fromListWith IntSet.union [ (to, IntSet.singleton from) | (from, to) <- Map.keys exits ])
-    sameEdge [a] [b] | a == b = [a]
-    sameEdge a b = a ++ b
-    breakFroms = IntMap.fromListWith sameEdge
-        [ (header, [to])
-        | ((_, to), BreakFrom header) <- Map.toList exits
-        ]
-    closed loops label = do
-        (body, rest) <- go loops label
+    allPredecessors = predecessors cfg
+    closed exits loops label = do
+        (body, rest) <- go exits loops label
         case rest of
             Nothing -> return body
             Just after -> Left ("unexpected edge from " ++ show label ++ " to " ++ show after)
-    go (Loops loops) label =
+    go exits (Loops loops) label =
         case IntMap.lookup label loops of
         Just (_, nested) -> do
-            body <- closed nested label
+            body <- closed exits nested label
             let loop = mkLoop label body
-            case IntMap.lookup label breakFroms of
-                Nothing -> return (loop, Nothing)
-                Just [after] -> do
-                    (rest1, rest2) <- go (Loops loops) after
+            case nub [ to | ((_, to), BreakFrom header) <- Map.toList exits, header == label ] of
+                [] -> return (loop, Nothing)
+                [after] -> do
+                    (rest1, rest2) <- go exits (Loops loops) after
                     return (loop `mappend` rest1, rest2)
-                Just targets ->
+                targets ->
                     Left ("multiple break targets from " ++ show label ++ ": " ++ show targets)
         Nothing -> do
             BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
@@ -231,9 +230,10 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = closed (nes
         where
         next branches to = case Map.lookup (label, to) exits of
             Nothing ->
-                let p = IntMap.findWithDefault IntSet.empty to allPredecessors in
-                if IntSet.size p == branches
-                then go (Loops loops) to
+                let p = IntSet.toList (fromMaybe IntSet.empty (IntMap.lookup to allPredecessors))
+                    q = filter (\ from -> Map.notMember (from, to) exits) p
+                in if length q == branches
+                then go exits (Loops loops) to
                 else return (mempty, Just (to, branches))
             Just (BreakFrom header) -> return (mkBreak header, Nothing)
             Just (ContinueTo header) -> return (mkContinue header, Nothing)
