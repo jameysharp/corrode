@@ -190,22 +190,19 @@ data Exit = BreakFrom Label | Continue
     deriving Show
 type Exits = Map.Map (Label, Label) Exit
 
-exitEdges :: CFG k s c -> Loops -> Exits
-exitEdges (CFG _ blocks) = go
+exitEdges :: CFG DepthFirst s c -> NaturalLoops -> Exits
+exitEdges (CFG _ blocks) = Map.unions . map eachLoop . IntMap.toList
     where
     successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
-    go (Loops loops) = Map.unions (map eachLoop (IntMap.toList loops))
-    eachLoop (header, (nodes, nested)) = exits `Map.union` go nested
-        where
-        exits = Map.fromList
-            [ ((from, to), if to == header then Continue else BreakFrom header)
-            | from <- IntSet.toList nodes
-            , to <- IntMap.findWithDefault [] from successors
-            , to == header || to `IntSet.notMember` nodes
-            ]
+    eachLoop (header, nodes) = Map.fromList
+        [ ((from, to), if to == header then Continue else BreakFrom header)
+        | from <- IntSet.toList nodes
+        , to <- IntMap.findWithDefault [] from successors
+        , to == header || to `IntSet.notMember` nodes
+        ]
 
-unifyBreaks :: CFG DepthFirst s c -> NaturalLoops -> Loops -> (IntMap.IntMap Label, Exits)
-unifyBreaks cfg allLoops loops = (breaks, Map.fromList exits')
+unifyBreaks :: CFG DepthFirst s c -> NaturalLoops -> (IntMap.IntMap Label, Exits)
+unifyBreaks cfg loops = (breaks, Map.fromList exits')
     where
     exits = exitEdges cfg loops
     (breakList, continues) = partitionEithers
@@ -217,7 +214,7 @@ unifyBreaks cfg allLoops loops = (breaks, Map.fromList exits')
     breaks = IntMap.map IntSet.findMax (IntMap.fromListWith IntSet.union breakList)
     breakExits header to = fromMaybe [] $ do
         candidates <- IntMap.lookup to (predecessors cfg)
-        insideLoop <- IntMap.lookup header allLoops
+        insideLoop <- IntMap.lookup header loops
         return (IntSet.toList (candidates `IntSet.intersection` insideLoop))
     exits' =
         [ ((from, to), BreakFrom header)
@@ -229,7 +226,7 @@ structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) ->
 structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
     allLoops <- naturalLoops cfg
     let loops = nestLoops allLoops
-    closed (unifyBreaks cfg allLoops loops) loops start
+    closed (unifyBreaks cfg allLoops) loops start
     where
     allPredecessors = predecessors cfg
     closed (breaks, exits) loops label = do
