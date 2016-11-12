@@ -10,7 +10,6 @@ import qualified Data.IntSet as IntSet
 import Data.List
 import qualified Data.Map.Lazy as Map
 import Data.Maybe
-import Data.Ord
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 
 type Label = Int
@@ -176,16 +175,6 @@ naturalLoops cfg = do
             put (inLoop `IntSet.union` new)
             growLoop (IntSet.unions (mapMaybe (\ label -> IntMap.lookup label allPredecessors) (IntSet.toList new)))
 
-newtype Loops = Loops (IntMap.IntMap (IntSet.IntSet, Loops))
-    deriving Show
-
-nestLoops :: NaturalLoops -> Loops
-nestLoops loops = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList loops))
-    where
-    insertLoop (Loops seen) (header, inside) =
-        case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) seen of
-        (nested, disjoint) -> Loops (IntMap.insert header (inside, Loops nested) disjoint)
-
 data Exit = BreakFrom Label | Continue
     deriving Show
 type Exits = Map.Map (Label, Label) Exit
@@ -224,49 +213,47 @@ unifyBreaks cfg loops = (breaks, Map.fromList exits')
 
 structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG DepthFirst s c -> Either String s
 structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
-    allLoops <- naturalLoops cfg
-    let loops = nestLoops allLoops
-    closed (unifyBreaks cfg allLoops) loops start
+    loops <- naturalLoops cfg
+    closed (unifyBreaks cfg loops) (IntMap.keysSet loops) start
     where
     allPredecessors = predecessors cfg
-    closed (breaks, exits) loops label = do
-        (body, rest) <- go (breaks, exits) loops label
+    closed (breaks, exits) loops entry = do
+        (body, rest) <- go entry
         case rest of
             Nothing -> return body
-            Just after -> Left ("unexpected edge from " ++ show label ++ " to " ++ show after)
-    go (breaks, exits) (Loops loops) label =
-        case IntMap.lookup label loops of
-        Just (_, nested) -> do
-            body <- closed (breaks, exits) nested label
+            Just after -> Left ("unexpected edge from " ++ show entry ++ " to " ++ show after)
+        where
+        go label | IntSet.member label loops = do
+            body <- closed (breaks, exits) (IntSet.delete label loops) label
             let loop = mkLoop label body
             case IntMap.lookup label breaks of
                 Nothing -> return (loop, Nothing)
                 Just after -> do
-                    (rest1, rest2) <- go (breaks, exits) (Loops loops) after
+                    (rest1, rest2) <- go after
                     return (loop `mappend` rest1, rest2)
-        Nothing -> do
+        go label = do
             BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
             (rest1, rest2) <- case term of
                 Unreachable -> return (mempty, Nothing)
-                Branch to -> next 1 to
+                Branch to -> next 1 label to
                 CondBranch c t f -> do
-                    (t', afterT) <- next 1 t
-                    (f', afterF) <- next 1 f
+                    (t', afterT) <- next 1 label t
+                    (f', afterF) <- next 1 label f
                     case (afterT, afterF) of
                         (_, Nothing) -> return (mkIf c mempty f' `mappend` t', afterT)
                         (Nothing, _) -> return (mkIf c t' mempty `mappend` f', afterF)
                         (Just (nextT, branchesT), Just (nextF, branchesF)) | nextT == nextF -> do
-                            (rest1, rest2) <- next (branchesT + branchesF) nextT
+                            (rest1, rest2) <- next (branchesT + branchesF) label nextT
                             return (mkIf c t' f' `mappend` rest1, rest2)
                         _ -> Left ("unsupported conditional branch from " ++ show label ++ " to " ++ show afterT ++ " and " ++ show afterF)
             return (body `mappend` rest1, rest2)
-        where
-        next branches to = case Map.lookup (label, to) exits of
+
+        next branches label to = case Map.lookup (label, to) exits of
             Nothing ->
                 let p = IntSet.toList (fromMaybe IntSet.empty (IntMap.lookup to allPredecessors))
                     q = filter (\ from -> Map.notMember (from, to) exits) p
                 in if length q == branches
-                then go (breaks, exits) (Loops loops) to
+                then go to
                 else return (mempty, Just (to, branches))
             Just (BreakFrom header) -> return (mkBreak header, Nothing)
             Just Continue -> return (mkContinue to, Nothing)
