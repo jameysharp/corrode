@@ -242,10 +242,11 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
                     (t', afterT) <- next 1 t
                     (f', afterF) <- next 1 f
                     case (afterT, afterF) of
+                        (_, Nothing) -> return (mkIf c mempty f' `mappend` t', afterT)
+                        (Nothing, _) -> return (mkIf c t' mempty `mappend` f', afterF)
                         (Just (nextT, branchesT), Just (nextF, branchesF)) | nextT == nextF -> do
                             (rest1, rest2) <- next (branchesT + branchesF) nextT
                             return (mkIf c t' f' `mappend` rest1, rest2)
-                        (Nothing, Nothing) -> return (mkIf c t' mempty `mappend` f', Nothing)
                         _ -> Left ("unsupported conditional branch from " ++ show label ++ " to " ++ show afterT ++ " and " ++ show afterF)
             return (body `mappend` rest1, rest2)
         where
