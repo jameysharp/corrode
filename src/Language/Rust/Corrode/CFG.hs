@@ -132,10 +132,11 @@ depthFirstOrder (CFG start blocks) = CFG start' blocks'
     blocks' = IntMap.fromList (IntMap.elems (IntMap.intersectionWith rewriteBlock mapping blocks))
 
 dominators :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
-dominators cfg@(CFG _ blocks) = case foldl go IntMap.empty (IntMap.keys blocks) of
+dominators cfg@(CFG start blocks) = case foldl go IntMap.empty (IntMap.keys blocks) of
     seen | all (check seen) (IntMap.keys blocks) -> Right seen
     _ -> Left "irreducible control flow"
     where
+    update _ label | label == start = IntSet.singleton start
     update seen label = IntSet.insert label self
         where
         allPredecessors = predecessors cfg
