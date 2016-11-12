@@ -1,6 +1,7 @@
 {-# LANGUAGE Rank2Types #-}
 module Language.Rust.Corrode.CFG where
 
+import Control.Monad
 import Control.Monad.Trans.State
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
@@ -115,7 +116,7 @@ dominators cfg@(CFG start blocks) = case foldl go IntMap.empty dfs of
     where
     search label = do
         (seen, order) <- get
-        if label `IntSet.member` seen then return () else do
+        unless (label `IntSet.member` seen) $ do
             put (IntSet.insert label seen, order)
             case IntMap.lookup label blocks of
                 Just (BasicBlock _ term) -> traverse_ search term
@@ -156,7 +157,7 @@ naturalLoops cfg = do
     growLoop toAdd = do
         inLoop <- get
         let new = toAdd `IntSet.difference` inLoop
-        if IntSet.null new then return () else do
+        unless (IntSet.null new) $ do
             put (inLoop `IntSet.union` new)
             growLoop (IntSet.unions (mapMaybe (\ label -> IntMap.lookup label allPredecessors) (IntSet.toList new)))
 
