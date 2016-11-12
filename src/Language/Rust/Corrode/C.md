@@ -1588,7 +1588,21 @@ up in a simple data type.
 data OuterLabels = OuterLabels
     { onBreak :: Maybe Label
     , onContinue :: Maybe Label
+    , switchExpression :: Maybe CExpr
     }
+
+newtype SwitchCases = SwitchCases (IntMap.IntMap (Maybe Result))
+
+instance Monoid SwitchCases where
+    mempty = SwitchCases IntMap.empty
+    SwitchCases a `mappend` SwitchCases b = SwitchCases $
+        IntMap.unionWith (liftM2 eitherCase) a b
+        where
+        eitherCase lhs rhs = Result
+            { resultType = IsBool
+            , resultMutable = Rust.Immutable
+            , result = Rust.LOr (toBool lhs) (toBool rhs)
+            }
 ```
 
 Inside a function, we find C statements. Unlike C syntax which is oriented
@@ -1598,7 +1612,7 @@ just a Rust expression), we end up being able to get rid of superfluous
 curly braces.
 
 ```haskell
-type CSourceBuildCFGT s = BuildCFGT (RWST OuterLabels [()] (Map.Map Ident Label) (EnvMonad s)) [Rust.Stmt] Result
+type CSourceBuildCFGT s = BuildCFGT (RWST OuterLabels SwitchCases (Map.Map Ident Label) (EnvMonad s)) [Rust.Stmt] Result
 
 interpretStatement :: CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
 ```
@@ -1609,6 +1623,22 @@ interpretStatement (CLabel ident body _ _) next = do
     (rest, end) <- interpretStatement body next
     addBlock label rest end
     return ([], Branch label)
+```
+
+```haskell
+interpretStatement stmt@(CCase expr body node) next = do
+    selector <- getSwitchExpression stmt
+    let condition = CBinary CEqOp selector expr node
+    addSwitchCase (Just condition) body next
+interpretStatement stmt@(CCases lower upper body node) next = do
+    selector <- getSwitchExpression stmt
+    let condition = CBinary CLndOp
+            (CBinary CGeqOp selector lower node)
+            (CBinary CLeqOp selector upper node)
+            node
+    addSwitchCase (Just condition) body next
+interpretStatement (CDefault body _) next =
+    addSwitchCase Nothing body next
 ```
 
 A C statement might be as simple as a "statement expression", which
@@ -1682,6 +1712,35 @@ interpretStatement (CIf c t mf _) next = do
     addBlock after rest end
 
     return ([], CondBranch c' trueLabel falseLabel)
+```
+
+```haskell
+interpretStatement stmt@(CSwitch expr body _) next = do
+    -- FIXME: if expr might have side effects, extract it to a variable
+
+    after <- newLabel
+    (_, SwitchCases cases) <- getSwitchCases expr $ setBreak after $
+        interpretStatement body (return ([], Branch after))
+
+    let isDefault (Just condition) = Left condition
+        isDefault Nothing = Right ()
+    let (conditions, defaults) = IntMap.mapEither isDefault cases
+    defaultCase <- case IntMap.keys defaults of
+        [] -> return after
+        [defaultCase] -> return defaultCase
+        _ -> lift $ lift $ badSource stmt "duplicate default cases"
+
+    entry <- foldrM conditionBlock defaultCase (IntMap.toList conditions)
+
+    (rest, end) <- next
+    addBlock after rest end
+
+    return ([], Branch entry)
+    where
+    conditionBlock (target, condition) defaultCase = do
+        label <- newLabel
+        addBlock label [] (CondBranch condition target defaultCase)
+        return label
 ```
 
 `while` loops are easy to translate from C to Rust. They have identical
@@ -1829,6 +1888,37 @@ setContinue label =
     mapBuildCFGT (local (\ flow -> flow { onContinue = Just label }))
 ```
 
+```haskell
+getSwitchExpression :: CStat -> CSourceBuildCFGT s CExpr
+getSwitchExpression stmt = do
+    mexpr <- lift $ asks switchExpression
+    case mexpr of
+        Nothing -> lift $ lift $ badSource stmt "case outside switch"
+        Just expr -> return expr
+
+addSwitchCase :: Maybe CExpr -> CStat -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result)
+addSwitchCase condition body next = do
+    condition' <- lift $ lift $ mapM (interpretExpr True) condition
+    next' <- interpretStatement body next
+    label <- case next' of
+        ([], Branch to) -> return to
+        (rest, end) -> do
+            label <- newLabel
+            addBlock label rest end
+            return label
+    lift $ tell $ SwitchCases $ IntMap.singleton label condition'
+    return ([], Branch label)
+
+getSwitchCases :: CExpr -> CSourceBuildCFGT s a -> CSourceBuildCFGT s (a, SwitchCases)
+getSwitchCases expr = mapBuildCFGT wrap
+    where
+    wrap body = do
+        ((a, st), cases) <- censor (const mempty)
+            $ local (\ flow -> flow { switchExpression = Just expr })
+            $ listen body
+        return ((a, cases), st)
+```
+
 C allows `goto` statements and their corresponding labels to appear in
 any order. So the first time we encounter the name of a C label, we
 assign it a CFG label, regardless of whether that's in a labeled
@@ -1858,7 +1948,7 @@ cfgToRust node build = do
             entry <- newLabel
             addBlock entry early term
             return entry
-    (rawCFG, []) <- evalRWST builder (OuterLabels Nothing Nothing) Map.empty
+    (rawCFG, _) <- evalRWST builder (OuterLabels Nothing Nothing Nothing) Map.empty
 ```
 
 This is not always possible without either introducing new variables
