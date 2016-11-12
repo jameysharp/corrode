@@ -159,7 +159,9 @@ backEdges cfg = do
     flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
     flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
-naturalLoops :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
+type NaturalLoops = IntMap.IntMap IntSet.IntSet
+
+naturalLoops :: CFG DepthFirst s c -> Either String NaturalLoops
 naturalLoops cfg = do
     back <- backEdges cfg
     return (IntMap.mapWithKey makeLoop back)
@@ -176,19 +178,18 @@ naturalLoops cfg = do
 newtype Loops = Loops (IntMap.IntMap (IntSet.IntSet, Loops))
     deriving Show
 
-nestLoops :: CFG DepthFirst s c -> Either String Loops
-nestLoops cfg = do
-    loops <- naturalLoops cfg
-    return (foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList loops)))
+nestLoops :: NaturalLoops -> Loops
+nestLoops loops = foldl insertLoop (Loops IntMap.empty) (sortBy (comparing (IntSet.size . snd)) (IntMap.toList loops))
     where
-    insertLoop (Loops loops) (header, inside) =
-        case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) loops of
+    insertLoop (Loops seen) (header, inside) =
+        case IntMap.partitionWithKey (\ header' _ -> header' `IntSet.member` inside) seen of
         (nested, disjoint) -> Loops (IntMap.insert header (inside, Loops nested) disjoint)
 
 data Exit = BreakFrom Label | Continue
     deriving Show
+type Exits = Map.Map (Label, Label) Exit
 
-exitEdges :: CFG k s c -> Loops -> Map.Map (Label, Label) Exit
+exitEdges :: CFG k s c -> Loops -> Exits
 exitEdges (CFG _ blocks) = go
     where
     successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
@@ -202,27 +203,32 @@ exitEdges (CFG _ blocks) = go
             , to == header || to `IntSet.notMember` nodes
             ]
 
-unifyBreaks :: CFG k s c -> Loops -> (IntMap.IntMap Label, Map.Map (Label, Label) Exit)
-unifyBreaks cfg loops = (breaks, Map.fromList exits')
+unifyBreaks :: CFG DepthFirst s c -> NaturalLoops -> Loops -> (IntMap.IntMap Label, Exits)
+unifyBreaks cfg allLoops loops = (breaks, Map.fromList exits')
     where
     exits = exitEdges cfg loops
-    (breakList, continueList) = partitionEithers
+    (breakList, continues) = partitionEithers
         [ case exit of
             BreakFrom header -> Left (header, IntSet.singleton to)
-            Continue -> Right (to, IntSet.singleton from)
-        | ((from, to), exit) <- Map.toList exits
+            Continue -> Right orig
+        | orig@((_, to), exit) <- Map.toList exits
         ]
-    combine = IntMap.fromListWith IntSet.union
-    breaks = IntMap.map IntSet.findMax (combine breakList)
-    continues = combine continueList
-    advancing = IntMap.differenceWith (\ a b -> Just (IntSet.difference a b)) (predecessors cfg) continues
-    exits' = [ ((from, to), Continue) | (to, froms) <- IntMap.toList continues, from <- IntSet.toList froms ]
-        ++ [ ((from, to), BreakFrom header) | (header, to) <- IntMap.toList breaks, from <- maybe [] IntSet.toList (IntMap.lookup to advancing) ]
+    breaks = IntMap.map IntSet.findMax (IntMap.fromListWith IntSet.union breakList)
+    breakExits header to = fromMaybe [] $ do
+        candidates <- IntMap.lookup to (predecessors cfg)
+        insideLoop <- IntMap.lookup header allLoops
+        return (IntSet.toList (candidates `IntSet.intersection` insideLoop))
+    exits' =
+        [ ((from, to), BreakFrom header)
+        | (header, to) <- IntMap.toList breaks
+        , from <- breakExits header to
+        ] ++ continues
 
 structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG DepthFirst s c -> Either String s
 structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
-    loops <- nestLoops cfg
-    closed (unifyBreaks cfg loops) loops start
+    allLoops <- naturalLoops cfg
+    let loops = nestLoops allLoops
+    closed (unifyBreaks cfg allLoops loops) loops start
     where
     allPredecessors = predecessors cfg
     closed (breaks, exits) loops label = do
