@@ -323,6 +323,7 @@ applyRenames ident = case identToString ident of
     "match" -> "match_"
     "proc" -> "proc_"
     "type" -> "type_"
+    "where" -> "where_"
     name -> name
 ```
 
