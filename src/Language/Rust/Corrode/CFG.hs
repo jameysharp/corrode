@@ -21,8 +21,7 @@ data Terminator' c l
     | Branch l
     | CondBranch c l l
 type Terminator c = Terminator' c Label
-data BasicBlock' s t = BasicBlock s t
-type BasicBlock s c = BasicBlock' s (Terminator c)
+data BasicBlock s c = BasicBlock s (Terminator c)
 
 data Unordered
 data DepthFirst
@@ -37,9 +36,6 @@ instance Foldable (Terminator' c) where
     foldMap _ Unreachable = mempty
     foldMap f (Branch l) = f l
     foldMap f (CondBranch _ l1 l2) = f l1 `mappend` f l2
-
-instance Functor (BasicBlock' s) where
-    fmap f (BasicBlock b t) = BasicBlock b (f t)
 
 prettyCFG :: (s -> Doc) -> (c -> Doc) -> CFG k s c -> Doc
 prettyCFG fmtS fmtC (CFG entry blocks) = vcat $
