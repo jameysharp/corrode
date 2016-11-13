@@ -2,6 +2,9 @@
 module Language.Rust.Corrode.CFG where
 
 import Control.Monad
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.Except
+import qualified Control.Monad.Trans.RWS.Lazy as RWS
 import Control.Monad.Trans.State
 import Data.Either
 import Data.Foldable
@@ -130,7 +133,9 @@ depthFirstOrder (CFG start blocks) = CFG start' blocks'
     rewriteBlock label (BasicBlock body term) = (label, BasicBlock body (fmap rewrite term))
     blocks' = IntMap.fromList (IntMap.elems (IntMap.intersectionWith rewriteBlock mapping blocks))
 
-dominators :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
+type Dominators = IntMap.IntMap IntSet.IntSet
+
+dominators :: CFG DepthFirst s c -> Either String Dominators
 dominators cfg@(CFG start blocks) = case foldl go IntMap.empty (IntMap.keys blocks) of
     seen | all (check seen) (IntMap.keys blocks) -> Right seen
     _ -> Left "irreducible control flow"
@@ -148,23 +153,19 @@ dominators cfg@(CFG start blocks) = case foldl go IntMap.empty (IntMap.keys bloc
     go seen label = IntMap.insert label (update seen label) seen
     check seen label = Just (update seen label) == IntMap.lookup label seen
 
-backEdges :: CFG DepthFirst s c -> Either String (IntMap.IntMap IntSet.IntSet)
-backEdges cfg = do
-    dom <- dominators cfg
-    return
-        $ IntMap.filter (not . IntSet.null)
-        $ IntMap.intersectionWith IntSet.intersection (flipEdges dom)
-        $ predecessors cfg
+backEdges :: CFG DepthFirst s c -> Dominators -> IntMap.IntMap IntSet.IntSet
+backEdges cfg dom =
+    IntMap.filter (not . IntSet.null) $
+    IntMap.intersectionWith IntSet.intersection (flipEdges dom) $
+    predecessors cfg
     where
     flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
     flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
 type NaturalLoops = IntMap.IntMap IntSet.IntSet
 
-naturalLoops :: CFG DepthFirst s c -> Either String NaturalLoops
-naturalLoops cfg = do
-    back <- backEdges cfg
-    return (IntMap.mapWithKey makeLoop back)
+naturalLoops :: CFG DepthFirst s c -> Dominators -> NaturalLoops
+naturalLoops cfg dom = IntMap.mapWithKey makeLoop (backEdges cfg dom)
     where
     makeLoop header inside = execState (growLoop inside) (IntSet.singleton header)
     allPredecessors = predecessors cfg
@@ -211,49 +212,71 @@ unifyBreaks cfg loops = (breaks, Map.fromList exits')
         , from <- breakExits header to
         ] ++ continues
 
-structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG DepthFirst s c -> Either String s
-structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = do
-    loops <- naturalLoops cfg
-    closed (unifyBreaks cfg loops) (IntMap.keysSet loops) start
-    where
-    allPredecessors = predecessors cfg
-    closed (breaks, exits) loops entry = do
-        (body, rest) <- go entry
-        case rest of
-            Nothing -> return body
-            Just after -> Left ("unexpected edge from " ++ show entry ++ " to " ++ show after)
-        where
-        go label | IntSet.member label loops = do
-            body <- closed (breaks, exits) (IntSet.delete label loops) label
-            let loop = mkLoop label body
-            case IntMap.lookup label breaks of
-                Nothing -> return (loop, Nothing)
-                Just after -> do
-                    (rest1, rest2) <- go after
-                    return (loop `mappend` rest1, rest2)
-        go label = do
-            BasicBlock body term <- maybe (Left ("missing block " ++ show label)) Right (IntMap.lookup label blocks)
-            (rest1, rest2) <- case term of
-                Unreachable -> return (mempty, Nothing)
-                Branch to -> next 1 label to
-                CondBranch c t f -> do
-                    (t', afterT) <- next 1 label t
-                    (f', afterF) <- next 1 label f
-                    case (afterT, afterF) of
-                        (_, Nothing) -> return (mkIf c mempty f' `mappend` t', afterT)
-                        (Nothing, _) -> return (mkIf c t' mempty `mappend` f', afterF)
-                        (Just (nextT, branchesT), Just (nextF, branchesF)) | nextT == nextF -> do
-                            (rest1, rest2) <- next (branchesT + branchesF) label nextT
-                            return (mkIf c t' f' `mappend` rest1, rest2)
-                        _ -> Left ("unsupported conditional branch from " ++ show label ++ " to " ++ show afterT ++ " and " ++ show afterF)
-            return (body `mappend` rest1, rest2)
+data StructureInput = StructureInput
+    { getDominators :: IntMap.IntMap IntSet.IntSet
+    , getExits :: Exits
+    , getLoops :: IntMap.IntMap (Maybe Label)
+    }
 
-        next branches label to = case Map.lookup (label, to) exits of
-            Nothing ->
-                let p = IntSet.toList (fromMaybe IntSet.empty (IntMap.lookup to allPredecessors))
-                    q = filter (\ from -> Map.notMember (from, to) exits) p
-                in if length q == branches
-                then go to
-                else return (mempty, Just (to, branches))
-            Just (BreakFrom header) -> return (mkBreak header, Nothing)
-            Just Continue -> return (mkContinue to, Nothing)
+structureCFG :: Monoid s => (Label -> s) -> (Label -> s) -> (Label -> s -> s) -> (c -> s -> s -> s) -> CFG DepthFirst s c -> Either String s
+structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = runExcept $ do
+    doms <- except $ dominators cfg
+    let loops = naturalLoops cfg doms
+    let (breaks, exits) = unifyBreaks cfg loops
+    let input = StructureInput
+            { getDominators = doms
+            , getExits = exits
+            , getLoops = IntMap.map Just breaks `IntMap.union` IntMap.map (const Nothing) loops
+            }
+    (final, _) <- RWS.execRWST (mapM_ doBlock (IntMap.toDescList blocks)) input IntMap.empty
+    case IntMap.toList final of
+        [(label, (body, _))] | label == start -> return body
+        pieces -> throwE $ "unconsumed blocks: " ++ show (map fst pieces)
+    where
+
+    doBlock (label, BasicBlock body term) = do
+        loops <- RWS.asks getLoops
+        (wrapped, reachable) <- RWS.listen $ do
+            body' <- mappend body <$> doTerm label term
+            case IntMap.lookup label loops of
+                Nothing -> return body'
+                Just breakTo -> do
+                    after <- case breakTo of
+                        Nothing -> return mempty
+                        Just to -> join (consumeBlock label to)
+                    return (mkLoop label body' `mappend` after)
+        RWS.modify (IntMap.insert label (wrapped, IntSet.insert label reachable))
+
+    consumeBlock from to = do
+        input <- RWS.ask
+        seen <- RWS.get
+        case IntMap.lookup to seen of
+            Nothing -> lift $ throwE $ "block " ++ show to ++ " isn't available from " ++ show from
+            Just (body, reachable) -> do
+                RWS.tell reachable
+                return $ if from `IntSet.notMember` IntMap.findWithDefault IntSet.empty to (getDominators input)
+                    then return mempty
+                    else do
+                        RWS.modify (IntMap.delete to)
+                        return body
+
+    followEdge from to = do
+        input <- RWS.ask
+        case Map.lookup (from, to) (getExits input) of
+            Just (BreakFrom header) -> return (return (mkBreak header))
+            Just Continue -> return (return (mkContinue to))
+            Nothing -> consumeBlock from to
+
+    doTerm _ Unreachable = return mempty
+    doTerm label (Branch to) = join (followEdge label to)
+    doTerm label (CondBranch c t f) = do
+        (consumeT, tReachable) <- RWS.listen (followEdge label t)
+        (consumeF, fReachable) <- RWS.listen (followEdge label f)
+        let joinPoint = fmap fst (IntSet.minView (tReachable `IntSet.intersection` fReachable))
+        let ifDisjoint consume l =
+                if Just l /= joinPoint then consume else return mempty
+        stmt <- mkIf c <$> ifDisjoint consumeT t <*> ifDisjoint consumeF f
+        after <- case joinPoint of
+            Just after -> join (consumeBlock label after)
+            Nothing -> return mempty
+        return (stmt `mappend` after)
