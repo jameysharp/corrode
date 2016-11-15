@@ -1023,7 +1023,7 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
     go :: CType -> [CDesignator] -> Designator -> EnvMonad s Designator
     go _ [] obj = pure obj
     go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
-        case span (\ (field, _) -> identToString ident /= field) fields of
+        case span (\ (field, _) -> applyRenames ident /= field) fields of
             (_, []) -> badSource d ("designator for field not in struct " ++ name)
             (earlier, (_, ty') : rest) ->
                 go ty' ds (From ty' (length earlier) (map snd rest) obj)
@@ -2672,8 +2672,11 @@ binop expr op lhs rhs = fmap wrapping $ case op of
         _ -> promote expr Rust.Add lhs rhs
     CSubOp -> case (resultType lhs, resultType rhs) of
         (IsPtr _ _, IsPtr _ _) -> do
+            ptrTo <- case compatiblePtr (resultType lhs) (resultType rhs) of
+                IsPtr _ ptrTo -> return ptrTo
+                _ -> badSource expr "pointer subtraction of incompatible pointers"
             let ty = IsInt Signed WordWidth
-            let size = rustSizeOfType (toRustType (compatiblePtr (resultType lhs) (resultType rhs)))
+            let size = rustSizeOfType (toRustType ptrTo)
             return Result
                 { resultType = ty
                 , resultMutable = Rust.Immutable
