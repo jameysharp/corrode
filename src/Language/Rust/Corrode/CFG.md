@@ -1,3 +1,4 @@
+```haskell
 {-# LANGUAGE Rank2Types #-}
 module Language.Rust.Corrode.CFG where
 
@@ -276,3 +277,4 @@ structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = runExcept $
             Just after -> join (consumeBlock label after)
             Nothing -> return mempty
         return (stmt `mappend` after)
+```
