@@ -69,7 +69,7 @@ main = dieOnError $ do
    optimization flags that make GCC define preprocessor symbols.
 
     ```haskell
-        let defines = [Define "_FORTIFY_SOURCE" "0"]
+        let defines = [Define "_FORTIFY_SOURCE" "0", Define "__NO_CTYPE" "1"]
         let undefines = map Undefine ["__BLOCKS__", "__FILE__", "__LINE__"]
         let warnings = ["-Wno-builtin-macro-redefined"]
         let args = foldl addCppOption
