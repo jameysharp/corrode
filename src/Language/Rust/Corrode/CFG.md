@@ -189,7 +189,7 @@ Constructing CFGs
 =================
 
 This module provides a small monadic interface for constructing
-control-flow graphs. It's provided as a "monad tranformer", meaning that
+control-flow graphs. It's provided as a "monad transformer", meaning that
 you can combine this monad with other monads. For example, if you need
 to keep information about variable declarations that are in scope in
 order to translate statements and expressions correctly, you can use a
