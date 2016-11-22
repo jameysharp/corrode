@@ -76,4 +76,4 @@ else:
 
     rustlibs = [ rustlibdir + fnmatch.filter(alllibs, pat)[0] for pat in needed ]
 
-    sys.exit(subprocess.run(['gcc'] + outflags + cflags + rustlibs + ['-lgcc_eh']).returncode)
+    sys.exit(subprocess.run(['gcc'] + outflags + cflags + rustlibs + ['-lgcc_eh', '-pthread', '-lm', '-ldl']).returncode)
