@@ -1439,7 +1439,7 @@ exit status from `main`.
             [ bind Rust.Immutable ret $
                 Rust.UnsafeExpr $ Rust.Block [] $ Just $
                 call realName args
-            , Rust.Stmt (call "std::process::exit" [Rust.Var ret])
+            , Rust.Stmt (call "::std::process::exit" [Rust.Var ret])
             ]
         ) Nothing))]
     where
@@ -1509,7 +1509,7 @@ Converting an `OsString` to a `Vec<u8>` is only allowed if we bring the
 Unix-specific `OsStringExt` trait into scope.
 
 ```haskell
-            [ Rust.StmtItem [] (Rust.Use "std::os::unix::ffi::OsStringExt")
+            [ Rust.StmtItem [] (Rust.Use "::std::os::unix::ffi::OsStringExt")
             , bind Rust.Mutable argv_storage $
                 chain "collect::<Vec<_>>" [] $
                 chain "map" [
@@ -1520,7 +1520,7 @@ Unix-specific `OsStringExt` trait into scope.
                             ] (Rust.Var vec))
                         ] (Just (Rust.Var vec))))
                 ] $
-                call "std::env::args_os" []
+                call "::std::env::args_os" []
 ```
 
 In C, `argv` is required to be a modifiable NULL-terminated array of
@@ -1541,7 +1541,7 @@ pointer&mdash;and conveniently, the `Option` type is iterable.
 ```haskell
             , bind Rust.Mutable argv $
                 chain "collect::<Vec<_>>" [] $
-                chain "chain" [call "Some" [call "std::ptr::null_mut" []]] $
+                chain "chain" [call "Some" [call "::std::ptr::null_mut" []]] $
                 chain "map" [
                     Rust.Lambda [vec] (chain "as_mut_ptr" [] (Rust.Var vec))
                 ] $
@@ -2886,14 +2886,14 @@ rustSizeOfType :: Rust.Type -> Result
 rustSizeOfType (Rust.TypeName ty) = Result
         { resultType = IsInt Unsigned WordWidth
         , resultMutable = Rust.Immutable
-        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::size_of::<" ++ ty ++ ">"))) []
+        , result = Rust.Call (Rust.Var (Rust.VarName ("::std::mem::size_of::<" ++ ty ++ ">"))) []
         }
 
 rustAlignOfType :: Rust.Type -> Result
 rustAlignOfType (Rust.TypeName ty) = Result
         { resultType = IsInt Unsigned WordWidth
         , resultMutable = Rust.Immutable
-        , result = Rust.Call (Rust.Var (Rust.VarName ("std::mem::align_of::<" ++ ty ++ ">"))) []
+        , result = Rust.Call (Rust.Var (Rust.VarName ("::std::mem::align_of::<" ++ ty ++ ">"))) []
         }
 ```
 
@@ -3283,7 +3283,7 @@ toRustType :: CType -> Rust.Type
 toRustType IsBool = Rust.TypeName "bool"
 toRustType (IsInt s w) = Rust.TypeName ((case s of Signed -> 'i'; Unsigned -> 'u') : (case w of BitWidth b -> show b; WordWidth -> "size"))
 toRustType (IsFloat w) = Rust.TypeName ('f' : show w)
-toRustType IsVoid = Rust.TypeName "std::os::raw::c_void"
+toRustType IsVoid = Rust.TypeName "::std::os::raw::c_void"
 toRustType (IsFunc retTy args variadic) = Rust.TypeName $ concat
     [ "unsafe extern fn("
     , args'
