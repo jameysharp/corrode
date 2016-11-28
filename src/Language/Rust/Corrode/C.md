@@ -644,7 +644,7 @@ The return type of the function depends on which kind of binding it's
 constructing.
 
 ```haskell
-type MakeBinding a = (Rust.ItemKind -> a, Rust.Mutable -> Rust.Var -> Rust.Type -> Maybe Rust.Expr -> a)
+type MakeBinding s a = (Rust.ItemKind -> a, Rust.Mutable -> Rust.Var -> CType -> NodeInfo -> Maybe CInit -> EnvMonad s a)
 ```
 
 It's up to the caller to provide an appropriate implementation of
@@ -655,17 +655,21 @@ define here for convenient use elsewhere.
 > variables.
 
 ```haskell
-makeStaticBinding :: MakeBinding Rust.Item
+makeStaticBinding :: MakeBinding s Rust.Item
 makeStaticBinding = (Rust.Item [] Rust.Private, makeBinding)
     where
-    makeBinding mut var ty mexpr = Rust.Item attrs Rust.Public
-        (Rust.Static mut var ty (fromMaybe 0 mexpr))
+    makeBinding mut var ty node minit = do
+        expr <- interpretInitializer ty (fromMaybe (CInitList [] node) minit)
+        return $ Rust.Item attrs Rust.Public
+            (Rust.Static mut var (toRustType ty) expr)
     attrs = [Rust.Attribute "no_mangle"]
 
-makeLetBinding :: MakeBinding Rust.Stmt
+makeLetBinding :: MakeBinding s Rust.Stmt
 makeLetBinding = (Rust.StmtItem [], makeBinding)
     where
-    makeBinding mut var ty mexpr = Rust.Let mut var (Just ty) mexpr
+    makeBinding mut var ty _ minit = do
+        mexpr <- mapM (interpretInitializer ty) minit
+        return $ Rust.Let mut var (Just (toRustType ty)) mexpr
 ```
 
 Now that we know how to translate variable declarations, everything else
@@ -756,7 +760,7 @@ declaration. It returns a list of bindings constructed using
 `MakeBinding`, and also updates the environment and output as needed.
 
 ```haskell
-interpretDeclarations :: MakeBinding b -> CDecl -> EnvMonad s [b]
+interpretDeclarations :: MakeBinding s b -> CDecl -> EnvMonad s [b]
 interpretDeclarations (fromItem, makeBinding) declaration@(CDecl specs decls _) = do
 ```
 
@@ -890,8 +894,8 @@ to translate that; see below.
                     { typeMutable = mut
                     , typeRep = ty } <- deferred
                 name <- addSymbolIdent ident (mut, ty)
-                mexpr <- mapM (interpretInitializer ty) minit
-                return (Just (makeBinding mut (Rust.VarName name) (toRustType ty) mexpr))
+                binding <- makeBinding mut (Rust.VarName name) ty (nodeInfo decl) minit
+                return (Just binding)
 ```
 
 Return the bindings produced for any declarator that did not return
