@@ -146,6 +146,9 @@ data Expr
     = Lit Lit
     | Var Var
     | Path Path
+    | Index Expr Expr
+    | ArrayExpr [Expr]
+    | RepeatArray Expr Expr
     | StructExpr String [(String, Expr)] (Maybe Expr)
     | Call Expr [Expr]
     | MethodCall Expr Var [Expr]
@@ -237,6 +240,13 @@ instance Pretty Expr where
         go _ _ (Lit x) = pPrint x
         go _ _ (Var x) = pPrint x
         go _ _ (Path x) = pPrint x
+        go pos _ (Index arr idx) = cat [go (left pos) 13 arr <> text "[", nest 4 (go RightExpr 0 idx), text "]"]
+        go _ _ (ArrayExpr els) = sep
+            [ text "["
+            , sep (punctuate (text ",") (map (nest 4 . go RightExpr 0) els))
+            , text "]"
+            ]
+        go _ _ (RepeatArray el size) = text "[" <> go RightExpr 0 el <> text ";" <+> go RightExpr 0 size <> text "]"
         go _ _ (StructExpr str fields base) = sep
             ( text str <+> text "{"
             : punctuate (text ",") ([ nest 4 (text name <> text ":" <+> go RightExpr 0 val) | (name, val) <- fields ] ++ maybe [] (\b -> [ text ".." <> go RightExpr 0 b ]) base)

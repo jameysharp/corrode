@@ -348,11 +348,9 @@ getSymbolIdent ident = do
         name <- lift (asks functionName)
         let name' = fromMaybe def name
         return $ Just Result
-            { resultType = IsPtr Rust.Immutable charType
+            { resultType = IsArray Rust.Immutable (length name' + 1) charType
             , resultMutable = Rust.Immutable
-            , result = Rust.MethodCall (
-                    Rust.Lit (Rust.LitRep ("b\"" ++ name' ++ "\\0\""))
-                ) (Rust.VarName "as_ptr") []
+            , result = Rust.Deref (Rust.Lit (Rust.LitRep ("b\"" ++ name' ++ "\\0\"")))
             }
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w, Result
@@ -1022,6 +1020,7 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
 
     go :: CType -> [CDesignator] -> Designator -> EnvMonad s Designator
     go _ [] obj = pure obj
+    go (IsArray _ _size _el) (d@(CArrDesig _idx _) : _ds) _obj = unimplemented d
     go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
         case span (\ (field, _) -> applyRenames ident /= field) fields of
             (_, []) -> badSource d ("designator for field not in struct " ++ name)
@@ -1074,6 +1073,7 @@ compatible objects.
 ```haskell
 nestedObject :: CType -> Designator -> Maybe Designator
 nestedObject ty desig = case designatorType desig of
+    IsArray _ size el -> Just (From el 0 (replicate (size - 1) el) desig)
     ty' | ty `compatibleInitializer` ty' -> Just desig
     IsStruct _ ((_ , ty') : fields) ->
         nestedObject ty (From ty' 0 (map snd fields) desig)
@@ -1113,6 +1113,7 @@ struct.
 
 ```haskell
     let base = case ty of
+                    IsArray _ size el -> From el 0 (replicate (size - 1) el) (Base ty)
                     IsStruct _ ((_,ty'):fields) -> From ty' 0 (map snd fields) (Base ty)
                     _ -> Base ty
 ```
@@ -1219,6 +1220,12 @@ zeroed out.
         IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
             where Rust.TypeName s = toRustType t
         IsPtr{} -> return $ scalar (Rust.Cast 0 (toRustType t))
+        IsArray _ size _ | IntMap.size initials == size -> return i
+        IsArray _ size elTy -> do
+            elInit <- zeroInitialize (Initializer Nothing IntMap.empty) elTy
+            case helper elTy elInit of
+                Just el -> return (Initializer (Just (Rust.RepeatArray el (fromIntegral size))) initials)
+                Nothing -> unimplemented initial
         IsFunc{} -> return $ scalar (Rust.Cast 0 (toRustType t))
         IsStruct _ fields -> do
             let fields' = IntMap.fromDistinctAscList $ zip [0..] $ map snd fields
@@ -1237,6 +1244,8 @@ zeroed out.
 ```haskell
     helper :: CType -> Initializer -> Maybe Rust.Expr
     helper _ (Initializer (Just expr) initials) | IntMap.null initials = Just expr
+    helper (IsArray _ _ el) (Initializer Nothing initials) =
+        Rust.ArrayExpr <$> mapM (helper el) (IntMap.elems initials)
     helper (IsStruct str fields) (Initializer expr initials) =
         Rust.StructExpr str <$> fields' <*> pure expr
         where
@@ -2380,14 +2389,24 @@ our `binop` helper here does the right thing.
 interpretExpr _ expr@(CIndex lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
-    ptr <- binop expr CAddOp lhs' rhs'
-    case resultType ptr of
-        IsPtr mut ty -> return Result
-            { resultType = ty
-            , resultMutable = mut
-            , result = Rust.Deref (result ptr)
-            }
-        _ -> badSource expr "array subscript of non-pointer"
+    case (resultType lhs', resultType rhs') of
+        (IsArray mut _ el, _) -> return (subscript mut el (result lhs') rhs')
+        (_, IsArray mut _ el) -> return (subscript mut el (result rhs') lhs')
+        _ -> do
+            ptr <- binop expr CAddOp lhs' rhs'
+            case resultType ptr of
+                IsPtr mut ty -> return Result
+                    { resultType = ty
+                    , resultMutable = mut
+                    , result = Rust.Deref (result ptr)
+                    }
+                _ -> badSource expr "array subscript of non-pointer"
+    where
+    subscript mut el arr idx = Result
+        { resultType = el
+        , resultMutable = mut
+        , result = Rust.Index arr (castTo (IsInt Unsigned WordWidth) idx)
+        }
 ```
 
 Function calls first translate the expression which identifies which
@@ -2440,6 +2459,7 @@ lack of a prototype, except we don't allow either of those cases.
     promoteArg :: Result -> Rust.Expr
     promoteArg r = case resultType r of
         IsFloat _ -> castTo (IsFloat 64) r
+        IsArray mut _ el -> castTo (IsPtr mut el) r
         ty -> castTo (intPromote ty) r
 ```
 
@@ -2561,11 +2581,9 @@ lifetime, the resulting raw pointer is always safe to use.
 
 ```haskell
     CStrConst (CString str False) _ -> return Result
-        { resultType = IsPtr Rust.Immutable charType
+        { resultType = IsArray Rust.Immutable (length str + 1) charType
         , resultMutable = Rust.Immutable
-        , result = Rust.MethodCall (Rust.Lit (
-                Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")
-            )) (Rust.VarName "as_ptr") []
+        , result = Rust.Deref (Rust.Lit (Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")))
         }
     _ -> unimplemented expr
     where
@@ -2661,18 +2679,30 @@ wrapping r@(Result { resultType = IsInt Unsigned _ }) = case result r of
     _ -> r
 wrapping r = r
 
+toPtr :: Result -> Maybe Result
+toPtr ptr@(Result { resultType = IsArray mut _ el }) = Just ptr
+    { resultType = IsPtr mut el
+    , result = castTo (IsPtr mut el) ptr
+    }
+toPtr ptr@(Result { resultType = IsPtr{} }) = Just ptr
+toPtr _ = Nothing
+
 binop :: CExpr -> CBinaryOp -> Result -> Result -> EnvMonad s Result
 binop expr op lhs rhs = fmap wrapping $ case op of
     CMulOp -> promote expr Rust.Mul lhs rhs
     CDivOp -> promote expr Rust.Div lhs rhs
     CRmdOp -> promote expr Rust.Mod lhs rhs
-    CAddOp -> case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) rhs] }
-        (_, IsPtr _ _) -> return rhs { result = Rust.MethodCall (result rhs) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) lhs] }
+    CAddOp -> case (toPtr lhs, toPtr rhs) of
+        (Just ptr, _) -> return (offset ptr rhs)
+        (_, Just ptr) -> return (offset ptr lhs)
         _ -> promote expr Rust.Add lhs rhs
-    CSubOp -> case (resultType lhs, resultType rhs) of
-        (IsPtr _ _, IsPtr _ _) -> do
-            ptrTo <- case compatiblePtr (resultType lhs) (resultType rhs) of
+        where
+        offset ptr idx = ptr
+            { result = Rust.MethodCall (result ptr) (Rust.VarName "offset") [castTo (IsInt Signed WordWidth) idx]
+            }
+    CSubOp -> case (toPtr lhs, toPtr rhs) of
+        (Just lhs', Just rhs') -> do
+            ptrTo <- case compatiblePtr (resultType lhs') (resultType rhs') of
                 IsPtr _ ptrTo -> return ptrTo
                 _ -> badSource expr "pointer subtraction of incompatible pointers"
             let ty = IsInt Signed WordWidth
@@ -2680,9 +2710,9 @@ binop expr op lhs rhs = fmap wrapping $ case op of
             return Result
                 { resultType = ty
                 , resultMutable = Rust.Immutable
-                , result = (Rust.MethodCall (castTo ty lhs) (Rust.VarName "wrapping_sub") [castTo ty rhs]) / castTo ty size
+                , result = (Rust.MethodCall (castTo ty lhs') (Rust.VarName "wrapping_sub") [castTo ty rhs']) / castTo ty size
                 }
-        (IsPtr _ _, _) -> return lhs { result = Rust.MethodCall (result lhs) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
+        (Just ptr, _) -> return ptr { result = Rust.MethodCall (result ptr) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
         _ -> promote expr Rust.Sub lhs rhs
     CShlOp -> shift Rust.ShiftL
     CShrOp -> shift Rust.ShiftR
@@ -2878,6 +2908,16 @@ that inserts a cast if and only if we need one.
 ```haskell
 castTo :: CType -> Result -> Rust.Expr
 castTo target source | resultType source == target = result source
+castTo target (Result { resultType = IsArray mut _ el, result = source }) =
+    castTo target Result
+        { resultType = IsPtr mut el
+        , resultMutable = Rust.Immutable
+        , result = Rust.MethodCall source (Rust.VarName method) []
+        }
+    where
+    method = case mut of
+        Rust.Immutable -> "as_ptr"
+        Rust.Mutable -> "as_mut_ptr"
 castTo IsBool source = toBool source
 castTo target source = Rust.Cast (result source) (toRustType target)
 ```
@@ -3120,7 +3160,9 @@ conversions" but for pointer types.
 ```haskell
 compatiblePtr :: CType -> CType -> CType
 compatiblePtr (IsPtr _ IsVoid) b = b
+compatiblePtr (IsArray mut _ el) b = compatiblePtr (IsPtr mut el) b
 compatiblePtr a (IsPtr _ IsVoid) = a
+compatiblePtr a (IsArray mut _ el) = compatiblePtr a (IsPtr mut el)
 compatiblePtr (IsPtr m1 a) (IsPtr m2 b) = IsPtr (leastMutable m1 m2) (compatiblePtr a b)
     where
     leastMutable Rust.Mutable Rust.Mutable = Rust.Mutable
@@ -3150,11 +3192,14 @@ promotePtr
     -> (Rust.Expr -> Rust.Expr -> Rust.Expr)
     -> Result -> Result -> EnvMonad s Result
 promotePtr node op a b = case (resultType a, resultType b) of
+    (IsArray _ _ _, _) -> ptrs
     (IsPtr _ _, _) -> ptrs
+    (_, IsArray _ _ _) -> ptrs
     (_, IsPtr _ _) -> ptrs
     _ -> promote node op a b
     where
     ptrOrVoid r = case resultType r of
+        t@(IsArray _ _ _) -> t
         t@(IsPtr _ _) -> t
         _ -> IsPtr Rust.Mutable IsVoid
     ty = compatiblePtr (ptrOrVoid a) (ptrOrVoid b)
@@ -3199,6 +3244,7 @@ data CType
     | IsVoid
     | IsFunc CType [(Maybe (Rust.Mutable, Ident), CType)] Bool
     | IsPtr Rust.Mutable CType
+    | IsArray Rust.Mutable Int CType
     | IsStruct String [(String, CType)]
     | IsEnum String
     | IsIncomplete Ident
@@ -3220,6 +3266,7 @@ instance Eq CType where
         aRetTy == bRetTy && aVariadic == bVariadic &&
         map snd aFormals == map snd bFormals
     IsPtr aMut aTy == IsPtr bMut bTy = aMut == bMut && aTy == bTy
+    IsArray aMut _ aTy == IsArray bMut _ bTy = aMut == bMut && aTy == bTy
     IsStruct aName aFields == IsStruct bName bFields =
         aName == bName && aFields == bFields
     IsEnum aName == IsEnum bName = aName == bName
@@ -3248,6 +3295,9 @@ toRustType (IsPtr mut to) = let Rust.TypeName to' = toRustType to in Rust.TypeNa
     where
     rustMut Rust.Mutable = "*mut "
     rustMut Rust.Immutable = "*const "
+toRustType (IsArray _ size el) = Rust.TypeName ("[" ++ typename el ++ "; " ++ show size ++ "]")
+    where
+    typename (toRustType -> Rust.TypeName t) = t
 toRustType (IsStruct name _fields) = Rust.TypeName name
 toRustType (IsEnum name) = Rust.TypeName name
 toRustType (IsIncomplete ident) = Rust.TypeName (identToString ident)
@@ -3619,13 +3669,15 @@ error; there must be an intervening pointer.
             { typeMutable = mutable quals
             , typeRep = IsPtr (typeMutable itype) (typeRep itype)
             }
-    derive (CArrDeclr quals _ _) = return $ \ itype ->
+    derive (CArrDeclr quals sizeExpr _) = return $ \ itype ->
         if typeIsFunc itype
         then badSource declr "function as array element type"
-        else return itype
-            { typeMutable = mutable quals
-            , typeRep = IsPtr (typeMutable itype) (typeRep itype)
-            }
+        else case sizeExpr of
+            CArrSize _ (CConst (CIntConst (CInteger size _ _) _)) -> return itype
+                { typeMutable = mutable quals
+                , typeRep = IsArray (typeMutable itype) (fromInteger size) (typeRep itype)
+                }
+            _ -> unimplemented declr
 ```
 
 ```haskell
@@ -3659,7 +3711,10 @@ error; there must be an intervening pointer.
                 return $ do
                     itype <- argTy
                     when (typeIsFunc itype) (badSource arg "function as function argument")
-                    return (fmap ((,) (typeMutable itype)) argname, typeRep itype)
+                    let ty = case typeRep itype of
+                            IsArray mut _ el -> IsPtr mut el
+                            orig -> orig
+                    return (fmap ((,) (typeMutable itype)) argname, ty)
             | arg@(CDecl argspecs declr' _) <-
 ```
 
