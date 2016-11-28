@@ -2209,7 +2209,7 @@ interpretExpr _ (CCast decl expr _) = do
             return Result
                 { resultType = ty
                 , resultMutable = Rust.Immutable
-                , result = Rust.Cast (result expr') (toRustType ty)
+                , result = castTo ty expr'
                 }
 ```
 
