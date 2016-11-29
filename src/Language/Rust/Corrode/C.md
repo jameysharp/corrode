@@ -1730,11 +1730,20 @@ interpretStatement (CIf c t mf _) next = do
 ```
 
 ```haskell
-interpretStatement stmt@(CSwitch expr body _) next = do
-    -- FIXME: if expr might have side effects, extract it to a variable
+interpretStatement stmt@(CSwitch expr body node) next = do
+    (bindings, expr') <- case expr of
+        CVar{} -> return ([], expr)
+        _ -> lift $ lift $ do
+            ident <- fmap internalIdent (uniqueName "switch")
+            rhs <- interpretExpr True expr
+            var <- addSymbolIdent ident (Rust.Immutable, resultType rhs)
+            return
+                ( [Rust.Let Rust.Immutable (Rust.VarName var) Nothing (Just (result rhs))]
+                , CVar ident node
+                )
 
     after <- newLabel
-    (_, SwitchCases cases) <- getSwitchCases expr $ setBreak after $
+    (_, SwitchCases cases) <- getSwitchCases expr' $ setBreak after $
         interpretStatement body (return ([], Branch after))
 
     let isDefault (Just condition) = Left condition
@@ -1750,7 +1759,7 @@ interpretStatement stmt@(CSwitch expr body _) next = do
     (rest, end) <- next
     addBlock after rest end
 
-    return ([], Branch entry)
+    return (bindings, Branch entry)
     where
     conditionBlock (target, condition) defaultCase = do
         label <- newLabel
