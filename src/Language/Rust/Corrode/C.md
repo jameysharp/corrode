@@ -2217,7 +2217,7 @@ explicitly ignoring the result, meaning the expression is only intended
 to be evaluated for its side effects. It's commonly used in older code
 to suppress over-zealous compiler warnings, and continues to be used in
 certain special cases such as glibc's implementation of the assert
-macro. A naïve translation of this idiom produces invalid Rust, so we
+macro. A naive translation of this idiom produces invalid Rust, so we
 special-case it to simply evaluate the subexpression without demanding
 its result.
 
