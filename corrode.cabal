@@ -37,3 +37,17 @@ executable corrode
                        markdown-unlit,
                        pretty,
                        transformers >=0.2
+
+test-suite tests
+  type:                exitcode-stdio-1.0
+  hs-source-dirs:      tests
+  main-is:             test.hs
+  build-depends:       base
+                     , containers >= 0.5
+                     , corrode
+                     , pretty
+                     , tasty
+                     , tasty-quickcheck
+                     , transformers >=0.2
+  ghc-options:         -Wall -threaded -rtsopts -with-rtsopts=-N
+  default-language:    Haskell2010

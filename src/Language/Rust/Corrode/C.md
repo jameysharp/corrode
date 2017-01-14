@@ -1966,7 +1966,7 @@ need to extract equivalent Rust control flow expressions.
 
 ```haskell
 cfgToRust :: (Pretty node, Pos node) => node -> CSourceBuildCFGT s ([Rust.Stmt], Terminator Result) -> EnvMonad s [Rust.Stmt]
-cfgToRust node build = do
+cfgToRust _node build = do
     let builder = buildCFG $ do
             (early, term) <- build
             entry <- newLabel
@@ -1983,11 +1983,8 @@ yet.
 
 ```haskell
     let cfg = depthFirstOrder (removeEmptyBlocks rawCFG)
-    case structureCFG mkBreak mkContinue mkLoop mkIf cfg of
-        Right stmts -> return stmts
-        Left msg -> noTranslation node (msg ++ ":\n" ++ render (nest 4 (prettyRustCFG cfg)) ++ "\nfrom")
+    return $ declCurrent : structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg
     where
-    prettyRustCFG cfg = prettyCFG (vcat . map pPrint) (pPrint . result) cfg
 ```
 
 The `CFG` module is agnostic to both source and target languages, so we
@@ -2006,6 +2003,13 @@ inside a `loop`.
     mkContinue l = [Rust.Stmt (Rust.Continue (Just (loopLabel l)))]
     mkLoop l b = [Rust.Stmt (Rust.Loop (Just (loopLabel l)) (statementsToBlock b))]
     mkIf c t f = [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))]
+
+    currentBlock = Rust.VarName "_currentBlock"
+    declCurrent = Rust.Let Rust.Mutable currentBlock Nothing Nothing
+    mkGoto l = [Rust.Stmt (Rust.Assign (Rust.Var currentBlock) (Rust.:=) (fromIntegral l))]
+    mkMatch = foldr go []
+        where
+        go (l, t) f = [Rust.Stmt (Rust.IfThenElse (Rust.CmpEQ (Rust.Var currentBlock) (fromIntegral l)) (statementsToBlock t) (statementsToBlock f))]
 ```
 
 To generate code that's as clear as possible, we handle some interesting
