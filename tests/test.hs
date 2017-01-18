@@ -1,6 +1,11 @@
 import Control.Monad
 import Control.Monad.Trans.Class
+import Control.Monad.Trans.State.Lazy
+import Data.Either
+import Data.Foldable
+import Data.Functor.Identity
 import qualified Data.IntMap as IntMap
+import qualified Data.Map as Map
 import Data.List
 import Language.Rust.Corrode.CFG
 import Test.Tasty
@@ -13,10 +18,12 @@ main = defaultMain tests
 tests :: TestTree
 tests = testGroup "Tests"
     [ QC.testProperty "structuring CFGs conserves code" cfgStructureConservesCode
+    , QC.testProperty "CFG structuring round-trips" cfgRoundTrip
     ]
 
 data Stmt
     = Stmt Int
+    | Return
     | Loop Label [Stmt]
     | Break Label
     | Continue Label
@@ -47,10 +54,98 @@ instance Pretty Stmt where
 prettyStmts :: [Stmt] -> Doc
 prettyStmts = vcat . map pPrint
 
+stmtToCFG :: [Stmt] -> CFG DepthFirst [Stmt] Cond
+stmtToCFG = depthFirstOrder . staticCFG . runIdentity . buildCFG . convert [] ([], Unreachable)
+    where
+    makeBlock ([], Branch to) = return to
+    makeBlock (after, term) = do
+        b <- newLabel
+        addBlock b after term
+        return b
+
+    convert loops term stmts = convert' loops term stmts >>= makeBlock
+    convert' loops = foldrM go
+        where
+        getLoop l = case lookup l loops of
+            Just labels -> labels
+            Nothing -> error ("stmtToCFG: loop " ++ show l ++ " not in " ++ show loops)
+        go Return _ = return ([Return], Unreachable)
+        go (Loop l stmts) (after, term) = do
+            brk <- makeBlock (after, term)
+            cont <- newLabel
+            (after', term') <- convert' ((l, (brk, cont)) : loops) ([], Branch cont) stmts
+            addBlock cont after' term'
+            return ([], Branch cont)
+        go (Break l) _ = return ([], Branch (fst (getLoop l)))
+        go (Continue l) _ = return ([], Branch (snd (getLoop l)))
+        go (If c t f) term = do
+            term' <- (,) [] <$> Branch <$> makeBlock term
+            t' <- convert loops term' t
+            f' <- convert loops term' f
+            return ([], CondBranch c t' f')
+        go s (after, term) = return (s : after, term)
+
+staticCFG :: CFG k [Stmt] Cond -> CFG Unordered [Stmt] Cond
+staticCFG (CFG start blocks) = removeEmptyBlocks $ evalState (buildCFG $ foo initialState start) Map.empty
+    where
+    initialState = -1
+    getGoto (Goto l) = Right l
+    getGoto s = Left s
+    extractGoto current stmts = case partitionEithers $ map getGoto stmts of
+        (stmts', gotos) -> (last (current : gotos), stmts')
+    foo current b = do
+        let key = (current, b)
+        seen <- lift get
+        case key `Map.lookup` seen of
+            Just b' -> return b'
+            Nothing -> case IntMap.lookup b blocks of
+                Nothing -> fail ("staticCFG: block " ++ show b ++ " missing")
+                Just (BasicBlock stmts term) -> do
+                    b' <- newLabel
+                    lift $ put $ Map.insert key b' seen
+                    let (current', stmts') = extractGoto current stmts
+                    term' <- case term of
+                        CondBranch (Match n) t f
+                            | current' == n -> Branch <$> foo initialState t
+                            | otherwise -> Branch <$> foo current' f
+                        _ -> mapM (foo current') term
+                    addBlock b' stmts' term'
+                    return b'
+
+data BigramFst = FstStmt Int | FstCond Int Bool
+    deriving (Eq, Ord, Show)
+data BigramSnd = SndStmt Int | SndCond Int | SndReturn
+    deriving (Eq, Ord, Show)
+
+bigrams :: CFG DepthFirst [Stmt] Cond -> Map.Map BigramFst BigramSnd
+bigrams (CFG start blocks) = snd $ IntMap.findWithDefault undefined start $ allBlocks $ allBlocks IntMap.empty
+    where
+    allBlocks seen = IntMap.foldrWithKey perBlock seen blocks
+
+    perBlock l (BasicBlock stmts term) seen = IntMap.insert l (foldr perStmt (perTerm go term) stmts) seen
+        where
+        go to = IntMap.findWithDefault (Nothing, Map.empty) to seen
+
+    newBigram _ (Nothing, seen) = seen
+    newBigram bigramFst (Just bigramSnd, seen) = Map.insert bigramFst bigramSnd seen
+
+    perStmt (Stmt s) next = (Just (SndStmt s), newBigram (FstStmt s) next)
+    perStmt Return _ = (Just SndReturn, Map.empty)
+    perStmt s _ = error ("bigrams: unsupported statment " ++ show s)
+
+    perTerm go term = case term of
+        Unreachable -> (Nothing, Map.empty)
+        Branch to -> go to
+        CondBranch (Cond c) t f -> (Just (SndCond c), bar True t `Map.union` bar False f)
+            where
+            bar matched to = newBigram (FstCond c matched) (go to)
+        CondBranch c _ _ -> error ("bigrams: unsupported condition " ++ show c)
+
 fingerprintStmt :: [Stmt] -> (IntMap.IntMap Int, IntMap.IntMap Int)
 fingerprintStmt = foldr go (IntMap.empty, IntMap.empty)
     where
     go (Stmt l) (stmts, conds) = (IntMap.insertWith (+) l 1 stmts, conds)
+    go Return _ = (IntMap.empty, IntMap.empty)
     go (Loop _ stmts) rest = foldr go rest stmts
     go (Break _) rest = rest
     go (Continue _) rest = rest
@@ -68,8 +163,14 @@ fingerprintCFG (CFG _ blocks) = mconcat $ map go $ IntMap.elems blocks
         CondBranch (Cond c) _ _ -> (stmts, IntMap.insertWith (+) c 1 conds)
         _ -> (stmts, conds)
 
+genStmts :: CFG DepthFirst s c -> CFG DepthFirst [Stmt] c
+genStmts (CFG start blocks) = CFG start (IntMap.mapWithKey go blocks)
+    where
+    go _ (BasicBlock _ Unreachable) = BasicBlock [Return] Unreachable
+    go l (BasicBlock _ term) = BasicBlock [Stmt l] term
+
 genCFG :: QC.Gen (CFG DepthFirst [Stmt] Cond)
-genCFG = QC.sized $ \ n -> fmap depthFirstOrder $ buildCFG $ do
+genCFG = QC.sized $ \ n -> fmap (genStmts . depthFirstOrder) $ buildCFG $ do
     labels <- replicateM (1 + n) newLabel
     let chooseLabel = QC.elements labels
     forM_ labels $ \ label -> do
@@ -78,11 +179,11 @@ genCFG = QC.sized $ \ n -> fmap depthFirstOrder $ buildCFG $ do
             , Branch <$> chooseLabel
             , CondBranch (Cond label) <$> chooseLabel <*> chooseLabel
             ]
-        addBlock label [Stmt label] term
+        addBlock label () term
     return (head labels)
 
 shrinkCFG :: CFG DepthFirst [Stmt] Cond -> [CFG DepthFirst [Stmt] Cond]
-shrinkCFG (CFG entry blocks) = map depthFirstOrder (removeEdges ++ skipBlocks)
+shrinkCFG (CFG entry blocks) = map (genStmts . depthFirstOrder) (removeEdges ++ skipBlocks)
     where
     removeEdges = map (CFG entry . IntMap.fromList) $ go $ IntMap.toList blocks
         where
@@ -121,3 +222,18 @@ cfgStructureConservesCode = QC.forAllShrink genCFG shrinkCFG $ \ cfg ->
     conserved kind structured cfg = case IntMap.toList $ IntMap.filter (/= 0) $ subtractMap structured cfg of
         [] -> QC.property True
         miss -> QC.counterexample (kind ++ " not conserved: " ++ show miss) False
+
+cfgRoundTrip :: QC.Property
+cfgRoundTrip = QC.forAllShrink genCFG shrinkCFG $ \ cfg ->
+    let bi = bigrams cfg
+        stmts = structureStmtCFG cfg
+        cfg' = stmtToCFG stmts
+        bi' = bigrams cfg'
+    in foldr QC.counterexample (QC.property (bi == bi')) $
+        map (++ "\n")
+            [ render (prettyStructure (relooperRoot cfg))
+            , render (prettyStmts stmts)
+            , show bi
+            , show bi'
+            , show cfg'
+            ]

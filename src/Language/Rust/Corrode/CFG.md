@@ -27,13 +27,12 @@ module Language.Rust.Corrode.CFG (
     prettyStructure, relooperRoot, structureCFG,
 ) where
 
-import Debug.Trace
-
 import Control.Monad
 import Control.Monad.Trans.State
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
+import Data.Traversable
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 ```
 
@@ -118,14 +117,15 @@ type is specifically the above-chosen `Label`.
 type Terminator c = Terminator' c Label
 
 instance Functor (Terminator' c) where
-    fmap _ Unreachable = Unreachable
-    fmap f (Branch l) = Branch (f l)
-    fmap f (CondBranch c l1 l2) = CondBranch c (f l1) (f l2)
+    fmap = fmapDefault
 
 instance Foldable (Terminator' c) where
-    foldMap _ Unreachable = mempty
-    foldMap f (Branch l) = f l
-    foldMap f (CondBranch _ l1 l2) = f l1 `mappend` f l2
+    foldMap = foldMapDefault
+
+instance Traversable (Terminator' c) where
+    traverse _ Unreachable = pure Unreachable
+    traverse f (Branch l) = Branch <$> f l
+    traverse f (CondBranch c l1 l2) = CondBranch c <$> f l1 <*> f l2
 ```
 
 Now we can define a complete control-flow graph in terms of the previous
@@ -353,30 +353,30 @@ data Structure
 prettyStructure :: [Structure] -> Doc
 prettyStructure = vcat . map go
     where
-    go (Simple entry) = text "-" <+> text (show entry)
-    go (Loop _ _ body) = text "-" <+> (text "loop" $+$ prettyStructure body)
-    go (Multiple handlers) = vcat [ text "|" <+> prettyStructure body | (_, body) <- handlers ]
+    go (Simple entry) = text (show entry ++ ";")
+    go (Loop cont brk body) = text ("loop continue=" ++ show cont ++ " break=" ++ show brk) $+$ nest 2 (prettyStructure body)
+    go (Multiple handlers) = text "match" $+$ vcat [ text (show label) $+$ nest 2 (prettyStructure body) | (label, body) <- handlers ]
 
 relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
-relooper entries _ | IntSet.null entries = []
+relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
 relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
     ([entry], []) -> constructSimple entry
-    ([], _) -> constructLoop
-    _ | not (IntMap.null singlyReached) -> constructMultiple
-    _ -> constructLoop
+    _ | IntSet.null noreturns || IntMap.null singlyReached -> constructLoop
+    _ -> constructMultiple
     where
-    returns = strictReachableFrom `IntMap.intersection` IntMap.fromSet (const ()) entries
-    noreturns = entries `IntSet.difference` IntMap.keysSet strictReachableFrom
+    returns = (strictReachableFrom `IntMap.intersection` blocks) `IntMap.intersection` IntMap.fromSet (const ()) entries
+    noreturns = entries `IntSet.difference` IntMap.keysSet (strictReachableFrom `IntMap.intersection` blocks)
 
-    badBlock entry = trace ("relooper: simple block " ++ show entry ++ " not in " ++ show blocks) IntSet.empty
-    constructSimple entry = Simple entry : relooper (IntMap.findWithDefault (badBlock entry) entry blocks) (IntMap.delete entry blocks)
+    constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
+        (Nothing, _) -> []
+        (Just block, blocks') -> Simple entry : relooper block blocks'
 
     singlyReached = flipEdges $ IntMap.filter (\ r -> IntSet.size r == 1) $ IntMap.map (IntSet.intersection entries) reachableFrom
     (multipleEntries, multipleFollowEntries, multipleWithin) = unzip3
-        [ ((entry, relooper (IntSet.singleton entry) (IntMap.map fst foo)), IntSet.unions (map snd (IntMap.elems foo)), within)
+        [ ((entry, relooper (IntSet.singleton entry) blocks'), outEdges, within)
         | (entry, within) <- IntMap.toList singlyReached
         , let blocks' = blocks `IntMap.intersection` IntMap.fromSet (const ()) within
-        , let foo = IntMap.map (`partitionMembers` within) blocks'
+        , let outEdges = IntSet.unions $ map (`IntSet.difference` within) $ IntMap.elems blocks'
         ]
     multipleFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) (IntSet.unions multipleWithin)
     constructMultiple = Multiple multipleEntries : relooper (IntSet.unions $ entries `IntSet.difference` IntSet.fromList (map fst multipleEntries) : multipleFollowEntries) multipleFollowBlocks
@@ -387,7 +387,7 @@ relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
     loopFoo = IntMap.map (`partitionMembers` loopWithin) loopBlocks
     loopFollowEntries = IntSet.unions (map snd (IntMap.elems loopFoo))
     constructLoop = Loop
-        { loopContinues = entries
+        { loopContinues = IntMap.keysSet returns
         , loopBreaks = loopFollowEntries
         , loopBody = relooper (IntMap.keysSet returns) (IntMap.map ((`IntSet.difference` entries) . fst) loopFoo)
         } : relooper loopFollowEntries loopFollowBlocks
