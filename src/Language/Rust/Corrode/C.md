@@ -905,6 +905,9 @@ Return the bindings produced for any declarator that did not return
     return (catMaybes mbinds)
 ```
 
+```haskell
+interpretDeclarations _ (CStaticAssert {}) = error "FIXME: interpretDeclarations CStaticAssert"
+```
 
 Initialization
 ==============
@@ -3390,7 +3393,7 @@ process we add any nested declarations of new `struct`, `union`, or
 baseTypeOf :: [CDeclSpec] -> EnvMonad s (Maybe CStorageSpec, EnvMonad s IntermediateType)
 baseTypeOf specs = do
     -- TODO: process attributes and the `inline` keyword
-    let (storage, _attributes, basequals, basespecs, _inline) = partitionDeclSpecs specs
+    let (storage, _attributes, basequals, basespecs, _inlineNoReturn, _align) = partitionDeclSpecs specs
     mstorage <- case storage of
         [] -> return Nothing
         [spec] -> return (Just spec)
@@ -3483,7 +3486,9 @@ only reporting an error if this struct is actually used.
 
 ```haskell
     singleSpec [CSUType (CStruct CStructTag mident (Just declarations) _ _) _] = do
-        deferredFields <- fmap concat $ forM declarations $ \ declaration@(CDecl spec decls _) -> do
+        deferredFields <- fmap concat $ forM declarations $ \ declaration -> case declaration of
+          CStaticAssert {} -> return []
+          CDecl spec decls _ -> do
             (storage, base) <- baseTypeOf spec
             case storage of
                 Just s -> badSource s "storage class specifier in struct"
@@ -3756,6 +3761,7 @@ mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
 typeName :: CDecl -> EnvMonad s (Rust.Mutable, CType)
+typeName (CStaticAssert {}) = error "FIXME: typeName of CStaticAssert"
 typeName decl@(CDecl spec declarators _) = do
     (storage, base) <- baseTypeOf spec
     case storage of

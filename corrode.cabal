@@ -20,7 +20,7 @@ library
   build-depends:       base >=4.8,
                        array >= 0.4,
                        containers >= 0.5,
-                       language-c >=0.4 && <0.6,
+                       language-c >=0.6 && <0.7,
                        markdown-unlit,
                        pretty,
                        transformers
@@ -33,7 +33,7 @@ executable corrode
                        bytestring,
                        corrode,
                        filepath,
-                       language-c >=0.4 && <0.6,
+                       language-c >=0.6 && <0.7,
                        markdown-unlit,
                        pretty,
                        transformers >=0.2
