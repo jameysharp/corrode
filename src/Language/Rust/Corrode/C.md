@@ -1882,7 +1882,7 @@ interpretStatement stmt@(CReturn expr _) next = do
     lift $ lift $ do
         val <- lift (asks functionReturnType)
         case val of
-            Nothing -> badSource stmt "return statement outside function" 
+            Nothing -> badSource stmt "return statement outside function"
             Just retTy -> do
                 expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
                 return ([Rust.Stmt (Rust.Return expr')], Unreachable)
