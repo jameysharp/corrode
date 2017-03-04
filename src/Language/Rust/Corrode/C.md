@@ -906,7 +906,7 @@ Return the bindings produced for any declarator that did not return
 ```
 
 ```haskell
-interpretDeclarations _ (CStaticAssert {}) = error "FIXME: interpretDeclarations CStaticAssert"
+interpretDeclarations _ node@(CStaticAssert {}) = unimplemented node
 ```
 
 Initialization
