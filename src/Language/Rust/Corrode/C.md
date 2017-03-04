@@ -3761,7 +3761,7 @@ mutable :: [CTypeQualifier a] -> Rust.Mutable
 mutable quals = if any (\ q -> case q of CConstQual _ -> True; _ -> False) quals then Rust.Immutable else Rust.Mutable
 
 typeName :: CDecl -> EnvMonad s (Rust.Mutable, CType)
-typeName (CStaticAssert {}) = error "FIXME: typeName of CStaticAssert"
+typeName decl@(CStaticAssert {}) = badSource decl "static assert in type name "
 typeName decl@(CDecl spec declarators _) = do
     (storage, base) <- baseTypeOf spec
     case storage of
