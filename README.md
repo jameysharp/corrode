@@ -100,7 +100,7 @@ into a Rust project), or use the `scripts/corrode-cc` tool in place of
 `gcc` to compile and link. In many build systems, such as `make`, you
 can simply set `CC=corrode-cc` without modification.
 
-### Design principles ###
+## Design principles
 
 The overarching goal of Corrode is to preserve the original properties
 of the source program as much as possible: behavior, ABI compatibility,
