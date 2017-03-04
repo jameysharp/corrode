@@ -3,14 +3,15 @@ module Language.Rust.AST where
 import Text.PrettyPrint.HughesPJClass
 
 newtype Lifetime = Lifetime String
-    deriving Eq
+    deriving (Show, Eq)
 newtype Type = TypeName String
-    deriving Eq
+    deriving (Show, Eq)
 newtype Lit = LitRep String
-    deriving Eq
+    deriving (Show, Eq)
 newtype Var = VarName String
-    deriving Eq
+    deriving (Show, Eq)
 newtype Path = PathSegments [String]
+    deriving Show
 
 instance Pretty Lifetime where
     pPrint (Lifetime s) = text "'" <> text s
@@ -28,7 +29,7 @@ instance Pretty Path where
     pPrint (PathSegments names) = hcat (punctuate (text "::") (map text names))
 
 data Visibility = Public | Private
-    deriving Eq
+    deriving (Show, Eq)
 
 data Mutable = Immutable | Mutable
     deriving (Show, Eq)
@@ -37,6 +38,7 @@ data Stmt
     = Stmt Expr
     | Let Mutable Var (Maybe Type) (Maybe Expr)
     | StmtItem [Attribute] ItemKind
+    deriving Show
 
 instance Pretty Stmt where
     -- Any statement consisting of an expression whose syntax ends with
@@ -57,13 +59,16 @@ instance Pretty Stmt where
         [ text "#[" <> text attr <> text "]" | Attribute attr <- attrs ] ++ [pPrint k]
 
 data Block = Block [Stmt] (Maybe Expr)
+    deriving Show
 
 pPrintBlock :: Doc -> Block -> Doc
 pPrintBlock pre (Block [] e) = sep [pre <+> text "{", nest 4 (maybe empty pPrint e), text "}"]
 pPrintBlock pre (Block ss e) = pre <+> text "{" $+$ nest 4 (vcat (map pPrint ss ++ [maybe empty pPrint e])) $+$ text "}"
 
 data Attribute = Attribute String
+    deriving Show
 data Item = Item [Attribute] Visibility ItemKind
+    deriving Show
 
 instance Pretty Item where
     pPrint (Item attrs vis k) = vcat $
@@ -73,6 +78,7 @@ instance Pretty Item where
 data FunctionAttribute
     = UnsafeFn
     | ExternABI (Maybe String)
+    deriving Show
 
 instance Pretty FunctionAttribute where
     pPrint UnsafeFn = text "unsafe"
@@ -85,6 +91,7 @@ data ItemKind
     | Extern [ExternItem]
     | Use String
     | Enum String [Enumerator]
+    deriving Show
 
 instance Pretty ItemKind where
     pPrint (Function attrs nm args ret body) = pPrintBlock (cat
@@ -116,6 +123,7 @@ instance Pretty ItemKind where
 data ExternItem
     = ExternFn String [(Var, Type)] Bool Type
     | ExternStatic Mutable Var Type
+    deriving Show
 
 instance Pretty ExternItem where
     pPrint (ExternFn nm args variadic ret) = cat
@@ -137,6 +145,7 @@ instance Pretty ExternItem where
 data Enumerator
     = EnumeratorAuto String
     | EnumeratorExpr String Expr
+    deriving Show
 
 instance Pretty Enumerator where
     pPrint (EnumeratorAuto name) = text name
@@ -202,6 +211,7 @@ data Expr
     -- precedence 1
     | Range Expr Expr
     | Assign Expr AssignOp Expr
+    deriving Show
 
 data AssignOp
     = (:=)
@@ -215,6 +225,7 @@ data AssignOp
     | (:^=)
     | (:<<=)
     | (:>>=)
+    deriving Show
 
 -- If a block is at the beginning of a statement, Rust parses it as if
 -- it were followed by a semicolon. If we didn't intend to put an
@@ -228,6 +239,7 @@ data AssignOp
 -- we don't have enough parentheses) or warn about excess parentheses.
 -- So it's worth going to some trouble to get this right.
 data ExprPosition = TopExpr | LeftExpr | RightExpr
+    deriving Show
 
 instance Pretty Expr where
     pPrintPrec _ = go TopExpr
