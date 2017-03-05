@@ -42,7 +42,6 @@ import Language.C
 import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
 import Language.Rust.Corrode.CFG
-import Numeric
 import Text.PrettyPrint.HughesPJClass hiding (Pretty)
 ```
 
@@ -1218,7 +1217,7 @@ zeroed out.
     zeroInitialize i@(Initializer Nothing initials) t = case t of
         IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool False))
         IsVoid{} -> badSource initial "initializer for void"
-        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt ("0" ++ s)))
+        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt 0 Rust.DecRepr s))
             where Rust.TypeName s = toRustType t
         IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitFloat ("0" ++ s)))
             where Rust.TypeName s = toRustType t
@@ -2554,16 +2553,18 @@ we always give it type `i64`.
                 , (True, s) <- [(allow_signed, Signed), (allow_unsigned, Unsigned)]
                 , v < 2 ^ (bits - if s == Signed then 1 else 0)
                 ]
-            str = case repr of
-                DecRepr -> show v
-                OctalRepr -> "0o" ++ showOct v ""
-                HexRepr -> "0x" ++ showHex v ""
+            repr' = case repr of
+                DecRepr -> Rust.DecRepr
+                OctalRepr -> Rust.OctalRepr
+                HexRepr -> Rust.HexRepr
         in case allowed_types of
         [] -> badSource expr "integer (too big)"
-        ty : _ -> return (literalNumber ty str Rust.LitInt)
+        ty : _ -> return (literalNumber ty (Rust.LitInt v repr' suffix))
+            where
+            Rust.TypeName suffix = toRustType ty
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> return (literalNumber (IsFloat 64) v Rust.LitFloat)
-        (v, [_]) -> return (literalNumber (IsFloat 32) v Rust.LitFloat)
+        (v, "") -> return (literalNumber (IsFloat 64) (Rust.LitFloat (v ++ "f64")))
+        (v, [_]) -> return (literalNumber (IsFloat 32) (Rust.LitFloat (v ++ "f32")))
         _ -> badSource expr "float"
 ```
 
@@ -2613,13 +2614,11 @@ However, we don't want to rely on Rust's inference rules here because we
 need to match C's rules instead.
 
 ```haskell
-    literalNumber ty v ctor =
-        let Rust.TypeName suffix = toRustType ty
-        in Result
-            { resultType = ty
-            , resultMutable = Rust.Immutable
-            , result = Rust.Lit (ctor (v ++ suffix))
-            }
+    literalNumber ty lit = Result
+        { resultType = ty
+        , resultMutable = Rust.Immutable
+        , result = Rust.Lit lit
+        }
 ```
 
 C99 compound literals are really not much different than an initializer

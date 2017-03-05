@@ -1,17 +1,23 @@
 module Language.Rust.AST where
 
 import Data.Char
+import Numeric
 import Text.PrettyPrint.HughesPJClass
 
 newtype Lifetime = Lifetime String
     deriving (Show, Eq)
 newtype Type = TypeName String
     deriving (Show, Eq)
+data LitIntRepr
+    = DecRepr
+    | OctalRepr
+    | HexRepr
+    deriving (Show, Eq)
 data Lit
     = LitByteStr String
     | LitByteChar Char
     | LitBool Bool
-    | LitInt String
+    | LitInt Integer LitIntRepr String
     | LitFloat String
     deriving (Show, Eq)
 newtype Var = VarName String
@@ -30,7 +36,12 @@ instance Pretty Lit where
         LitByteStr s -> text $ "b\"" ++ concatMap rustByteLit s ++ "\""
         LitByteChar ch -> text $ "b'" ++ rustByteLit ch ++ "'"
         LitBool b -> text $ if b then "true" else "false"
-        LitInt s -> text s
+        LitInt i repr ty -> text $ s ++ ty
+            where
+            s = case repr of
+                DecRepr -> show i
+                OctalRepr -> "0o" ++ showOct i ""
+                HexRepr -> "0x" ++ showHex i ""
         LitFloat s -> text s
         where
         -- Rust character and string literals have only a few special
@@ -381,7 +392,7 @@ instance Num Expr where
     (-) = Sub
     (*) = Mul
     negate = Neg
-    fromInteger i = Lit (LitInt (show i))
+    fromInteger i = Lit (LitInt i DecRepr "")
 
 instance Fractional Expr where
     (/) = Div
