@@ -1,12 +1,24 @@
 module Language.Rust.AST where
 
+import Data.Char
+import Numeric
 import Text.PrettyPrint.HughesPJClass
 
 newtype Lifetime = Lifetime String
     deriving (Show, Eq)
 newtype Type = TypeName String
     deriving (Show, Eq)
-newtype Lit = LitRep String
+data LitIntRepr
+    = DecRepr
+    | OctalRepr
+    | HexRepr
+    deriving (Show, Eq)
+data Lit
+    = LitByteStr String
+    | LitByteChar Char
+    | LitBool Bool
+    | LitInt Integer LitIntRepr String
+    | LitFloat String
     deriving (Show, Eq)
 newtype Var = VarName String
     deriving (Show, Eq)
@@ -20,7 +32,32 @@ instance Pretty Type where
     pPrint (TypeName s) = text s
 
 instance Pretty Lit where
-    pPrint (LitRep s) = text s
+    pPrint lit = case lit of
+        LitByteStr s -> text $ "b\"" ++ concatMap rustByteLit s ++ "\""
+        LitByteChar ch -> text $ "b'" ++ rustByteLit ch ++ "'"
+        LitBool b -> text $ if b then "true" else "false"
+        LitInt i repr ty -> text $ s ++ ty
+            where
+            s = case repr of
+                DecRepr -> show i
+                OctalRepr -> "0o" ++ showOct i ""
+                HexRepr -> "0x" ++ showHex i ""
+        LitFloat s -> text s
+        where
+        -- Rust character and string literals have only a few special
+        -- escape sequences, so we can't reuse any functions for
+        -- escaping Haskell or C strings.
+        rustByteLit '"' = "\\\""
+        rustByteLit '\'' = "\\'"
+        rustByteLit '\n' = "\\n"
+        rustByteLit '\r' = "\\r"
+        rustByteLit '\t' = "\\t"
+        rustByteLit '\\' = "\\\\"
+        rustByteLit '\NUL' = "\\0"
+        rustByteLit ch | ch >= ' ' && ch <= '~' = [ch]
+        rustByteLit ch = "\\x" ++
+            let (u, l) = ord ch `divMod` 16
+            in map (toUpper . intToDigit) [u, l]
 
 instance Pretty Var where
     pPrint (VarName s) = text s
@@ -355,9 +392,9 @@ instance Num Expr where
     (-) = Sub
     (*) = Mul
     negate = Neg
-    fromInteger i = Lit (LitRep (show i))
+    fromInteger i = Lit (LitInt i DecRepr "")
 
 instance Fractional Expr where
     (/) = Div
-    recip = Div (Lit (LitRep "1.0"))
-    fromRational r = Lit (LitRep (show (fromRational r :: Double)))
+    recip = Div (Lit (LitFloat "1.0"))
+    fromRational r = Lit (LitFloat (show (fromRational r :: Double)))
