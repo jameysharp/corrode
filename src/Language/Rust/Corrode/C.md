@@ -2578,7 +2578,7 @@ syntax.
     CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
         , resultMutable = Rust.Immutable
-        , result = Rust.Lit (Rust.LitByteStr ("b'" ++ rustByteLit ch ++ "'"))
+        , result = Rust.Lit (Rust.LitByteChar ("b'" ++ rustByteLit ch ++ "'"))
         }
 ```
 
