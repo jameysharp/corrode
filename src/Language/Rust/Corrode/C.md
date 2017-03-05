@@ -350,7 +350,7 @@ getSymbolIdent ident = do
         return $ Just Result
             { resultType = IsArray Rust.Immutable (length name' + 1) charType
             , resultMutable = Rust.Immutable
-            , result = Rust.Deref (Rust.Lit (Rust.LitRep ("b\"" ++ name' ++ "\\0\"")))
+            , result = Rust.Deref (Rust.Lit (Rust.LitByteStr ("b\"" ++ name' ++ "\\0\"")))
             }
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w, Result
@@ -1217,11 +1217,11 @@ zeroed out.
 
 ```haskell
     zeroInitialize i@(Initializer Nothing initials) t = case t of
-        IsBool{} -> return $ scalar (Rust.Lit (Rust.LitRep "false"))
+        IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool "false"))
         IsVoid{} -> badSource initial "initializer for void"
-        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt ("0" ++ s)))
             where Rust.TypeName s = toRustType t
-        IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitRep ("0" ++ s)))
+        IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitFloat ("0" ++ s)))
             where Rust.TypeName s = toRustType t
         IsPtr{} -> return $ scalar (Rust.Cast 0 (toRustType t))
         IsArray _ size _ | IntMap.size initials == size -> return i
@@ -1516,7 +1516,7 @@ Unix-specific `OsStringExt` trait into scope.
                     Rust.Lambda [str] (Rust.BlockExpr (Rust.Block
                         [ bind Rust.Mutable vec (chain "into_vec" [] (Rust.Var str))
                         , Rust.Stmt (chain "push" [
-                                Rust.Lit (Rust.LitRep "b'\\0'")
+                                Rust.Lit (Rust.LitByteChar "b'\\0'")
                             ] (Rust.Var vec))
                         ] (Just (Rust.Var vec))))
                 ] $
@@ -2561,10 +2561,10 @@ we always give it type `i64`.
                 HexRepr -> "0x" ++ showHex v ""
         in case allowed_types of
         [] -> badSource expr "integer (too big)"
-        ty : _ -> return (literalNumber ty str)
+        ty : _ -> return (literalNumber ty str Rust.LitInt)
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> return (literalNumber (IsFloat 64) v)
-        (v, [_]) -> return (literalNumber (IsFloat 32) v)
+        (v, "") -> return (literalNumber (IsFloat 64) v Rust.LitFloat)
+        (v, [_]) -> return (literalNumber (IsFloat 32) v Rust.LitFloat)
         _ -> badSource expr "float"
 ```
 
@@ -2578,7 +2578,7 @@ syntax.
     CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
         , resultMutable = Rust.Immutable
-        , result = Rust.Lit (Rust.LitRep ("b'" ++ rustByteLit ch ++ "'"))
+        , result = Rust.Lit (Rust.LitByteStr ("b'" ++ rustByteLit ch ++ "'"))
         }
 ```
 
@@ -2596,7 +2596,7 @@ lifetime, the resulting raw pointer is always safe to use.
     CStrConst (CString str False) _ -> return Result
         { resultType = IsArray Rust.Immutable (length str + 1) charType
         , resultMutable = Rust.Immutable
-        , result = Rust.Deref (Rust.Lit (Rust.LitRep ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")))
+        , result = Rust.Deref (Rust.Lit (Rust.LitByteStr ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")))
         }
     _ -> unimplemented expr
     where
@@ -2614,12 +2614,12 @@ However, we don't want to rely on Rust's inference rules here because we
 need to match C's rules instead.
 
 ```haskell
-    literalNumber ty v =
+    literalNumber ty v ctor =
         let Rust.TypeName suffix = toRustType ty
         in Result
             { resultType = ty
             , resultMutable = Rust.Immutable
-            , result = Rust.Lit (Rust.LitRep (v ++ suffix))
+            , result = Rust.Lit (ctor (v ++ suffix))
             }
 ```
 

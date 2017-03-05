@@ -6,7 +6,12 @@ newtype Lifetime = Lifetime String
     deriving (Show, Eq)
 newtype Type = TypeName String
     deriving (Show, Eq)
-newtype Lit = LitRep String
+data Lit
+    = LitByteStr String
+    | LitByteChar String
+    | LitBool String
+    | LitInt String
+    | LitFloat String
     deriving (Show, Eq)
 newtype Var = VarName String
     deriving (Show, Eq)
@@ -20,7 +25,11 @@ instance Pretty Type where
     pPrint (TypeName s) = text s
 
 instance Pretty Lit where
-    pPrint (LitRep s) = text s
+    pPrint (LitByteStr s) = text s
+    pPrint (LitByteChar s) = text s
+    pPrint (LitBool s) = text s
+    pPrint (LitInt s) = text s
+    pPrint (LitFloat s) = text s
 
 instance Pretty Var where
     pPrint (VarName s) = text s
@@ -355,9 +364,9 @@ instance Num Expr where
     (-) = Sub
     (*) = Mul
     negate = Neg
-    fromInteger i = Lit (LitRep (show i))
+    fromInteger i = Lit (LitInt (show i))
 
 instance Fractional Expr where
     (/) = Div
-    recip = Div (Lit (LitRep "1.0"))
-    fromRational r = Lit (LitRep (show (fromRational r :: Double)))
+    recip = Div (Lit (LitFloat "1.0"))
+    fromRational r = Lit (LitFloat (show (fromRational r :: Double)))
