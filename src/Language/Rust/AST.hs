@@ -9,7 +9,7 @@ newtype Type = TypeName String
 data Lit
     = LitByteStr String
     | LitByteChar String
-    | LitBool String
+    | LitBool Bool
     | LitInt String
     | LitFloat String
     deriving (Show, Eq)
@@ -27,7 +27,7 @@ instance Pretty Type where
 instance Pretty Lit where
     pPrint (LitByteStr s) = text s
     pPrint (LitByteChar s) = text s
-    pPrint (LitBool s) = text s
+    pPrint (LitBool b) = text $ if b then "true" else "false"
     pPrint (LitInt s) = text s
     pPrint (LitFloat s) = text s
 

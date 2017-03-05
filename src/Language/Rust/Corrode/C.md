@@ -1217,7 +1217,7 @@ zeroed out.
 
 ```haskell
     zeroInitialize i@(Initializer Nothing initials) t = case t of
-        IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool "false"))
+        IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool False))
         IsVoid{} -> badSource initial "initializer for void"
         IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt ("0" ++ s)))
             where Rust.TypeName s = toRustType t
