@@ -31,7 +31,6 @@ import Control.Monad.ST
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.RWS.Strict
-import Data.Char
 import Data.Foldable
 import qualified Data.Map.Lazy as Map
 import qualified Data.IntMap.Strict as IntMap
@@ -350,7 +349,7 @@ getSymbolIdent ident = do
         return $ Just Result
             { resultType = IsArray Rust.Immutable (length name' + 1) charType
             , resultMutable = Rust.Immutable
-            , result = Rust.Deref (Rust.Lit (Rust.LitByteStr ("b\"" ++ name' ++ "\\0\"")))
+            , result = Rust.Deref (Rust.Lit (Rust.LitByteStr (name' ++ "\NUL")))
             }
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w, Result
@@ -1516,7 +1515,7 @@ Unix-specific `OsStringExt` trait into scope.
                     Rust.Lambda [str] (Rust.BlockExpr (Rust.Block
                         [ bind Rust.Mutable vec (chain "into_vec" [] (Rust.Var str))
                         , Rust.Stmt (chain "push" [
-                                Rust.Lit (Rust.LitByteChar "b'\\0'")
+                                Rust.Lit (Rust.LitByteChar '\NUL')
                             ] (Rust.Var vec))
                         ] (Just (Rust.Var vec))))
                 ] $
@@ -2578,7 +2577,7 @@ syntax.
     CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
         , resultMutable = Rust.Immutable
-        , result = Rust.Lit (Rust.LitByteChar ("b'" ++ rustByteLit ch ++ "'"))
+        , result = Rust.Lit (Rust.LitByteChar ch)
         }
 ```
 
@@ -2596,7 +2595,7 @@ lifetime, the resulting raw pointer is always safe to use.
     CStrConst (CString str False) _ -> return Result
         { resultType = IsArray Rust.Immutable (length str + 1) charType
         , resultMutable = Rust.Immutable
-        , result = Rust.Deref (Rust.Lit (Rust.LitByteStr ("b\"" ++ concatMap rustByteLit str ++ "\\0\"")))
+        , result = Rust.Deref (Rust.Lit (Rust.LitByteStr (str ++ "\NUL")))
         }
     _ -> unimplemented expr
     where
@@ -2621,24 +2620,6 @@ need to match C's rules instead.
             , resultMutable = Rust.Immutable
             , result = Rust.Lit (ctor (v ++ suffix))
             }
-```
-
-Rust character and string literals have only a few special escape
-sequences, so we can't reuse any functions for escaping Haskell or C
-strings.
-
-```haskell
-    rustByteLit '"' = "\\\""
-    rustByteLit '\'' = "\\'"
-    rustByteLit '\n' = "\\n"
-    rustByteLit '\r' = "\\r"
-    rustByteLit '\t' = "\\t"
-    rustByteLit '\\' = "\\\\"
-    rustByteLit '\NUL' = "\\0"
-    rustByteLit ch | ch >= ' ' && ch <= '~' = [ch]
-    rustByteLit ch = "\\x" ++
-        let (u, l) = ord ch `divMod` 16
-        in map (toUpper . intToDigit) [u, l]
 ```
 
 C99 compound literals are really not much different than an initializer

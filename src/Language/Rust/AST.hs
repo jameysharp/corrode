@@ -1,5 +1,6 @@
 module Language.Rust.AST where
 
+import Data.Char
 import Text.PrettyPrint.HughesPJClass
 
 newtype Lifetime = Lifetime String
@@ -8,7 +9,7 @@ newtype Type = TypeName String
     deriving (Show, Eq)
 data Lit
     = LitByteStr String
-    | LitByteChar String
+    | LitByteChar Char
     | LitBool Bool
     | LitInt String
     | LitFloat String
@@ -25,11 +26,27 @@ instance Pretty Type where
     pPrint (TypeName s) = text s
 
 instance Pretty Lit where
-    pPrint (LitByteStr s) = text s
-    pPrint (LitByteChar s) = text s
-    pPrint (LitBool b) = text $ if b then "true" else "false"
-    pPrint (LitInt s) = text s
-    pPrint (LitFloat s) = text s
+    pPrint lit = case lit of
+        LitByteStr s -> text $ "b\"" ++ concatMap rustByteLit s ++ "\""
+        LitByteChar ch -> text $ "b'" ++ rustByteLit ch ++ "'"
+        LitBool b -> text $ if b then "true" else "false"
+        LitInt s -> text s
+        LitFloat s -> text s
+        where
+        -- Rust character and string literals have only a few special
+        -- escape sequences, so we can't reuse any functions for
+        -- escaping Haskell or C strings.
+        rustByteLit '"' = "\\\""
+        rustByteLit '\'' = "\\'"
+        rustByteLit '\n' = "\\n"
+        rustByteLit '\r' = "\\r"
+        rustByteLit '\t' = "\\t"
+        rustByteLit '\\' = "\\\\"
+        rustByteLit '\NUL' = "\\0"
+        rustByteLit ch | ch >= ' ' && ch <= '~' = [ch]
+        rustByteLit ch = "\\x" ++
+            let (u, l) = ord ch `divMod` 16
+            in map (toUpper . intToDigit) [u, l]
 
 instance Pretty Var where
     pPrint (VarName s) = text s
