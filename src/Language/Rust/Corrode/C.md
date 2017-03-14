@@ -1025,11 +1025,9 @@ objectFromDesignators ty desigs = Just <$> go ty desigs (Base ty)
 
     go :: CType -> [CDesignator] -> Designator -> EnvMonad s Designator
     go _ [] obj = pure obj
-    go (IsArray _ size el) (d@(CArrDesig idxExpr _) : ds) obj =
-        case idxExpr of
-        CConst (CIntConst (CInteger idx _ _) _) ->
-            go el ds (From el (fromInteger idx) (replicate (size - fromInteger idx - 1) el) obj)
-        _ -> unimplemented d
+    go (IsArray _ size el) (CArrDesig idxExpr _ : ds) obj = do
+        idx <- interpretConstExpr idxExpr
+        go el ds (From el (fromInteger idx) (replicate (size - fromInteger idx - 1) el) obj)
     go (IsStruct name fields) (d@(CMemberDesig ident _) : ds) obj = do
         case span (\ (field, _) -> applyRenames ident /= field) fields of
             (_, []) -> badSource d ("designator for field not in struct " ++ name)
@@ -2892,6 +2890,27 @@ rustAlignOfType (Rust.TypeName ty) = Result
         }
 ```
 
+
+Constant expressions
+--------------------
+
+C defines a subset of the expression syntax that can be evaluated at
+compile-time, and then allows such constant expressions to be used for
+various things, such as array size expressions.
+
+In this section we define a constant expression evaluator that we can
+use when we need to know the actual value of a constant expression in
+order to translate it to Rust. This is not always necessary: often,
+equivalent constant expressions can be used in Rust, and doing so is
+better because it preserves more of the programmer's intent.
+
+```haskell
+interpretConstExpr :: CExpr -> EnvMonad s Integer
+interpretConstExpr (CConst (CIntConst (CInteger v _ _) _)) = return v
+interpretConstExpr expr = unimplemented expr
+```
+
+
 Implicit type coercions
 =======================
 
@@ -3670,15 +3689,18 @@ error; there must be an intervening pointer.
             { typeMutable = mutable quals
             , typeRep = IsPtr (typeMutable itype) (typeRep itype)
             }
-    derive (CArrDeclr quals sizeExpr _) = return $ \ itype ->
+    derive (CArrDeclr quals arraySize _) = return $ \ itype ->
         if typeIsFunc itype
         then badSource declr "function as array element type"
-        else case sizeExpr of
-            CArrSize _ (CConst (CIntConst (CInteger size _ _) _)) -> return itype
+        else do
+            sizeExpr <- case arraySize of
+                CArrSize _ sizeExpr -> return sizeExpr
+                CNoArrSize _ -> unimplemented declr
+            size <- interpretConstExpr sizeExpr
+            return itype
                 { typeMutable = mutable quals
                 , typeRep = IsArray (typeMutable itype) (fromInteger size) (typeRep itype)
                 }
-            _ -> unimplemented declr
 ```
 
 ```haskell
