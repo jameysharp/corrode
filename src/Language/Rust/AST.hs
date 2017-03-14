@@ -17,8 +17,8 @@ data Lit
     = LitByteStr String
     | LitByteChar Char
     | LitBool Bool
-    | LitInt Integer LitIntRepr String
-    | LitFloat String
+    | LitInt Integer LitIntRepr Type
+    | LitFloat String Type
     deriving (Show, Eq)
 newtype Var = VarName String
     deriving (Show, Eq)
@@ -36,13 +36,13 @@ instance Pretty Lit where
         LitByteStr s -> text $ "b\"" ++ concatMap rustByteLit s ++ "\""
         LitByteChar ch -> text $ "b'" ++ rustByteLit ch ++ "'"
         LitBool b -> text $ if b then "true" else "false"
-        LitInt i repr ty -> text $ s ++ ty
+        LitInt i repr (TypeName ty) -> text $ s ++ ty
             where
             s = case repr of
                 DecRepr -> show i
                 OctalRepr -> "0o" ++ showOct i ""
                 HexRepr -> "0x" ++ showHex i ""
-        LitFloat s -> text s
+        LitFloat s (TypeName ty) -> text $ s ++ ty
         where
         -- Rust character and string literals have only a few special
         -- escape sequences, so we can't reuse any functions for
@@ -392,9 +392,9 @@ instance Num Expr where
     (-) = Sub
     (*) = Mul
     negate = Neg
-    fromInteger i = Lit (LitInt i DecRepr "")
+    fromInteger i = Lit (LitInt i DecRepr (TypeName ""))
 
 instance Fractional Expr where
     (/) = Div
-    recip = Div (Lit (LitFloat "1.0"))
-    fromRational r = Lit (LitFloat (show (fromRational r :: Double)))
+    recip = Div (Lit (LitFloat "1.0" (TypeName "")))
+    fromRational r = Lit (LitFloat (show (fromRational r :: Double)) (TypeName ""))

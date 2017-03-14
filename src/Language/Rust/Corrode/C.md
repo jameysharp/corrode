@@ -1220,10 +1220,8 @@ zeroed out.
     zeroInitialize i@(Initializer Nothing initials) t = case t of
         IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool False))
         IsVoid{} -> badSource initial "initializer for void"
-        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt 0 Rust.DecRepr s))
-            where Rust.TypeName s = toRustType t
-        IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitFloat ("0" ++ s)))
-            where Rust.TypeName s = toRustType t
+        IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt 0 Rust.DecRepr (toRustType t)))
+        IsFloat{} -> return $ scalar (Rust.Lit (Rust.LitFloat "0" (toRustType t)))
         IsPtr{} -> return $ scalar (Rust.Cast 0 (toRustType t))
         IsArray _ size _ | IntMap.size initials == size -> return i
         IsArray _ size elTy -> do
@@ -2563,12 +2561,10 @@ we always give it type `i64`.
                 HexRepr -> Rust.HexRepr
         in case allowed_types of
         [] -> badSource expr "integer (too big)"
-        ty : _ -> return (literalNumber ty (Rust.LitInt v repr' suffix))
-            where
-            Rust.TypeName suffix = toRustType ty
+        ty : _ -> return (literalNumber ty (Rust.LitInt v repr'))
     CFloatConst (CFloat str) _ -> case span (`notElem` "fF") str of
-        (v, "") -> return (literalNumber (IsFloat 64) (Rust.LitFloat (v ++ "f64")))
-        (v, [_]) -> return (literalNumber (IsFloat 32) (Rust.LitFloat (v ++ "f32")))
+        (v, "") -> return (literalNumber (IsFloat 64) (Rust.LitFloat v))
+        (v, [_]) -> return (literalNumber (IsFloat 32) (Rust.LitFloat v))
         _ -> badSource expr "float"
 ```
 
@@ -2621,7 +2617,7 @@ need to match C's rules instead.
     literalNumber ty lit = Result
         { resultType = ty
         , resultMutable = Rust.Immutable
-        , result = Rust.Lit lit
+        , result = Rust.Lit (lit (toRustType ty))
         }
 ```
 
