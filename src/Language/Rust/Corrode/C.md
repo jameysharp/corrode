@@ -1209,9 +1209,7 @@ interpretInitializer ty initial = do
         CInitList list _ -> translateInitList ty list
 
     zeroed <- zeroInitialize initial' ty
-    case helper ty zeroed of
-        Nothing -> badSource initial "initializer"
-        Just expr -> pure expr
+    helper ty zeroed
 
     where
 ```
@@ -1232,9 +1230,8 @@ zeroed out.
         IsArray _ size _ | IntMap.size initials == size -> return i
         IsArray _ size elTy -> do
             elInit <- zeroInitialize (Initializer Nothing IntMap.empty) elTy
-            case helper elTy elInit of
-                Just el -> return (Initializer (Just (Rust.RepeatArray el (fromIntegral size))) initials)
-                Nothing -> unimplemented initial
+            el <- helper elTy elInit
+            return (Initializer (Just (Rust.RepeatArray el (fromIntegral size))) initials)
         IsFunc{} -> return $ scalar (Rust.Cast 0 (toRustType t))
         IsStruct _ fields -> do
             let fields' = IntMap.fromDistinctAscList $ zip [0..] $ map snd fields
@@ -1251,18 +1248,20 @@ zeroed out.
 ```
 
 ```haskell
-    helper :: CType -> Initializer -> Maybe Rust.Expr
-    helper _ (Initializer (Just expr) initials) | IntMap.null initials = Just expr
-    helper (IsArray _ _ el) (Initializer Nothing initials) =
-        Rust.ArrayExpr <$> mapM (helper el) (IntMap.elems initials)
-    helper (IsStruct str fields) (Initializer expr initials) =
+    helper _ (Initializer (Just expr) initials) | IntMap.null initials = return expr
+    helper (IsArray _ _ el) (Initializer expr initials) = case expr of
+        Nothing -> Rust.ArrayExpr <$> mapM (helper el) (IntMap.elems initials)
+        Just _ -> unimplemented initial
+    helper strTy@(IsStruct str fields) (Initializer expr initials) =
         Rust.StructExpr str <$> fields' <*> pure expr
         where
-        fields' = forM (IntMap.toList initials) $ \ (idx, value) -> do
-            (field, ty') <- listToMaybe (drop idx fields)
-            value' <- helper ty' value
-            Just (field, value')
-    helper _ _ = Nothing
+        fields' = forM (IntMap.toList initials) $ \ (idx, value) ->
+            case drop idx fields of
+            (field, ty') : _ -> do
+                value' <- helper ty' value
+                return (field, value')
+            [] -> noTranslation initial ("internal error: " ++ show strTy ++ " doesn't have enough fields to initialize field " ++ show idx)
+    helper _ _ = badSource initial "initializer"
 ```
 
 
