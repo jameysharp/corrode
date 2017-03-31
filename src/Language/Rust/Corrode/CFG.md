@@ -32,6 +32,7 @@ import Control.Monad.Trans.State
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
+import Data.List
 import Data.Traversable
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 ```
@@ -359,8 +360,13 @@ prettyStructure :: [Structure] -> Doc
 prettyStructure = vcat . map go
     where
     go (Structure _ (Simple entry)) = text (show entry ++ ";")
-    go (Structure _ (Loop body)) = text "loop" $+$ nest 2 (prettyStructure body)
-    go (Structure _ (Multiple handlers)) = text "match" $+$ vcat [ text (show label) $+$ nest 2 (prettyStructure body) | (label, body) <- handlers ]
+    go (Structure entries (Loop body)) = prettyGroup entries "loop" (prettyStructure body)
+    go (Structure entries (Multiple handlers)) = prettyGroup entries "match" $
+        vcat $ intersperse (text "---") $ map (prettyStructure . snd) handlers
+
+    prettyGroup entries kind body =
+        text "{" <> hsep (punctuate (text ",") (map (text . show) (IntSet.toList entries))) <> text ("} " ++ kind)
+        $+$ nest 2 body
 
 relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
