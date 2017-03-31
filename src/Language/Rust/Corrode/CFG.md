@@ -370,13 +370,12 @@ prettyStructure = vcat . map go
 
 relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
-relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
+relooper entries blocks = case (IntSet.toList noreturns, IntSet.toList returns) of
     ([entry], []) -> constructSimple entry
     _ | IntSet.null noreturns || IntMap.null singlyReached -> constructLoop
     _ -> constructMultiple
     where
-    returns = (strictReachableFrom `IntMap.intersection` blocks) `IntMap.intersection` IntMap.fromSet (const ()) entries
-    noreturns = entries `IntSet.difference` IntMap.keysSet (strictReachableFrom `IntMap.intersection` blocks)
+    (returns, noreturns) = partitionMembers entries $ IntSet.unions $ IntMap.elems blocks
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
         (Nothing, _) -> []
@@ -393,12 +392,14 @@ relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
         , let outEdges = IntSet.unions $ map (`IntSet.difference` within) $ IntMap.elems blocks'
         ]
     multipleFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) (IntSet.unions multipleWithin)
+    multipleUnhandledEntries = entries `IntSet.difference` IntSet.fromList (map fst multipleEntries)
     constructMultiple = Structure
         { structureEntries = entries
         , structureBody = Multiple multipleEntries
-        } : relooper (IntSet.unions $ entries `IntSet.difference` IntSet.fromList (map fst multipleEntries) : multipleFollowEntries) multipleFollowBlocks
+        } : relooper (IntSet.unions $ multipleUnhandledEntries : multipleFollowEntries) multipleFollowBlocks
 
-    loopWithin = IntSet.unions (IntMap.keysSet returns : IntMap.elems returns)
+    loopReturns = (strictReachableFrom `IntMap.intersection` blocks) `IntMap.intersection` IntMap.fromSet (const ()) entries
+    loopWithin = IntSet.unions (IntMap.keysSet loopReturns : IntMap.elems loopReturns)
     loopBlocks = blocks `IntMap.intersection` IntMap.fromSet (const ()) loopWithin
     loopFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) loopWithin
     loopFoo = IntMap.map (`partitionMembers` loopWithin) loopBlocks
