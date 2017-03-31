@@ -389,7 +389,7 @@ relooper entries blocks = case (IntSet.toList noreturns, IntSet.toList returns) 
         [ ((entry, relooper (IntSet.singleton entry) blocks'), outEdges, within)
         | (entry, within) <- IntMap.toList singlyReached
         , let blocks' = blocks `IntMap.intersection` IntMap.fromSet (const ()) within
-        , let outEdges = IntSet.unions $ map (`IntSet.difference` within) $ IntMap.elems blocks'
+        , let outEdges = IntSet.unions $ map (`IntSet.difference` IntMap.keysSet blocks') $ IntMap.elems blocks'
         ]
     multipleFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) (IntSet.unions multipleWithin)
     multipleUnhandledEntries = entries `IntSet.difference` IntSet.fromList (map fst multipleEntries)
