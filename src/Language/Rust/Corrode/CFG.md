@@ -344,18 +344,23 @@ Transforming CFGs to structured programs
 ========================================
 
 ```haskell
-data Structure
+data Structure' a
     = Simple Label
-    | Loop { loopContinues :: IntSet.IntSet, loopBreaks :: IntSet.IntSet, loopBody :: [Structure] }
-    | Multiple [(Label, [Structure])]
+    | Loop a
+    | Multiple [(Label, a)]
     deriving Show
+
+data Structure = Structure
+    { structureEntries :: IntSet.IntSet
+    , structureBody :: Structure' [Structure]
+    }
 
 prettyStructure :: [Structure] -> Doc
 prettyStructure = vcat . map go
     where
-    go (Simple entry) = text (show entry ++ ";")
-    go (Loop cont brk body) = text ("loop continue=" ++ show cont ++ " break=" ++ show brk) $+$ nest 2 (prettyStructure body)
-    go (Multiple handlers) = text "match" $+$ vcat [ text (show label) $+$ nest 2 (prettyStructure body) | (label, body) <- handlers ]
+    go (Structure _ (Simple entry)) = text (show entry ++ ";")
+    go (Structure _ (Loop body)) = text "loop" $+$ nest 2 (prettyStructure body)
+    go (Structure _ (Multiple handlers)) = text "match" $+$ vcat [ text (show label) $+$ nest 2 (prettyStructure body) | (label, body) <- handlers ]
 
 relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
@@ -369,7 +374,10 @@ relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
         (Nothing, _) -> []
-        (Just block, blocks') -> Simple entry : relooper block blocks'
+        (Just block, blocks') -> Structure
+            { structureEntries = entries
+            , structureBody = Simple entry
+            } : relooper block blocks'
 
     singlyReached = flipEdges $ IntMap.filter (\ r -> IntSet.size r == 1) $ IntMap.map (IntSet.intersection entries) reachableFrom
     (multipleEntries, multipleFollowEntries, multipleWithin) = unzip3
@@ -379,17 +387,19 @@ relooper entries blocks = case (IntSet.toList noreturns, IntMap.keys returns) of
         , let outEdges = IntSet.unions $ map (`IntSet.difference` within) $ IntMap.elems blocks'
         ]
     multipleFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) (IntSet.unions multipleWithin)
-    constructMultiple = Multiple multipleEntries : relooper (IntSet.unions $ entries `IntSet.difference` IntSet.fromList (map fst multipleEntries) : multipleFollowEntries) multipleFollowBlocks
+    constructMultiple = Structure
+        { structureEntries = entries
+        , structureBody = Multiple multipleEntries
+        } : relooper (IntSet.unions $ entries `IntSet.difference` IntSet.fromList (map fst multipleEntries) : multipleFollowEntries) multipleFollowBlocks
 
     loopWithin = IntSet.unions (IntMap.keysSet returns : IntMap.elems returns)
     loopBlocks = blocks `IntMap.intersection` IntMap.fromSet (const ()) loopWithin
     loopFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) loopWithin
     loopFoo = IntMap.map (`partitionMembers` loopWithin) loopBlocks
     loopFollowEntries = IntSet.unions (map snd (IntMap.elems loopFoo))
-    constructLoop = Loop
-        { loopContinues = IntMap.keysSet returns
-        , loopBreaks = loopFollowEntries
-        , loopBody = relooper (IntMap.keysSet returns) (IntMap.map ((`IntSet.difference` entries) . fst) loopFoo)
+    constructLoop = Structure
+        { structureEntries = entries
+        , structureBody = Loop (relooper entries (IntMap.map ((`IntSet.difference` entries) . fst) loopFoo))
         } : relooper loopFollowEntries loopFollowBlocks
 
     strictReachableFrom = flipEdges (go blocks)
@@ -441,30 +451,39 @@ structureCFG
     -> ([(Label, s)] -> s)
     -> CFG DepthFirst s c
     -> s
-structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg@(CFG _ blocks) = foo mempty False root
+structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg@(CFG _ blocks) = foo mempty mempty root
     where
     root = relooperRoot cfg
-    foo exits mult' = snd . foldr go (mult', mempty)
+    foo exits next' = snd . foldr go (next', mempty)
         where
-        branch mult to = case IntMap.findWithDefault (mult, mempty) to exits of
-            (True, s) -> mkGoto to `mappend` s
-            (False, s) -> s
+        go structure (next, rest) = (structureEntries structure, go' structure next `mappend` rest)
 
-        go (Simple entry) (mult, rest) = (,) False $ case IntMap.lookup entry blocks of
+        go' (Structure _ (Simple entry)) next = case IntMap.lookup entry blocks of
             Just (BasicBlock s term) -> s `mappend` case term of
-                Unreachable -> rest
-                Branch to -> branch mult to `mappend` rest
-                CondBranch c t f -> mkIf c (branch mult t) (branch mult f) `mappend` rest
+                Unreachable -> mempty
+                Branch to -> branch to
+                CondBranch c t f -> mkIf c (branch t) (branch f)
             Nothing -> error $ "reloop: basic block " ++ show entry ++ " missing"
-        go (Multiple handlers) (mult, rest) = (True, mkMatch [ (label, foo exits mult body) | (label, body) <- handlers ] `mappend` rest)
-        go (Loop continues breaks body) (mult, rest) = (firstMult, mkLoop label (foo exits' firstMult body) `mappend` rest)
             where
-            label = IntSet.findMin continues
-            firstMult = case body of Multiple _ : _ -> True; _ -> False
+            branch' to | to `IntSet.member` next = (next, mempty)
+            branch' to = case IntMap.lookup to exits of
+                Just target -> target
+                Nothing -> error ("structureCFG: label " ++ show to ++ " is not a valid exit from " ++ show entry)
+
+            branch to = case branch' to of
+                (target, s) | IntSet.size target == 1 -> s
+                (_, s) -> mkGoto to `mappend` s
+
+        go' (Structure _ (Multiple handlers)) next =
+            mkMatch [ (label, foo exits next body) | (label, body) <- handlers ]
+
+        go' (Structure entries (Loop body)) next = mkLoop label (foo exits' entries body)
+            where
+            label = IntSet.findMin entries
             exits' = IntMap.unions
                 [ exits
-                , IntMap.fromSet (const (firstMult, mkContinue label)) continues
-                , IntMap.fromSet (const (mult, mkBreak label)) breaks
+                , IntMap.fromSet (const (entries, mkContinue label)) entries
+                , IntMap.fromSet (const (next, mkBreak label)) next
                 ]
 ```
 
