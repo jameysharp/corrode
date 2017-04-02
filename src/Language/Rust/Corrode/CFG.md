@@ -383,20 +383,72 @@ relooper entries blocks = case (IntSet.toList noreturns, IntSet.toList returns) 
             { structureEntries = entries
             , structureBody = Simple entry
             } : relooper block blocks'
+```
 
+The elements in the `singlyReached` map are disjoint sets. Proof: keys
+in an `IntMap` are distinct by definition, and the values after `filter`
+are singleton sets; so after `flipEdges`, each distinct block can only
+be attached to one entry label.
+
+```haskell
+    reachableFrom = IntMap.unionWith IntSet.union (IntMap.fromSet IntSet.singleton entries) strictReachableFrom
     singlyReached = flipEdges $ IntMap.filter (\ r -> IntSet.size r == 1) $ IntMap.map (IntSet.intersection entries) reachableFrom
-    (multipleEntries, multipleFollowEntries, multipleWithin) = unzip3
-        [ ((entry, relooper (IntSet.singleton entry) blocks'), outEdges, within)
-        | (entry, within) <- IntMap.toList singlyReached
-        , let blocks' = blocks `IntMap.intersection` IntMap.fromSet (const ()) within
-        , let outEdges = IntSet.unions $ map (`IntSet.difference` IntMap.keysSet blocks') $ IntMap.elems blocks'
-        ]
-    multipleFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) (IntSet.unions multipleWithin)
-    multipleUnhandledEntries = entries `IntSet.difference` IntSet.fromList (map fst multipleEntries)
+```
+
+Some subset of the entries are now associated with sets of labels that
+can only be reached via that entry. Mapping these to their corresponding
+blocks preserves the property that they're disjoint.
+
+In addition, only labels that are permitted to appear inside this
+`Multiple` block will remain after this. Labels which have already been
+assigned to a later block won't get duplicated into this one, so we'll
+have to generate code to ensure that control continues to the later
+copy.
+
+```haskell
+    multipleEntries = IntMap.map (\ within -> blocks `IntMap.intersection` IntMap.fromSet (const ()) within) singlyReached
+```
+
+If one of the entry labels can reach another one, then the latter can't
+be handled in this `Multiple` block because we'd have no way to make
+control flow from one to the other. These unhandled entries must be
+handled in subsequent blocks.
+
+```haskell
+    multipleUnhandledEntries = entries `IntSet.difference` IntMap.keysSet multipleEntries
+```
+
+All labels that are reachable only from the entry points that we _are_
+handling, however, will be placed somewhere inside this `Multiple`
+block. Labels that are left over will be placed somewhere after this
+block.
+
+```haskell
+    multipleHandledBlocks = IntMap.unions (IntMap.elems multipleEntries)
+    multipleFollowBlocks = blocks `IntMap.difference` multipleHandledBlocks
+```
+
+The block after this one will have an entry point for each of this
+block's unhandled entries, and in addition, one for each branch that
+leaves this `Multiple` block.
+
+```haskell
+    multipleFollowEntries = IntSet.unions $ multipleUnhandledEntries :
+        (map (`IntSet.difference` IntMap.keysSet multipleHandledBlocks) $ IntMap.elems multipleHandledBlocks)
+```
+
+Finally, we've partitioned the entries and labels into those which
+should be inside this `Multiple` block and those which should follow it.
+Recurse on each handled entry point and on the next block.
+
+```haskell
     constructMultiple = Structure
         { structureEntries = entries
-        , structureBody = Multiple multipleEntries
-        } : relooper (IntSet.unions $ multipleUnhandledEntries : multipleFollowEntries) multipleFollowBlocks
+        , structureBody = Multiple
+            [ (entry, relooper (IntSet.singleton entry) blocks')
+            | (entry, blocks') <- IntMap.toList multipleEntries
+            ]
+        } : relooper multipleFollowEntries multipleFollowBlocks
 
     loopReturns = (strictReachableFrom `IntMap.intersection` blocks) `IntMap.intersection` IntMap.fromSet (const ()) entries
     loopWithin = IntSet.unions (IntMap.keysSet loopReturns : IntMap.elems loopReturns)
@@ -413,7 +465,6 @@ relooper entries blocks = case (IntSet.toList noreturns, IntSet.toList returns) 
         where
         grow r = IntMap.map (\ seen -> IntSet.unions $ seen : (IntMap.elems (r `IntMap.intersection` IntMap.fromSet (const ()) seen))) r
         go r = let r' = grow r in if r /= r' then go r' else r'
-    reachableFrom = IntMap.unionWith IntSet.union (IntMap.mapWithKey (const . IntSet.singleton) blocks) strictReachableFrom
 
 partitionMembers :: IntSet.IntSet -> IntSet.IntSet -> (IntSet.IntSet, IntSet.IntSet)
 partitionMembers a b = (a `IntSet.intersection` b, a `IntSet.difference` b)
