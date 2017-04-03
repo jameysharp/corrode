@@ -206,7 +206,7 @@ structureStmtCFG = structureCFG
     (\ l b -> [Loop l b])
     (\ c t f -> [If c t f])
     (return . Goto)
-    (foldr (\ (l, t) f -> [If (Match l) t f]) [])
+    (flip (foldr (\ (l, t) f -> [If (Match l) t f])))
 
 subtractMap :: IntMap.IntMap Int -> IntMap.IntMap Int -> IntMap.IntMap Int
 subtractMap = IntMap.mergeWithKey (\ _ a b -> Just (a - b)) id (IntMap.map negate)

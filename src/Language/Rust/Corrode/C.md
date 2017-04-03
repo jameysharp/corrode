@@ -2007,7 +2007,7 @@ inside a `loop`.
     currentBlock = Rust.VarName "_currentBlock"
     declCurrent = Rust.Let Rust.Mutable currentBlock Nothing Nothing
     mkGoto l = [Rust.Stmt (Rust.Assign (Rust.Var currentBlock) (Rust.:=) (fromIntegral l))]
-    mkMatch = foldr go []
+    mkMatch = flip (foldr go)
         where
         go (l, t) f = [Rust.Stmt (Rust.IfThenElse (Rust.CmpEQ (Rust.Var currentBlock) (fromIntegral l)) (statementsToBlock t) (statementsToBlock f))]
 ```

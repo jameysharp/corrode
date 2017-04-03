@@ -32,7 +32,6 @@ import Control.Monad.Trans.State
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
-import Data.List
 import Data.Maybe
 import Data.Traversable
 import Text.PrettyPrint.HughesPJClass hiding (empty)
@@ -358,7 +357,7 @@ type StructureBlock s c = (s, StructureTerminator c)
 data Structure' s c a
     = Simple s (StructureTerminator c)
     | Loop a
-    | Multiple [(Label, a)]
+    | Multiple [(Label, a)] a
     deriving Show
 
 data Structure s c = Structure
@@ -371,15 +370,15 @@ prettyStructure = vcat . map go
     where
     go (Structure _ (Simple s term)) = text (show s ++ ";") $+$ text (show term)
     go (Structure entries (Loop body)) = prettyGroup entries "loop" (prettyStructure body)
-    go (Structure entries (Multiple handlers)) = prettyGroup entries "match" $
-        vcat $ intersperse (text "---") $ map (prettyStructure . snd) handlers
+    go (Structure entries (Multiple handlers unhandled)) = prettyGroup entries "match" $
+        vcat [ text (show entry ++ " =>") $+$ nest 2 (prettyStructure handler) | (entry, handler) <- handlers ]
+        $+$ if null unhandled then mempty else (text "_ =>" $+$ nest 2 (prettyStructure unhandled))
 
     prettyGroup entries kind body =
         text "{" <> hsep (punctuate (text ",") (map (text . show) (IntSet.toList entries))) <> text ("} " ++ kind)
         $+$ nest 2 body
 
-relooper :: IntSet.IntSet -> IntMap.IntMap (StructureBlock s c) -> [Structure s c]
-relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
+relooper :: Monoid s => IntSet.IntSet -> IntMap.IntMap (StructureBlock s c) -> [Structure s c]
 relooper entries blocks =
 ```
 
@@ -399,6 +398,7 @@ simpler in each case.
 ```haskell
     let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ map successors $ IntMap.elems blocks
     in case (IntSet.toList noreturns, IntSet.toList returns) of
+    ([], []) -> []
 ```
 
 If all the entry labels are targets of branches in some block somewhere,
@@ -435,6 +435,32 @@ Otherwise, we need to merge multiple control flow paths at this point,
 by constructing code that will dynamically check which path we're
 supposed to be on.
 
+The first challenge in this case is when some or all of our entry labels
+refer to blocks that we have already decided to place somewhere later.
+(Note that if we need to branch to a block that we placed somewhere
+earlier, then we'll have already constructed a loop for that, so we
+don't need to handle that case here.) We avoid duplicating code, so we
+need some way to skip over any intervening code until control flow
+reaches wherever we actually placed these blocks. We accomplish this by
+constructing a `Multiple` block with an empty branch for each absent
+entry label, and an else-branch that contains the code we may want to
+skip. However, if we don't have any code to place in the else-branch,
+then this procedure would generate a no-op `Multiple` block, so we can
+avoid emitting anything at all in that case.
+
+```haskell
+    _ ->
+        let (present, absent) = partitionMembers entries (IntMap.keysSet blocks)
+        in case (IntSet.null absent, IntSet.null present) of
+        (False, True) -> []
+        (False, False) -> Structure
+            { structureEntries = entries
+            , structureBody = Multiple
+                [ (entry, []) | entry <- IntSet.toList absent ]
+                (relooper present blocks)
+            } : []
+```
+
 In a `Multiple` block, we construct a separate handler for each entry
 label that we can safely split off. We make a recursive call for each
 handler, and one more for all the blocks we couldn't handle in this
@@ -459,11 +485,14 @@ block.
   block in this pass.
 
 ```haskell
-    _ -> constructMultiple
+        (True, _) -> constructMultiple
     where
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
-        (Nothing, _) -> []
+        (Nothing, _) -> Structure
+            { structureEntries = entries
+            , structureBody = Simple mempty (Branch (GoTo entry))
+            } : []
         (Just (s, term), blocks') -> Structure
             { structureEntries = entries
             , structureBody = Simple s term
@@ -532,6 +561,7 @@ Recurse on each handled entry point and on the next block.
             [ (entry, relooper (IntSet.singleton entry) blocks')
             | (entry, blocks') <- IntMap.toList multipleEntries
             ]
+            []
         } : relooper multipleFollowEntries multipleFollowBlocks
 ```
 
@@ -615,7 +645,7 @@ successors (_, term) = IntSet.fromList [ target | GoTo target <- toList term ]
 flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
 flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
-relooperRoot :: CFG k s c -> [Structure s c]
+relooperRoot :: Monoid s => CFG k s c -> [Structure s c]
 relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) $
     IntMap.map (\ (BasicBlock s term) -> (s, fmap GoTo term)) blocks
 
@@ -647,7 +677,7 @@ structureCFG
     -> (Label -> s -> s)
     -> (c -> s -> s -> s)
     -> (Label -> s)
-    -> ([(Label, s)] -> s)
+    -> ([(Label, s)] -> s -> s)
     -> CFG DepthFirst s c
     -> s
 structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty mempty root
@@ -671,8 +701,8 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty memp
             insertGoto _ (target, s) | IntSet.size target == 1 = s
             insertGoto to (_, s) = mkGoto to `mappend` s
 
-        go' (Structure _ (Multiple handlers)) next =
-            mkMatch [ (label, foo exits next body) | (label, body) <- handlers ]
+        go' (Structure _ (Multiple handlers unhandled)) next =
+            mkMatch [ (label, foo exits next body) | (label, body) <- handlers ] (foo exits next unhandled)
 
         go' (Structure entries (Loop body)) next = mkLoop label (foo exits' entries body)
             where
