@@ -106,7 +106,7 @@ staticCFG (CFG start blocks) = removeEmptyBlocks $ evalState (buildCFG $ foo ini
                     let (current', stmts') = extractGoto current stmts
                     term' <- case term of
                         CondBranch (Match n) t f
-                            | current' == n -> Branch <$> foo initialState t
+                            | current' == n -> Branch <$> foo current' t
                             | otherwise -> Branch <$> foo current' f
                         _ -> mapM (foo current') term
                     addBlock b' stmts' term'
