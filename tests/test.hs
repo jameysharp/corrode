@@ -145,7 +145,7 @@ fingerprintStmt :: [Stmt] -> (IntMap.IntMap Int, IntMap.IntMap Int)
 fingerprintStmt = foldr go (IntMap.empty, IntMap.empty)
     where
     go (Stmt l) (stmts, conds) = (IntMap.insertWith (+) l 1 stmts, conds)
-    go Return _ = (IntMap.empty, IntMap.empty)
+    go Return rest = rest
     go (Loop _ stmts) rest = foldr go rest stmts
     go (Break _) rest = rest
     go (Continue _) rest = rest
