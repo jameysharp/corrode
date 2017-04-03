@@ -33,6 +33,7 @@ import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
 import Data.List
+import Data.Maybe
 import Data.Traversable
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 ```
@@ -95,6 +96,7 @@ data Terminator' c l
     = Unreachable
     | Branch l
     | CondBranch c l l
+    deriving Show
 ```
 
 The above `Terminator'` type has two generic type parameters:
@@ -346,26 +348,28 @@ Transforming CFGs to structured programs
 
 ```haskell
 data StructureLabel
-    = GoTo Label
-    | ExitTo Label
+    = GoTo { structureLabel :: Label }
+    | ExitTo { structureLabel :: Label }
+    deriving Show
 
 type StructureTerminator c = Terminator' c StructureLabel
+type StructureBlock s c = (s, StructureTerminator c)
 
-data Structure' a
-    = Simple Label
+data Structure' s c a
+    = Simple s (StructureTerminator c)
     | Loop a
     | Multiple [(Label, a)]
     deriving Show
 
-data Structure = Structure
+data Structure s c = Structure
     { structureEntries :: IntSet.IntSet
-    , structureBody :: Structure' [Structure]
+    , structureBody :: Structure' s c [Structure s c]
     }
 
-prettyStructure :: [Structure] -> Doc
+prettyStructure :: (Show s, Show c) => [Structure s c] -> Doc
 prettyStructure = vcat . map go
     where
-    go (Structure _ (Simple entry)) = text (show entry ++ ";")
+    go (Structure _ (Simple s term)) = text (show s ++ ";") $+$ text (show term)
     go (Structure entries (Loop body)) = prettyGroup entries "loop" (prettyStructure body)
     go (Structure entries (Multiple handlers)) = prettyGroup entries "match" $
         vcat $ intersperse (text "---") $ map (prettyStructure . snd) handlers
@@ -374,7 +378,7 @@ prettyStructure = vcat . map go
         text "{" <> hsep (punctuate (text ",") (map (text . show) (IntSet.toList entries))) <> text ("} " ++ kind)
         $+$ nest 2 body
 
-relooper :: IntSet.IntSet -> IntMap.IntMap (StructureTerminator c) -> [Structure]
+relooper :: IntSet.IntSet -> IntMap.IntMap (StructureBlock s c) -> [Structure s c]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
 relooper entries blocks =
 ```
@@ -460,10 +464,10 @@ block.
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
         (Nothing, _) -> []
-        (Just term, blocks') -> Structure
+        (Just (s, term), blocks') -> Structure
             { structureEntries = entries
-            , structureBody = Simple entry
-            } : relooper (successors term) blocks'
+            , structureBody = Simple s term
+            } : relooper (successors (s, term)) blocks'
 ```
 
 The elements in the `singlyReached` map are disjoint sets. Proof: keys
@@ -585,7 +589,7 @@ necessary.
         | label `IntSet.member` (loopFollowEntries `IntSet.union` entries)
         = ExitTo label
     loopMarkEdge edge = edge
-    loopBlocks = IntMap.map (fmap loopMarkEdge) loopOriginalBlocks
+    loopBlocks = IntMap.map (\ (s, term) -> (s, fmap loopMarkEdge term)) loopOriginalBlocks
 ```
 
 ```haskell
@@ -599,21 +603,21 @@ necessary.
         grow r = IntMap.map (\ seen -> IntSet.unions $ seen : (IntMap.elems (r `IntMap.intersection` IntMap.fromSet (const ()) seen))) r
         go r = let r' = grow r in if r /= r' then go r' else r'
 
-outEdges :: IntMap.IntMap (StructureTerminator c) -> IntSet.IntSet
+outEdges :: IntMap.IntMap (StructureBlock s c) -> IntSet.IntSet
 outEdges blocks = IntSet.unions (map successors $ IntMap.elems blocks) `IntSet.difference` IntMap.keysSet blocks
 
 partitionMembers :: IntSet.IntSet -> IntSet.IntSet -> (IntSet.IntSet, IntSet.IntSet)
 partitionMembers a b = (a `IntSet.intersection` b, a `IntSet.difference` b)
 
-successors :: StructureTerminator c -> IntSet.IntSet
-successors term = IntSet.fromList [ target | GoTo target <- toList term ]
+successors :: StructureBlock s c -> IntSet.IntSet
+successors (_, term) = IntSet.fromList [ target | GoTo target <- toList term ]
 
 flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
 flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
-relooperRoot :: CFG k s c -> [Structure]
+relooperRoot :: CFG k s c -> [Structure s c]
 relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) $
-    IntMap.map (\ (BasicBlock _ term) -> fmap GoTo term) blocks
+    IntMap.map (\ (BasicBlock s term) -> (s, fmap GoTo term)) blocks
 
 -- We no longer care about ordering, but reachability needs to only include
 -- nodes that are reachable from the function entry, and this has the side
@@ -646,28 +650,26 @@ structureCFG
     -> ([(Label, s)] -> s)
     -> CFG DepthFirst s c
     -> s
-structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg@(CFG _ blocks) = foo mempty mempty root
+structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty mempty root
     where
     root = relooperRoot cfg
     foo exits next' = snd . foldr go (next', mempty)
         where
         go structure (next, rest) = (structureEntries structure, go' structure next `mappend` rest)
 
-        go' (Structure _ (Simple entry)) next = case IntMap.lookup entry blocks of
-            Just (BasicBlock s term) -> s `mappend` case term of
+        go' (Structure entries (Simple body term)) next = body `mappend` case term of
                 Unreachable -> mempty
                 Branch to -> branch to
                 CondBranch c t f -> mkIf c (branch t) (branch f)
-            Nothing -> error $ "reloop: basic block " ++ show entry ++ " missing"
             where
-            branch' to | to `IntSet.member` next = (next, mempty)
-            branch' to = case IntMap.lookup to exits of
-                Just target -> target
-                Nothing -> error ("structureCFG: label " ++ show to ++ " is not a valid exit from " ++ show entry)
+            branch to | structureLabel to `IntSet.member` next =
+                insertGoto (structureLabel to) (next, mempty)
+            branch (ExitTo to) | isJust target = insertGoto to (fromJust target)
+                where target = IntMap.lookup to exits
+            branch to = error ("structureCFG: label " ++ show to ++ " is not a valid exit from " ++ show entries)
 
-            branch to = case branch' to of
-                (target, s) | IntSet.size target == 1 -> s
-                (_, s) -> mkGoto to `mappend` s
+            insertGoto _ (target, s) | IntSet.size target == 1 = s
+            insertGoto to (_, s) = mkGoto to `mappend` s
 
         go' (Structure _ (Multiple handlers)) next =
             mkMatch [ (label, foo exits next body) | (label, body) <- handlers ]
