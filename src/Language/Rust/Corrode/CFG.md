@@ -345,6 +345,12 @@ Transforming CFGs to structured programs
 ========================================
 
 ```haskell
+data StructureLabel
+    = GoTo Label
+    | ExitTo Label
+
+type StructureTerminator c = Terminator' c StructureLabel
+
 data Structure' a
     = Simple Label
     | Loop a
@@ -368,7 +374,7 @@ prettyStructure = vcat . map go
         text "{" <> hsep (punctuate (text ",") (map (text . show) (IntSet.toList entries))) <> text ("} " ++ kind)
         $+$ nest 2 body
 
-relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
+relooper :: IntSet.IntSet -> IntMap.IntMap (StructureTerminator c) -> [Structure]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
 relooper entries blocks =
 ```
@@ -387,7 +393,7 @@ finish it off immediately. We'll show that the subproblems truly are
 simpler in each case.
 
 ```haskell
-    let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ IntMap.elems blocks
+    let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ map successors $ IntMap.elems blocks
     in case (IntSet.toList noreturns, IntSet.toList returns) of
 ```
 
@@ -454,10 +460,10 @@ block.
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
         (Nothing, _) -> []
-        (Just block, blocks') -> Structure
+        (Just term, blocks') -> Structure
             { structureEntries = entries
             , structureBody = Simple entry
-            } : relooper block blocks'
+            } : relooper (successors term) blocks'
 ```
 
 The elements in the `singlyReached` map are disjoint sets. Proof: keys
@@ -575,7 +581,11 @@ will still be correct, but will have more `Multiple` blocks than
 necessary.
 
 ```haskell
-    loopBlocks = IntMap.map (`IntSet.difference` (loopFollowEntries `IntSet.union` entries)) loopOriginalBlocks
+    loopMarkEdge (GoTo label)
+        | label `IntSet.member` (loopFollowEntries `IntSet.union` entries)
+        = ExitTo label
+    loopMarkEdge edge = edge
+    loopBlocks = IntMap.map (fmap loopMarkEdge) loopOriginalBlocks
 ```
 
 ```haskell
@@ -584,25 +594,26 @@ necessary.
         , structureBody = Loop (relooper entries loopBlocks)
         } : relooper loopFollowEntries loopFollowBlocks
 
-    strictReachableFrom = flipEdges (go blocks)
+    strictReachableFrom = flipEdges (go (IntMap.map successors blocks))
         where
         grow r = IntMap.map (\ seen -> IntSet.unions $ seen : (IntMap.elems (r `IntMap.intersection` IntMap.fromSet (const ()) seen))) r
         go r = let r' = grow r in if r /= r' then go r' else r'
 
-outEdges :: IntMap.IntMap IntSet.IntSet -> IntSet.IntSet
-outEdges blocks = IntSet.unions (IntMap.elems blocks) `IntSet.difference` IntMap.keysSet blocks
+outEdges :: IntMap.IntMap (StructureTerminator c) -> IntSet.IntSet
+outEdges blocks = IntSet.unions (map successors $ IntMap.elems blocks) `IntSet.difference` IntMap.keysSet blocks
 
 partitionMembers :: IntSet.IntSet -> IntSet.IntSet -> (IntSet.IntSet, IntSet.IntSet)
 partitionMembers a b = (a `IntSet.intersection` b, a `IntSet.difference` b)
 
-successors :: IntMap.IntMap (BasicBlock s c) -> IntMap.IntMap IntSet.IntSet
-successors blocks = IntMap.map (\ (BasicBlock _ term) -> IntSet.fromList (toList term)) blocks
+successors :: StructureTerminator c -> IntSet.IntSet
+successors term = IntSet.fromList [ target | GoTo target <- toList term ]
 
 flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
 flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 
 relooperRoot :: CFG k s c -> [Structure]
-relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) (successors blocks)
+relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) $
+    IntMap.map (\ (BasicBlock _ term) -> fmap GoTo term) blocks
 
 -- We no longer care about ordering, but reachability needs to only include
 -- nodes that are reachable from the function entry, and this has the side
