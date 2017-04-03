@@ -397,12 +397,61 @@ simpler in each case.
 
 ```haskell
     let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ map successors $ IntMap.elems blocks
+        (present, absent) = partitionMembers entries (IntMap.keysSet blocks)
     in case (IntSet.toList noreturns, IntSet.toList returns) of
     ([], []) -> []
 ```
 
+If there's only one label and it is _not_ the target of a branch in the
+current set of blocks, then simply place that label next in the output.
+If the target is a block that we've already decided to place somewhere
+later, then we need to construct a fake block that tells the code
+generator to set the current-block state variable appropriately.
+
+This case always removes one block from consideration before making the
+recursive call, so the subproblem is one block smaller.
+
+```haskell
+    ([entry], []) -> constructSimple entry
+```
+
+When there are multiple entry labels and some or all of them refer to
+blocks that we have already decided to place somewhere later, we need
+some way to skip over any intervening code until control flow reaches
+wherever we actually placed these blocks. (Note that if we need to
+branch to a block that we placed somewhere earlier, then we'll have
+already constructed a loop for that, so we don't need to handle that
+case here.)
+
+We accomplish this by constructing a `Multiple` block with an empty
+branch for each absent entry label, and an else-branch that contains the
+code we may want to skip. This gets control flow to the end of the
+enclosing block. If the target block isn't there either, then we'll do
+this again at that point, until we've gotten all the way out to a block
+that does contain the target label.
+
+However, if we don't have any code to place in the else-branch, then
+this procedure would generate a no-op `Multiple` block, so we can avoid
+emitting anything at all in that case.
+
+```haskell
+    _ | not (IntSet.null absent) ->
+        if IntSet.null present then [] else Structure
+            { structureEntries = entries
+            , structureBody = Multiple
+                [ (entry, []) | entry <- IntSet.toList absent ]
+                (relooper present blocks)
+            } : []
+```
+
 If all the entry labels are targets of branches in some block somewhere,
 then construct a loop with all those labels as entry points.
+
+To keep the generated code simple, we want to eliminate any absent
+entries (the previous case) before constructing a loop. If we generate a
+loop with absent entry points, then to handle those inside the loop we'd
+need to `break` out of the loop. By doing it in this order instead, we
+don't need any code at all in the handlers for the absent branches.
 
 In this case, we have one recursive call for the body of the loop, and
 another for the labels that go after the loop.
@@ -421,45 +470,9 @@ another for the labels that go after the loop.
     ([], _) -> constructLoop
 ```
 
-If there's only one label and it is _not_ the target of a branch in the
-current set of blocks, then simply place that label next in the output.
-
-This case always removes one block from consideration before making the
-recursive call, so the subproblem is one block smaller.
-
-```haskell
-    ([entry], []) -> constructSimple entry
-```
-
 Otherwise, we need to merge multiple control flow paths at this point,
 by constructing code that will dynamically check which path we're
 supposed to be on.
-
-The first challenge in this case is when some or all of our entry labels
-refer to blocks that we have already decided to place somewhere later.
-(Note that if we need to branch to a block that we placed somewhere
-earlier, then we'll have already constructed a loop for that, so we
-don't need to handle that case here.) We avoid duplicating code, so we
-need some way to skip over any intervening code until control flow
-reaches wherever we actually placed these blocks. We accomplish this by
-constructing a `Multiple` block with an empty branch for each absent
-entry label, and an else-branch that contains the code we may want to
-skip. However, if we don't have any code to place in the else-branch,
-then this procedure would generate a no-op `Multiple` block, so we can
-avoid emitting anything at all in that case.
-
-```haskell
-    _ ->
-        let (present, absent) = partitionMembers entries (IntMap.keysSet blocks)
-        in case (IntSet.null absent, IntSet.null present) of
-        (False, True) -> []
-        (False, False) -> Structure
-            { structureEntries = entries
-            , structureBody = Multiple
-                [ (entry, []) | entry <- IntSet.toList absent ]
-                (relooper present blocks)
-            } : []
-```
 
 In a `Multiple` block, we construct a separate handler for each entry
 label that we can safely split off. We make a recursive call for each
@@ -485,7 +498,7 @@ block.
   block in this pass.
 
 ```haskell
-        (True, _) -> constructMultiple
+    _ -> constructMultiple
     where
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
