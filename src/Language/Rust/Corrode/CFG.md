@@ -508,8 +508,7 @@ block's unhandled entries, and in addition, one for each branch that
 leaves this `Multiple` block.
 
 ```haskell
-    multipleFollowEntries = IntSet.unions $ multipleUnhandledEntries :
-        (map (`IntSet.difference` IntMap.keysSet multipleHandledBlocks) $ IntMap.elems multipleHandledBlocks)
+    multipleFollowEntries = multipleUnhandledEntries `IntSet.union` outEdges multipleHandledBlocks
 ```
 
 Finally, we've partitioned the entries and labels into those which
@@ -524,22 +523,74 @@ Recurse on each handled entry point and on the next block.
             | (entry, blocks') <- IntMap.toList multipleEntries
             ]
         } : relooper multipleFollowEntries multipleFollowBlocks
+```
 
+The labels that should be included in this loop's body are all those
+which can eventually come back to one of the entry points for the loop.
+
+Note that `IntMap.keysSet loopReturns == entries`. If some entry were
+not reachable from any other entry, then we would have split it off into
+a `Multiple` block first.
+
+```haskell
     loopReturns = (strictReachableFrom `IntMap.intersection` blocks) `IntMap.intersection` IntMap.fromSet (const ()) entries
     loopWithin = IntSet.unions (IntMap.keysSet loopReturns : IntMap.elems loopReturns)
-    loopBlocks = blocks `IntMap.intersection` IntMap.fromSet (const ()) loopWithin
+```
+
+Now that we've identified which labels belong in the loop body, we can
+partition the current blocks into those that are inside the loop and
+those that follow it.
+
+```haskell
+    loopOriginalBlocks = blocks `IntMap.intersection` IntMap.fromSet (const ()) loopWithin
     loopFollowBlocks = blocks `IntMap.difference` IntMap.fromSet (const ()) loopWithin
-    loopFoo = IntMap.map (`partitionMembers` loopWithin) loopBlocks
-    loopFollowEntries = IntSet.unions (map snd (IntMap.elems loopFoo))
+```
+
+Any branches that go from inside this loop to outside it form the entry
+points for the block following this one. (There can't be any branches
+that go to someplace earlier in the program because we've already
+removed those before recursing into some loop that encloses this one.)
+
+```haskell
+    loopFollowEntries = outEdges loopOriginalBlocks
+```
+
+At this point we've identified some branches as either a `break` (so
+it's in `loopFollowEntries`) or a `continue` (because it was one of this
+loop's entry points) branch. When we recurse to structure the body of
+this loop, we must not consider those branches again, so we delete them
+from the successors of all blocks inside the loop.
+
+Note that `structureEntries` for this loop block records the labels that
+are `continue` edges, and `structureEntries` for the subsequent block
+records the labels that are `break` edges, so we don't need to record
+any additional information here.
+
+If we fail to delete some branch back to the loop entry, then when we
+recurse we'll generate another `Loop` block, which might mean the
+algorithm never terminates.
+
+If we fail to delete some branch that exits the loop, I think the result
+will still be correct, but will have more `Multiple` blocks than
+necessary.
+
+```haskell
+    loopBlocks = IntMap.map (`IntSet.difference` (loopFollowEntries `IntSet.union` entries)) loopOriginalBlocks
+```
+
+```haskell
     constructLoop = Structure
         { structureEntries = entries
-        , structureBody = Loop (relooper entries (IntMap.map ((`IntSet.difference` entries) . fst) loopFoo))
+        , structureBody = Loop (relooper entries loopBlocks)
         } : relooper loopFollowEntries loopFollowBlocks
 
     strictReachableFrom = flipEdges (go blocks)
         where
         grow r = IntMap.map (\ seen -> IntSet.unions $ seen : (IntMap.elems (r `IntMap.intersection` IntMap.fromSet (const ()) seen))) r
         go r = let r' = grow r in if r /= r' then go r' else r'
+
+outEdges :: IntMap.IntMap IntSet.IntSet -> IntSet.IntSet
+outEdges blocks = IntSet.unions (IntMap.elems blocks) `IntSet.difference` IntMap.keysSet blocks
 
 partitionMembers :: IntSet.IntSet -> IntSet.IntSet -> (IntSet.IntSet, IntSet.IntSet)
 partitionMembers a b = (a `IntSet.intersection` b, a `IntSet.difference` b)
