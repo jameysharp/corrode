@@ -370,12 +370,87 @@ prettyStructure = vcat . map go
 
 relooper :: IntSet.IntSet -> IntMap.IntMap IntSet.IntSet -> [Structure]
 relooper entries blocks | IntSet.null (entries `IntSet.intersection` IntMap.keysSet blocks) = []
-relooper entries blocks = case (IntSet.toList noreturns, IntSet.toList returns) of
+relooper entries blocks =
+```
+
+First we partition the entry labels into those that some block may
+branch to versus those that none can branch to. The key idea is that
+entry labels need to be placed early in the output, but if something
+later can branch to them, then we need to wrap them in a loop so we can
+send control flow back to the entry point again.
+
+Each of these cases makes at least one recursive call. To ensure that
+this algorithm doesn't get stuck in an infinite loop, we need to make
+sure that every recursive call has a "simpler" problem to solve, such
+that eventually each subproblem has been made so simple that we can
+finish it off immediately. We'll show that the subproblems truly are
+simpler in each case.
+
+```haskell
+    let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ IntMap.elems blocks
+    in case (IntSet.toList noreturns, IntSet.toList returns) of
+```
+
+If all the entry labels are targets of branches in some block somewhere,
+then construct a loop with all those labels as entry points.
+
+In this case, we have one recursive call for the body of the loop, and
+another for the labels that go after the loop.
+
+- The loop body has the same entry labels. However, for the recursive
+  call we remove all the branches that made it a loop, so we're
+  guaranteed to not hit this case again with the same set of entry
+  labels. As long as the other cases reduce the number of blocks, we're
+  set.
+
+- For the labels following the loop, we've removed at least the current
+  entry labels from consideration, so there are fewer blocks we still
+  need to structure.
+
+```haskell
+    ([], _) -> constructLoop
+```
+
+If there's only one label and it is _not_ the target of a branch in the
+current set of blocks, then simply place that label next in the output.
+
+This case always removes one block from consideration before making the
+recursive call, so the subproblem is one block smaller.
+
+```haskell
     ([entry], []) -> constructSimple entry
-    _ | IntSet.null noreturns || IntMap.null singlyReached -> constructLoop
+```
+
+Otherwise, we need to merge multiple control flow paths at this point,
+by constructing code that will dynamically check which path we're
+supposed to be on.
+
+In a `Multiple` block, we construct a separate handler for each entry
+label that we can safely split off. We make a recursive call for each
+handler, and one more for all the blocks we couldn't handle in this
+block.
+
+- If there are unhandled blocks, then each handler contains fewer blocks
+  than we started with. If we were able to handle all the entry labels,
+  then we've partitioned the blocks into at least two non-empty groups,
+  so each one is necessarily smaller than we started with. There must be
+  at least two entry labels because if there weren't any no-return
+  entries then we'd have constructed a loop, and if there were only one
+  no-return entry and no entries that can be returned to, we'd have
+  constructed a simple block.
+
+- Each handler consumes at least its entry label, so as long as we
+  generate at least one handler, the recursive call for the unhandled
+  blocks will have a smaller subproblem. We can only handle an entry
+  label if none of the other entry labels can, through any series of
+  branches, branch to this label. But because we aren't in the case
+  above for constructing a loop, we know that at least one entry label
+  has no branches into it, so we're guaranteed to consume at least one
+  block in this pass.
+
+```haskell
     _ -> constructMultiple
     where
-    (returns, noreturns) = partitionMembers entries $ IntSet.unions $ IntMap.elems blocks
 
     constructSimple entry = case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
         (Nothing, _) -> []
