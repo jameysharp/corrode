@@ -357,7 +357,7 @@ type StructureBlock s c = (s, StructureTerminator c)
 data Structure' s c a
     = Simple s (StructureTerminator c)
     | Loop a
-    | Multiple [(Label, a)] a
+    | Multiple (IntMap.IntMap a) a
     deriving Show
 
 data Structure s c = Structure
@@ -371,7 +371,7 @@ prettyStructure = vcat . map go
     go (Structure _ (Simple s term)) = text (show s ++ ";") $+$ text (show term)
     go (Structure entries (Loop body)) = prettyGroup entries "loop" (prettyStructure body)
     go (Structure entries (Multiple handlers unhandled)) = prettyGroup entries "match" $
-        vcat [ text (show entry ++ " =>") $+$ nest 2 (prettyStructure handler) | (entry, handler) <- handlers ]
+        vcat [ text (show entry ++ " =>") $+$ nest 2 (prettyStructure handler) | (entry, handler) <- IntMap.toList handlers ]
         $+$ if null unhandled then mempty else (text "_ =>" $+$ nest 2 (prettyStructure unhandled))
 
     prettyGroup entries kind body =
@@ -439,7 +439,7 @@ emitting anything at all in that case.
         if IntSet.null present then [] else Structure
             { structureEntries = entries
             , structureBody = Multiple
-                [ (entry, []) | entry <- IntSet.toList absent ]
+                (IntMap.fromSet (const []) absent)
                 (relooper present blocks)
             } : []
 ```
@@ -568,13 +568,11 @@ should be inside this `Multiple` block and those which should follow it.
 Recurse on each handled entry point and on the next block.
 
 ```haskell
+    multipleMakeHandler entry blocks' = relooper (IntSet.singleton entry) blocks'
+    multipleHandlers = IntMap.mapWithKey multipleMakeHandler multipleEntries
     constructMultiple = Structure
         { structureEntries = entries
-        , structureBody = Multiple
-            [ (entry, relooper (IntSet.singleton entry) blocks')
-            | (entry, blocks') <- IntMap.toList multipleEntries
-            ]
-            []
+        , structureBody = Multiple multipleHandlers []
         } : relooper multipleFollowEntries multipleFollowBlocks
 ```
 
@@ -715,7 +713,7 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty memp
             insertGoto to (_, s) = mkGoto to `mappend` s
 
         go' (Structure _ (Multiple handlers unhandled)) next =
-            mkMatch [ (label, foo exits next body) | (label, body) <- handlers ] (foo exits next unhandled)
+            mkMatch [ (label, foo exits next body) | (label, body) <- IntMap.toList handlers ] (foo exits next unhandled)
 
         go' (Structure entries (Loop body)) next = mkLoop label (foo exits' entries body)
             where
