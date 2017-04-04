@@ -346,16 +346,17 @@ Transforming CFGs to structured programs
 ========================================
 
 ```haskell
-data StructureLabel
+data StructureLabel s c
     = GoTo { structureLabel :: Label }
     | ExitTo { structureLabel :: Label }
+    | Nested [Structure s c]
     deriving Show
 
-type StructureTerminator c = Terminator' c StructureLabel
-type StructureBlock s c = (s, StructureTerminator c)
+type StructureTerminator s c = Terminator' c (StructureLabel s c)
+type StructureBlock s c = (s, StructureTerminator s c)
 
 data Structure' s c a
-    = Simple s (StructureTerminator c)
+    = Simple s (StructureTerminator s c)
     | Loop a
     | Multiple (IntMap.IntMap a) a
     deriving Show
@@ -364,6 +365,7 @@ data Structure s c = Structure
     { structureEntries :: IntSet.IntSet
     , structureBody :: Structure' s c [Structure s c]
     }
+    deriving Show
 
 prettyStructure :: (Show s, Show c) => [Structure s c] -> Doc
 prettyStructure = vcat . map go
@@ -660,6 +662,52 @@ relooperRoot :: Monoid s => CFG k s c -> [Structure s c]
 relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) $
     IntMap.map (\ (BasicBlock s term) -> (s, fmap GoTo term)) blocks
 
+simplifyStructure :: Monoid s => [Structure s c] -> [Structure s c]
+simplifyStructure = foldr go [] . map descend
+    where
+    descend structure = structure { structureBody =
+        case structureBody structure of
+        Simple s term -> Simple s term
+        Multiple handlers unhandled ->
+            Multiple (IntMap.map simplifyStructure handlers) (simplifyStructure unhandled)
+        Loop body -> Loop (simplifyStructure body)
+    }
+```
+
+If there's a `Simple` block immediately followed by a `Multiple` block,
+then we know several useful facts immediately:
+
+- The `Simple` block terminates with a conditional branch, where both
+  targets are distinct `GoTo` labels. Otherwise, the next block wouldn't
+  have enough entry points to be a `Multiple` block.
+
+- Each target of the conditional branch either has a handler it can be
+  replaced by from the `Multiple` block, or it can be replaced with the
+  unhandled blocks.
+
+- Every non-empty branch of the `Multiple` block will be used by this
+  process, so no code will be lost.
+
+- This simplification never duplicates code.
+
+The one tricky thing here is that under some circumstances we need to
+ensure that there's a `mkGoto` statement emitted in some branches.
+Conveniently, here we can unconditionally insert an empty `Simple` block
+ending in a `GoTo` branch, and let `structureCFG` decide later whether
+that requires emitting any actual code.
+
+```haskell
+    go (Structure entries (Simple s term))
+       (Structure _ (Multiple handlers unhandled) : rest) =
+        Structure entries (Simple s (fmap rewrite term)) : rest
+        where
+        rewrite (GoTo to) = Nested
+            $ Structure (IntSet.singleton to) (Simple mempty (Branch (GoTo to)))
+            : IntMap.findWithDefault unhandled to handlers
+        rewrite _ = error ("simplifyStructure: Simple/Multiple invariants violated in " ++ show entries)
+
+    go block rest = block : rest
+
 -- We no longer care about ordering, but reachability needs to only include
 -- nodes that are reachable from the function entry, and this has the side
 -- effect of pruning unreachable nodes from the graph.
@@ -693,7 +741,7 @@ structureCFG
     -> s
 structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty mempty root
     where
-    root = relooperRoot cfg
+    root = simplifyStructure (relooperRoot cfg)
     foo exits next' = snd . foldr go (next', mempty)
         where
         go structure (next, rest) = (structureEntries structure, go' structure next `mappend` rest)
@@ -703,11 +751,12 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty memp
                 Branch to -> branch to
                 CondBranch c t f -> mkIf c (branch t) (branch f)
             where
+            branch (Nested nested) = foo exits next nested
             branch to | structureLabel to `IntSet.member` next =
                 insertGoto (structureLabel to) (next, mempty)
             branch (ExitTo to) | isJust target = insertGoto to (fromJust target)
                 where target = IntMap.lookup to exits
-            branch to = error ("structureCFG: label " ++ show to ++ " is not a valid exit from " ++ show entries)
+            branch to = error ("structureCFG: label " ++ show (structureLabel to) ++ " is not a valid exit from " ++ show entries)
 
             insertGoto _ (target, s) | IntSet.size target == 1 = s
             insertGoto to (_, s) = mkGoto to `mappend` s
