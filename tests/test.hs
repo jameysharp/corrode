@@ -203,7 +203,7 @@ shrinkCFG (CFG entry blocks) = map (genStmts . depthFirstOrder) (removeEdges ++ 
         where rewrite label = if label == from then to else label
 
 structureStmtCFG :: CFG DepthFirst [Stmt] Cond -> [Stmt]
-structureStmtCFG = structureCFG
+structureStmtCFG = snd . structureCFG
     (return . Break)
     (return . Continue)
     (\ l b -> [Loop l b])

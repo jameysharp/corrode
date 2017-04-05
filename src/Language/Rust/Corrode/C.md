@@ -1986,7 +1986,8 @@ yet.
 
 ```haskell
     let cfg = depthFirstOrder (removeEmptyBlocks rawCFG)
-    return $ declCurrent : structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg
+    let (hasGoto, structured) = structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg
+    return $ if hasGoto then declCurrent : structured else structured
     where
 ```
 

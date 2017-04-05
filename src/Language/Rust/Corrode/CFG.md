@@ -799,8 +799,9 @@ structureCFG
     -> (Label -> s)
     -> ([(Label, s)] -> s -> s)
     -> CFG DepthFirst s c
-    -> s
-structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo [] mempty root
+    -> (Bool, s)
+structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg =
+    (hasMultiple root, foo [] mempty root)
     where
     root = simplifyStructure (relooperRoot cfg)
     foo exits next' = snd . foldr go (next', mempty)
@@ -838,4 +839,11 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo [] mempty r
                     (IntMap.fromSet (const (entries, mkContinue)) entries)
                     (IntMap.fromSet (const (next, mkBreak)) next)
                 ) : exits
+
+hasMultiple :: [Structure s c] -> Bool
+hasMultiple = any (go . structureBody)
+    where
+    go (Multiple{}) = True
+    go (Simple _ term) = or [ hasMultiple nested | Nested nested <- toList term ]
+    go (Loop body) = hasMultiple body
 ```
