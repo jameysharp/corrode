@@ -21,23 +21,19 @@ look very different than the input to step 1!
 {-# LANGUAGE Rank2Types #-}
 module Language.Rust.Corrode.CFG (
     Label, Terminator'(..), Terminator, BasicBlock(..),
-    CFG, Unordered, DepthFirst, prettyCFG,
+    CFG(..), Unordered, DepthFirst, prettyCFG,
     BuildCFGT, mapBuildCFGT, addBlock, newLabel, buildCFG,
-    depthFirstOrder, removeEmptyBlocks, structureCFG,
+    removeEmptyBlocks, depthFirstOrder,
+    prettyStructure, relooperRoot, structureCFG,
 ) where
 
 import Control.Monad
-import Control.Monad.Trans.Class
-import Control.Monad.Trans.Except
-import qualified Control.Monad.Trans.RWS.Lazy as RWS
 import Control.Monad.Trans.State
-import Data.Either
 import Data.Foldable
 import qualified Data.IntMap.Lazy as IntMap
 import qualified Data.IntSet as IntSet
-import Data.List
-import qualified Data.Map.Lazy as Map
 import Data.Maybe
+import Data.Traversable
 import Text.PrettyPrint.HughesPJClass hiding (empty)
 ```
 
@@ -99,6 +95,7 @@ data Terminator' c l
     = Unreachable
     | Branch l
     | CondBranch c l l
+    deriving Show
 ```
 
 The above `Terminator'` type has two generic type parameters:
@@ -122,14 +119,15 @@ type is specifically the above-chosen `Label`.
 type Terminator c = Terminator' c Label
 
 instance Functor (Terminator' c) where
-    fmap _ Unreachable = Unreachable
-    fmap f (Branch l) = Branch (f l)
-    fmap f (CondBranch c l1 l2) = CondBranch c (f l1) (f l2)
+    fmap = fmapDefault
 
 instance Foldable (Terminator' c) where
-    foldMap _ Unreachable = mempty
-    foldMap f (Branch l) = f l
-    foldMap f (CondBranch _ l1 l2) = f l1 `mappend` f l2
+    foldMap = foldMapDefault
+
+instance Traversable (Terminator' c) where
+    traverse _ Unreachable = pure Unreachable
+    traverse f (Branch l) = Branch <$> f l
+    traverse f (CondBranch c l1 l2) = CondBranch c <$> f l1 <*> f l2
 ```
 
 Now we can define a complete control-flow graph in terms of the previous
@@ -156,6 +154,9 @@ figure that out!
 data Unordered
 data DepthFirst
 data CFG k s c = CFG Label (IntMap.IntMap (BasicBlock s c))
+
+instance (Show s, Show c) => Show (CFG k s c) where
+    show = render . prettyCFG (text . show) (text . show)
 ```
 
 When things go wrong, it's handy to be able to print a human-readable
@@ -363,91 +364,399 @@ more than one loop in one go, by giving loops names and specifying which
 loop to exit by name. This code assumes that your target language is one
 of the latter kind.
 
-This algorithm proceeds by first sorting the basic blocks into an order
-that makes the later steps more efficient; then collecting a bunch of
-analyses about the CFG; and finally using all the analysis results to
-decide which blocks are loops, which are if-then-else, and where to
-place them all.
+```haskell
+data StructureLabel s c
+    = GoTo { structureLabel :: Label }
+    | ExitTo { structureLabel :: Label }
+    | Nested [Structure s c]
+    deriving Show
 
-One helper used in several algorithms just finds, for each block in the
-control-flow graph, the set of other blocks that can branch directly to
-it.
+type StructureTerminator s c = Terminator' c (StructureLabel s c)
+type StructureBlock s c = (s, StructureTerminator s c)
+
+data Structure' s c a
+    = Simple s (StructureTerminator s c)
+    | Loop a
+    | Multiple (IntMap.IntMap a) a
+    deriving Show
+
+data Structure s c = Structure
+    { structureEntries :: IntSet.IntSet
+    , structureBody :: Structure' s c [Structure s c]
+    }
+    deriving Show
+
+prettyStructure :: (Show s, Show c) => [Structure s c] -> Doc
+prettyStructure = vcat . map go
+    where
+    go (Structure _ (Simple s term)) = text (show s ++ ";") $+$ text (show term)
+    go (Structure entries (Loop body)) = prettyGroup entries "loop" (prettyStructure body)
+    go (Structure entries (Multiple handlers unhandled)) = prettyGroup entries "match" $
+        vcat [ text (show entry ++ " =>") $+$ nest 2 (prettyStructure handler) | (entry, handler) <- IntMap.toList handlers ]
+        $+$ if null unhandled then mempty else (text "_ =>" $+$ nest 2 (prettyStructure unhandled))
+
+    prettyGroup entries kind body =
+        text "{" <> hsep (punctuate (text ",") (map (text . show) (IntSet.toList entries))) <> text ("} " ++ kind)
+        $+$ nest 2 body
+
+relooperRoot :: Monoid s => CFG k s c -> [Structure s c]
+relooperRoot (CFG entry blocks) = relooper (IntSet.singleton entry) $
+    IntMap.map (\ (BasicBlock s term) -> (s, fmap GoTo term)) blocks
+
+relooper :: Monoid s => IntSet.IntSet -> IntMap.IntMap (StructureBlock s c) -> [Structure s c]
+relooper entries blocks =
+```
+
+First we partition the entry labels into those that some block may
+branch to versus those that none can branch to. The key idea is that
+entry labels need to be placed early in the output, but if something
+later can branch to them, then we need to wrap them in a loop so we can
+send control flow back to the entry point again.
+
+Each of these cases makes at least one recursive call. To ensure that
+this algorithm doesn't get stuck in an infinite loop, we need to make
+sure that every recursive call has a "simpler" problem to solve, such
+that eventually each subproblem has been made so simple that we can
+finish it off immediately. We'll show that the subproblems truly are
+simpler in each case.
 
 ```haskell
-predecessors :: CFG k s c -> IntMap.IntMap IntSet.IntSet
-predecessors (CFG _ blocks) = IntMap.foldrWithKey grow IntMap.empty blocks
+    let (returns, noreturns) = partitionMembers entries $ IntSet.unions $ map successors $ IntMap.elems blocks
+        (present, absent) = partitionMembers entries (IntMap.keysSet blocks)
+    in case (IntSet.toList noreturns, IntSet.toList returns) of
+```
+
+If there are no entry points, then the previous block can't reach any
+remaining blocks, so we don't need to generate any code for them. This
+is the primary recursive base case for this algorithm.
+
+```haskell
+    ([], []) -> []
+```
+
+Simple blocks
+-------------
+
+If there's only one label and it is _not_ the target of a branch in the
+current set of blocks, then simply place that label next in the output.
+
+This case always removes one block from consideration before making the
+recursive call, so the subproblem is one block smaller.
+
+```haskell
+    ([entry], []) -> case IntMap.updateLookupWithKey (\ _ _ -> Nothing) entry blocks of
+        (Just (s, term), blocks') -> Structure
+            { structureEntries = entries
+            , structureBody = Simple s term
+            } : relooper (successors (s, term)) blocks'
+```
+
+If the target is a block that we've already decided to place somewhere
+later, then we need to construct a fake block that tells the code
+generator to set the current-block state variable appropriately.
+
+```haskell
+        (Nothing, _) -> Structure
+            { structureEntries = entries
+            , structureBody = Simple mempty (Branch (GoTo entry))
+            } : []
+```
+
+Skipping to blocks placed later
+-------------------------------
+
+When there are multiple entry labels and some or all of them refer to
+blocks that we have already decided to place somewhere later, we need
+some way to skip over any intervening code until control flow reaches
+wherever we actually placed these blocks. (Note that if we need to
+branch to a block that we placed somewhere earlier, then we'll have
+already constructed a loop for that, so we don't need to handle that
+case here.)
+
+We accomplish this by constructing a `Multiple` block with an empty
+branch for each absent entry label, and an else-branch that contains the
+code we may want to skip. This gets control flow to the end of the
+enclosing block. If the target block isn't there either, then we'll do
+this again at that point, until we've gotten all the way out to a block
+that does contain the target label.
+
+However, if we don't have any code to place in the else-branch, then
+this procedure would generate a no-op `Multiple` block, so we can avoid
+emitting anything at all in that case.
+
+```haskell
+    _ | not (IntSet.null absent) ->
+        if IntSet.null present then [] else Structure
+            { structureEntries = entries
+            , structureBody = Multiple
+                (IntMap.fromSet (const []) absent)
+                (relooper present blocks)
+            } : []
+```
+
+Loops
+-----
+
+If all the entry labels are targets of branches in some block somewhere,
+then construct a loop with all those labels as entry points.
+
+To keep the generated code simple, we want to eliminate any absent
+entries (the previous case) before constructing a loop. If we generate a
+loop with absent entry points, then to handle those inside the loop we'd
+need to `break` out of the loop. By doing it in this order instead, we
+don't need any code at all in the handlers for the absent branches.
+
+In this case, we have one recursive call for the body of the loop, and
+another for the labels that go after the loop.
+
+- The loop body has the same entry labels. However, for the recursive
+  call we remove all the branches that made it a loop, so we're
+  guaranteed to not hit this case again with the same set of entry
+  labels. As long as the other cases reduce the number of blocks, we're
+  set.
+
+- For the labels following the loop, we've removed at least the current
+  entry labels from consideration, so there are fewer blocks we still
+  need to structure.
+
+```haskell
+    ([], _) -> Structure
+        { structureEntries = entries
+        , structureBody = Loop (relooper entries blocks')
+        } : relooper followEntries followBlocks
+        where
+```
+
+The labels that should be included in this loop's body are all those
+which can eventually come back to one of the entry points for the loop.
+
+Note that `IntMap.keysSet returns' == entries`. If some entry were
+not reachable from any other entry, then we would have split it off into
+a `Multiple` block first.
+
+```haskell
+        returns' = (strictReachableFrom `IntMap.intersection` blocks) `restrictKeys` entries
+        bodyBlocks = blocks `restrictKeys`
+            IntSet.unions (IntMap.keysSet returns' : IntMap.elems returns')
+```
+
+Now that we've identified which labels belong in the loop body, we can
+partition the current blocks into those that are inside the loop and
+those that follow it.
+
+```haskell
+        followBlocks = blocks `IntMap.difference` bodyBlocks
+```
+
+Any branches that go from inside this loop to outside it form the entry
+points for the block following this one. (There can't be any branches
+that go to someplace earlier in the program because we've already
+removed those before recursing into some loop that encloses this one.)
+
+```haskell
+        followEntries = outEdges bodyBlocks
+```
+
+At this point we've identified some branches as either a `break` (so
+it's in `followEntries`) or a `continue` (because it was one of this
+loop's entry points) branch. When we recurse to structure the body of
+this loop, we must not consider those branches again, so we delete them
+from the successors of all blocks inside the loop.
+
+Note that `structureEntries` for this loop block records the labels that
+are `continue` edges, and `structureEntries` for the subsequent block
+records the labels that are `break` edges, so we don't need to record
+any additional information here.
+
+If we fail to delete some branch back to the loop entry, then when we
+recurse we'll generate another `Loop` block, which might mean the
+algorithm never terminates.
+
+If we fail to delete some branch that exits the loop, I think the result
+will still be correct, but will have more `Multiple` blocks than
+necessary.
+
+```haskell
+        markEdge (GoTo label)
+            | label `IntSet.member` (followEntries `IntSet.union` entries)
+            = ExitTo label
+        markEdge edge = edge
+        blocks' = IntMap.map (\ (s, term) -> (s, fmap markEdge term)) bodyBlocks
+```
+
+Multiple-entry blocks
+---------------------
+
+Otherwise, we need to merge multiple control flow paths at this point,
+by constructing code that will dynamically check which path we're
+supposed to be on.
+
+In a `Multiple` block, we construct a separate handler for each entry
+label that we can safely split off. We make a recursive call for each
+handler, and one more for all the blocks we couldn't handle in this
+block.
+
+- If there are unhandled blocks, then each handler contains fewer blocks
+  than we started with. If we were able to handle all the entry labels,
+  then we've partitioned the blocks into at least two non-empty groups,
+  so each one is necessarily smaller than we started with. There must be
+  at least two entry labels because if there weren't any no-return
+  entries then we'd have constructed a loop, and if there were only one
+  no-return entry and no entries that can be returned to, we'd have
+  constructed a simple block.
+
+- Each handler consumes at least its entry label, so as long as we
+  generate at least one handler, the recursive call for the unhandled
+  blocks will have a smaller subproblem. We can only handle an entry
+  label if none of the other entry labels can, through any series of
+  branches, branch to this label. But because we aren't in the case
+  above for constructing a loop, we know that at least one entry label
+  has no branches into it, so we're guaranteed to consume at least one
+  block in this pass.
+
+```haskell
+    _ -> Structure
+        { structureEntries = entries
+        , structureBody = Multiple handlers []
+        } : relooper followEntries followBlocks
+        where
+```
+
+The elements in the `singlyReached` map are disjoint sets. Proof: keys
+in an `IntMap` are distinct by definition, and the values after `filter`
+are singleton sets; so after `flipEdges`, each distinct block can only
+be attached to one entry label.
+
+```haskell
+        reachableFrom = IntMap.unionWith IntSet.union (IntMap.fromSet IntSet.singleton entries) strictReachableFrom
+        singlyReached = flipEdges $ IntMap.filter (\ r -> IntSet.size r == 1) $ IntMap.map (IntSet.intersection entries) reachableFrom
+```
+
+Some subset of the entries are now associated with sets of labels that
+can only be reached via that entry. Mapping these to their corresponding
+blocks preserves the property that they're disjoint.
+
+In addition, only labels that are permitted to appear inside this
+`Multiple` block will remain after this. Labels which have already been
+assigned to a later block won't get duplicated into this one, so we'll
+have to generate code to ensure that control continues to the later
+copy.
+
+```haskell
+        handledEntries = IntMap.map (\ within -> blocks `restrictKeys` within) singlyReached
+```
+
+If one of the entry labels can reach another one, then the latter can't
+be handled in this `Multiple` block because we'd have no way to make
+control flow from one to the other. These unhandled entries must be
+handled in subsequent blocks.
+
+```haskell
+        unhandledEntries = entries `IntSet.difference` IntMap.keysSet handledEntries
+```
+
+All labels that are reachable only from the entry points that we _are_
+handling, however, will be placed somewhere inside this `Multiple`
+block. Labels that are left over will be placed somewhere after this
+block.
+
+```haskell
+        handledBlocks = IntMap.unions (IntMap.elems handledEntries)
+        followBlocks = blocks `IntMap.difference` handledBlocks
+```
+
+The block after this one will have an entry point for each of this
+block's unhandled entries, and in addition, one for each branch that
+leaves this `Multiple` block.
+
+```haskell
+        followEntries = unhandledEntries `IntSet.union` outEdges handledBlocks
+```
+
+Finally, we've partitioned the entries and labels into those which
+should be inside this `Multiple` block and those which should follow it.
+Recurse on each handled entry point and on the next block.
+
+```haskell
+        makeHandler entry blocks' = relooper (IntSet.singleton entry) blocks'
+        handlers = IntMap.mapWithKey makeHandler handledEntries
+
     where
-    grow from (BasicBlock _ term) rest = foldr (insertEdge from) rest term
-    insertEdge from to = IntMap.insertWith IntSet.union to (IntSet.singleton from)
+    strictReachableFrom = flipEdges (go (IntMap.map successors blocks))
+        where
+        grow r = IntMap.map (\ seen -> IntSet.unions $ seen : IntMap.elems (r `restrictKeys` seen)) r
+        go r = let r' = grow r in if r /= r' then go r' else r'
+
+restrictKeys :: IntMap.IntMap a -> IntSet.IntSet -> IntMap.IntMap a
+restrictKeys m s = m `IntMap.intersection` IntMap.fromSet (const ()) s
+
+outEdges :: IntMap.IntMap (StructureBlock s c) -> IntSet.IntSet
+outEdges blocks = IntSet.unions (map successors $ IntMap.elems blocks) `IntSet.difference` IntMap.keysSet blocks
+
+partitionMembers :: IntSet.IntSet -> IntSet.IntSet -> (IntSet.IntSet, IntSet.IntSet)
+partitionMembers a b = (a `IntSet.intersection` b, a `IntSet.difference` b)
+
+successors :: StructureBlock s c -> IntSet.IntSet
+successors (_, term) = IntSet.fromList [ target | GoTo target <- toList term ]
+
+flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
+flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
 ```
 
 
-Depth-First Ordering
---------------------
-
-Every algorithm below gets simpler and more efficient if we establish
-one simple invariant first:
-
-> If block `u` can branch to block `v`, then either the label for `u` is
-> less than the label for `v`, or that branch is returning to the
-> beginning of a loop.
-
-(Note that there are often multiple assignments of labels that satisfy
-this rule.)
-
-In some cases it's also useful to establish that every basic block in
-the control-flow graph is reachable by some path from the start of the
-function, and it turns out this is a convenient place to do that too.
-
-Let's explore how we can accomplish all that in a moment, but first, why
-is this a useful invariant?
-
-By re-labeling every basic block according to that rule, we get two
-benefits:
-
-1. If we know that there's a control-flow path from one basic block to
-another, then we can check which one should be earlier in the function
-by just checking which one has a smaller label.
-
-2. We can accumulate control-flow facts about all blocks in a single
-pass by processing blocks in label order. If computing a fact for a
-particular block depends only on data from blocks that came earlier,
-then we just need to process blocks in increasing order. If instead
-facts propagate from later blocks to earlier ones, then we should
-process blocks in decreasing order.
-
-Conveniently, we chose to store the collection of basic blocks in an
-`IntMap`, which provides efficient ways to work in either ascending or
-descending order by label. So all we have to do is re-number all the
-labels.
-
-(There's a nice bonus that this order makes the output of `prettyCFG`
-easier to understand, if you happen to be unlucky enough to need to
-inspect the raw basic blocks.)
-
-So how can we do this? Different authors call this a "reverse postorder"
-or just a "depth-first ordering". For the latter term, see the "red
-dragon" book: "Compilers: Principles, Techniques, and Tools", by Aho,
-Sethi, and Ullman, pages 660-664. The "reverse postorder" terminology
-seems to be more common today, and there's good background for it all
-over the web; see for example the Wikipedia article on
-[Data-flow analysis](https://en.wikipedia.org/wiki/Data-flow_analysis#The_order_matters).
-
-As hinted by the name, we can efficiently compute the desired ordering
-with a depth-first traversal of the control-flow graph. The general idea
-is that once we've finished traversing all the successors of a block, we
-can insert the block itself at the beginning of the ordering, because
-that way it appears before its successors. Once we've inserted all nodes
-into the list, we can assign successive labels to the blocks in the
-newly-computed order.
-
-An interesting thing happens if there's a basic block which is
-unreachable from the start node: that block won't be visited in the
-depth-first traversal, so it won't be assigned a new label. This
-implementation has a bonus feature that it simply deletes unreachable
-nodes.
+Eliminating unnecessary multiple-entry blocks
+---------------------------------------------
 
 ```haskell
+simplifyStructure :: Monoid s => [Structure s c] -> [Structure s c]
+simplifyStructure = foldr go [] . map descend
+    where
+    descend structure = structure { structureBody =
+        case structureBody structure of
+        Simple s term -> Simple s term
+        Multiple handlers unhandled ->
+            Multiple (IntMap.map simplifyStructure handlers) (simplifyStructure unhandled)
+        Loop body -> Loop (simplifyStructure body)
+    }
+```
+
+If there's a `Simple` block immediately followed by a `Multiple` block,
+then we know several useful facts immediately:
+
+- The `Simple` block terminates with a conditional branch, where both
+  targets are distinct `GoTo` labels. Otherwise, the next block wouldn't
+  have enough entry points to be a `Multiple` block.
+
+- Each target of the conditional branch either has a handler it can be
+  replaced by from the `Multiple` block, or it can be replaced with the
+  unhandled blocks.
+
+- Every non-empty branch of the `Multiple` block will be used by this
+  process, so no code will be lost.
+
+- This simplification never duplicates code.
+
+The one tricky thing here is that under some circumstances we need to
+ensure that there's a `mkGoto` statement emitted in some branches.
+Conveniently, here we can unconditionally insert an empty `Simple` block
+ending in a `GoTo` branch, and let `structureCFG` decide later whether
+that requires emitting any actual code.
+
+```haskell
+    go (Structure entries (Simple s term))
+       (Structure _ (Multiple handlers unhandled) : rest) =
+        Structure entries (Simple s (fmap rewrite term)) : rest
+        where
+        rewrite (GoTo to) = Nested
+            $ Structure (IntSet.singleton to) (Simple mempty (Branch (GoTo to)))
+            : IntMap.findWithDefault unhandled to handlers
+        rewrite _ = error ("simplifyStructure: Simple/Multiple invariants violated in " ++ show entries)
+
+    go block rest = block : rest
+
+-- We no longer care about ordering, but reachability needs to only include
+-- nodes that are reachable from the function entry, and this has the side
+-- effect of pruning unreachable nodes from the graph.
 depthFirstOrder :: CFG k s c -> CFG DepthFirst s c
 depthFirstOrder (CFG start blocks) = CFG start' blocks'
     where
@@ -468,268 +777,12 @@ depthFirstOrder (CFG start blocks) = CFG start' blocks'
 ```
 
 
-Dominators
-----------
-
-The "dominators" of a basic block are the blocks that you must pass
-through to get there. For example:
-
-- The entry node for the function dominates all blocks in the function,
-  because you can't reach any node unless you pass through the entry
-  node first.
-
-- Every node dominates itself. That's a tautology: if you got there, you
-  must have gotten there. (It's called "strictly dominating" if you
-  don't include nodes dominating themselves.)
-
-- The start of a loop dominates every block inside the loop body.
-
-- In code like:
-
-    ``` { .c .ignore }
-    A;
-    if(...)
-        B;
-    else
-        C;
-    D;
-    ```
-
-    `A` dominates all of `B`, `C`, and `D`. But `B` doesn't dominate
-    `D`, because it's possible to reach `D` without passing through `B`
-    by going through `C` instead; and similarly, `C` doesn't dominate
-    `D`, because you could have gone through `B`.
-
-- Dominance is transitive: If `A` dominates `B`, and `B` dominates `C`,
-  then `A` also dominates `C`.
-
-We'll use this information in several of the following algorithms so
-we'll look at what it's useful for then. For now, how can we compute it?
-
-The dominators for a block are the block itself, plus those nodes which
-dominate all the predecessors of the block. Let's consider a few
-cases...
-
-- If there are no loops, then all of a block's predecessors have earlier
-  labels in the depth-first ordering. That means that if we compute
-  dominators in increasing order by label, we can be certain we have all
-  the information we need by the time we get to each block.
-
-- If there's a loop, but the only way to enter the loop is through a
-  single node (usually called the "loop header"), then we can still
-  compute dominators in increasing order by label. In this case, when we
-  encounter predecessors that we haven't computed dominance for yet,
-  that means those are branches to a loop header from somewhere inside
-  the loop. A loop header dominates all blocks within the loop, and
-  since dominance is transitive, everything that dominates the loop
-  header also dominates every node within the loop. That means that
-  nodes inside the loop can't remove any nodes from the set of
-  dominators we'd compute by just using the earlier blocks' dominators,
-  so we can ignore the later blocks.
-
-- The only remaining possibility is if there's a loop that can be
-  entered via two or more nodes, like this fragment of C:
-
-    ``` { .c .ignore }
-    if(...) goto b;
-    for(;;) {
-        step1();
-    b:  step2();
-    }
-    ```
-
-    In that case, neither entry block for the loop dominates the other,
-    but computing dominators in depth-first order will assume that one
-    of them is a loop header, leading to incorrect results. In compilers
-    literature, this is called "irreducible control flow". For a classic
-    example of this, check out Tom Duff's original 1983 e-mail about
-    ["Duff's Device"](https://www.lysator.liu.se/c/duffs-device.html).
-
-In that last case, we can tell the control flow is irreducible by making
-a second pass of dominator computation over all the basic blocks, and
-checking whether any of the results changed after having later nodes'
-results available.
-
-We can even compute the correct dominators by re-running the computation
-repeatedly until the result stops changing. If control flow is
-reducible, this will stop after two passes.
-
-Many important data-flow analysis algorithms have trouble with
-irreducible control flow, not just dominator computation, so there's
-been lots written on the subject. But James Stanier and Des Watson's
-2010 paper,
-["A study of irreducibility in C programs"](http://onlinelibrary.wiley.com/doi/10.1002/spe.1059/abstract),
-is of particular interest. They examined 15 open source projects which
-together contained 1,709 "goto" statements. They found that out of
-10,427 functions, only 5 had irreducible control flow! In practice, this
-problem occurs extraordinarily rarely in real C programs.
-
-Based on those statistics, and because deciding what to generate is hard
-for irreducible control flow, we currently just detect this case here
-and report an error so later steps can assume the input is reducible.
-
-```haskell
-type Dominators = IntMap.IntMap IntSet.IntSet
-
-dominators :: CFG DepthFirst s c -> Either String Dominators
-dominators cfg@(CFG start blocks) = case foldl go IntMap.empty (IntMap.keys blocks) of
-    seen | all (check seen) (IntMap.keys blocks) -> Right seen
-    _ -> Left "irreducible control flow"
-    where
-    update _ label | label == start = IntSet.singleton start
-    update seen label = IntSet.insert label self
-        where
-        allPredecessors = predecessors cfg
-        selfPredecessors = maybe [] IntSet.toList (IntMap.lookup label allPredecessors)
-        predecessorDominators = mapMaybe (\ parent -> IntMap.lookup parent seen) selfPredecessors
-        self = case predecessorDominators of
-            [] -> IntSet.empty
-            _ -> foldr1 IntSet.intersection predecessorDominators
-
-    go seen label = IntMap.insert label (update seen label) seen
-    check seen label = Just (update seen label) == IntMap.lookup label seen
-```
-
-
-Finding loops
--------------
-
-To identify parts of the control-flow graph that represent loops, first
-we find those branches that go "backward".
-
-Each back-edge marks a loop where the loop header is the target of the
-back-edge, but several back-edges may branch to the same loop header. So
-we group back-edges by loop header.
-
-> **FIXME**: Because we reject irreducible control flow while computing
-> dominators, any "retreating edge" in the depth-first order is also a
-> back-edge to a loop header, so we could simplify this to finding edges
-> `(from, to)` where `to` is less than `from`. By contrast, this version
-> is correct for the general case. Which is the right choice for
-> pedagogy now? Which for a hypothetical future version that supports
-> irreducible control flow?
-
-```haskell
-backEdges :: CFG k s c -> Dominators -> IntMap.IntMap IntSet.IntSet
-backEdges cfg dom =
-    IntMap.filter (not . IntSet.null) $
-    IntMap.intersectionWith IntSet.intersection (flipEdges dom) $
-    predecessors cfg
-    where
-    flipEdges :: IntMap.IntMap IntSet.IntSet -> IntMap.IntMap IntSet.IntSet
-    flipEdges edges = IntMap.unionsWith IntSet.union [ IntMap.fromSet (const (IntSet.singleton from)) to | (from, to) <- IntMap.toList edges ]
-```
-
-Given the back-edges for a loop header, we can find the rest of the
-blocks that are part of that same loop.
-
-- The header is part of the loop.
-- Add the back-edge sources to the loop.
-- Aside from the header, for each node newly added to the loop, add its
-  predecessors, unless they're already there.
-
-```haskell
-type NaturalLoops = IntMap.IntMap IntSet.IntSet
-
-naturalLoops :: CFG k s c -> Dominators -> NaturalLoops
-naturalLoops cfg dom = IntMap.mapWithKey makeLoop (backEdges cfg dom)
-    where
-    makeLoop header inside = execState (growLoop inside) (IntSet.singleton header)
-    allPredecessors = predecessors cfg
-    growLoop toAdd = do
-        inLoop <- get
-        let new = toAdd `IntSet.difference` inLoop
-        unless (IntSet.null new) $ do
-            put (inLoop `IntSet.union` new)
-            growLoop (IntSet.unions (mapMaybe (\ label -> IntMap.lookup label allPredecessors) (IntSet.toList new)))
-```
-
-
-Finding loop exits
-------------------
-
-Once we know which blocks are loop headers and what blocks are in each
-loop, we can find the branches that leave each loop. We'll translate
-those as `break` statements if they go someplace after the loop, or
-`continue` statements if they go backward to the beginning of the
-current loop or an enclosing one.
-
-For `break` statements, we need to note which loop to exit, and it needs
-to be the outer-most loop that contains the `break` edge but does not
-contain its target. But determining which is the inner loop and which is
-the outer is extra work. Fortunately we don't actually need to do it.
-
-If loop A encloses loop B, the loop header for A must come before the
-header for B in a depth-first ordering. So visiting loops in depth-first
-order is good enough; we don't have to work out how the loops are nested
-first.
-
-```haskell
-data Exit = BreakFrom Label | Continue
-    deriving Show
-type Exits = Map.Map (Label, Label) Exit
-
-exitEdges :: CFG DepthFirst s c -> NaturalLoops -> Exits
-exitEdges (CFG _ blocks) = Map.unions . map eachLoop . IntMap.toList
-    where
-    successors = IntMap.map (\ (BasicBlock _ term) -> nub (toList term)) blocks
-    eachLoop (header, nodes) = Map.fromList
-        [ ((from, to), if to == header then Continue else BreakFrom header)
-        | from <- IntSet.toList nodes
-        , to <- IntMap.findWithDefault [] from successors
-        , to == header || to `IntSet.notMember` nodes
-        ]
-```
-
-A loop may have `break` edges to several different blocks, but we have
-to pick just one block to place immediately after the loop. Fortunately,
-either one of the candidates is reachable from all the others, or some
-of them return early and it doesn't matter where we place them. Once
-we've chosen a unique `break` target for a loop, we just need to mark
-all of its in-loop predecessors as exits.
-
-```haskell
-unifyBreaks :: CFG DepthFirst s c -> NaturalLoops -> (IntMap.IntMap Label, Exits)
-unifyBreaks cfg loops = (breaks, Map.fromList exits')
-    where
-    exits = exitEdges cfg loops
-    (breakList, continues) = partitionEithers
-        [ case exit of
-            BreakFrom header -> Left (header, IntSet.singleton to)
-            Continue -> Right orig
-        | orig@((_, to), exit) <- Map.toList exits
-        ]
-    breaks = IntMap.map IntSet.findMax (IntMap.fromListWith IntSet.union breakList)
-    breakExits header to = fromMaybe [] $ do
-        candidates <- IntMap.lookup to (predecessors cfg)
-        insideLoop <- IntMap.lookup header loops
-        return (IntSet.toList (candidates `IntSet.intersection` insideLoop))
-    exits' =
-        [ ((from, to), BreakFrom header)
-        | (header, to) <- IntMap.toList breaks
-        , from <- breakExits header to
-        ] ++ continues
-```
-
-
-Structuring the CFG
--------------------
+Generating final structured code
+--------------------------------
 
 With all the preliminary analyses out of the way, we're finally ready to
 turn a control-flow graph back into a structured program full of loops
 and `if`-statements!
-
-Since we need various analysis results available throughout the
-transformation, we'll just package them up into a new data type that we
-can pass around using a `Reader` monad.
-
-```haskell
-data StructureInput = StructureInput
-    { getDominators :: IntMap.IntMap IntSet.IntSet
-    , getExits :: Exits
-    , getLoops :: IntMap.IntMap (Maybe Label)
-    }
-```
 
 Since this module is not language-specific, the caller needs to provide
 functions for constructing `break`, `continue`, loop, and `if`
@@ -739,148 +792,50 @@ loop name from it, to support multi-level exits.
 ```haskell
 structureCFG
     :: Monoid s
-    => (Label -> s)
-    -> (Label -> s)
+    => (Maybe Label -> s)
+    -> (Maybe Label -> s)
     -> (Label -> s -> s)
     -> (c -> s -> s -> s)
+    -> (Label -> s)
+    -> ([(Label, s)] -> s -> s)
     -> CFG DepthFirst s c
-    -> Either String s
-structureCFG mkBreak mkContinue mkLoop mkIf cfg@(CFG start blocks) = runExcept $ do
-    doms <- except $ dominators cfg
-    let loops = naturalLoops cfg doms
-    let (breaks, exits) = unifyBreaks cfg loops
-    let input = StructureInput
-            { getDominators = doms
-            , getExits = exits
-            , getLoops = IntMap.map Just breaks `IntMap.union` IntMap.map (const Nothing) loops
-            }
-```
-
-Once we've computed all the analysis results, we walk backwards over all
-the blocks, structuring them one at a time. By going in the opposite of
-the depth-first ordering, we are guaranteed that when we structure a
-block, all of the blocks it branches to have been
-structured&mdash;except for back-edges to loop headers, which we handle
-separately.
-
-```haskell
-    (final, _) <- RWS.execRWST (mapM_ doBlock (IntMap.toDescList blocks)) input IntMap.empty
-```
-
-Structuring should use every block exactly once. Considering that the
-depth-first ordering already pruned any unreachable nodes, if there are
-any left over then we did not reach all the nodes in the control-flow
-graph.
-
-```haskell
-    case IntMap.toList final of
-        [(label, (body, _))] | label == start -> return body
-        pieces -> throwE $ "unconsumed blocks: " ++ show (map fst pieces)
+    -> s
+structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo [] mempty root
     where
-```
+    root = simplifyStructure (relooperRoot cfg)
+    foo exits next' = snd . foldr go (next', mempty)
+        where
+        go structure (next, rest) = (structureEntries structure, go' structure next `mappend` rest)
 
-To structure a basic block, we need to combine the block body with `if`,
-`break`, and `continue` statements as appropriate, and then wrap the
-whole thing in a `loop` if this is a loop header.
+        go' (Structure entries (Simple body term)) next = body `mappend` case term of
+                Unreachable -> mempty
+                Branch to -> branch to
+                CondBranch c t f -> mkIf c (branch t) (branch f)
+            where
+            branch (Nested nested) = foo exits next nested
+            branch to | structureLabel to `IntSet.member` next =
+                insertGoto (structureLabel to) (next, mempty)
+            branch (ExitTo to) | isJust target = insertGoto to (fromJust target)
+                where
+                inScope immediate (label, local) = do
+                    (follow, mkStmt) <- IntMap.lookup to local
+                    return (follow, mkStmt (immediate label))
+                target = msum (zipWith inScope (const Nothing : repeat Just) exits)
+            branch to = error ("structureCFG: label " ++ show (structureLabel to) ++ " is not a valid exit from " ++ show entries)
 
-Then we save the newly-structured block so that earlier nodes can
-consume it.
+            insertGoto _ (target, s) | IntSet.size target == 1 = s
+            insertGoto to (_, s) = mkGoto to `mappend` s
 
-```haskell
-    doBlock (label, BasicBlock body term) = do
-        loops <- RWS.asks getLoops
-        (wrapped, reachable) <- RWS.listen $ do
-            body' <- mappend body <$> doTerm label term
-            case IntMap.lookup label loops of
-                Nothing -> return body'
-                Just breakTo -> do
-                    after <- case breakTo of
-                        Nothing -> return mempty
-                        Just to -> join (consumeBlock label to)
-                    return (mkLoop label body' `mappend` after)
-        RWS.modify (IntMap.insert label (wrapped, IntSet.insert label reachable))
-```
+        go' (Structure _ (Multiple handlers unhandled)) next =
+            mkMatch [ (label, foo exits next body) | (label, body) <- IntMap.toList handlers ] (foo exits next unhandled)
 
-Consuming a block means looking it up in the blocks that have already
-been structured, and then removing it. This lets us enforce a rule that
-the structuring algorithm never duplicates code. If we try to consume a
-block a second time, then it will no longer be available and we can
-report an error.
-
-We also check that the block we want to consume is dominated by the
-block we're placing it after. This way we ensure we can't trigger the
-"block isn't available" error, because we'll only place a block after
-code that must execute in order to reach it.
-
-```haskell
-    consumeBlock from to = do
-        input <- RWS.ask
-        seen <- RWS.get
-        case IntMap.lookup to seen of
-            Nothing -> lift $ throwE $ "block " ++ show to ++ " isn't available from " ++ show from
-            Just (body, reachable) -> do
-                RWS.tell reachable
-                return $ if from `IntSet.notMember` IntMap.findWithDefault IntSet.empty to (getDominators input)
-                    then return mempty
-                    else do
-                        RWS.modify (IntMap.delete to)
-                        return body
-```
-
-`consumeBlock` assumes you're sure you want that block. When we're
-following branches from a terminator, though, we need to check if any of
-those branches are exit edges. If so, that's not the time to structure
-them; they'll get consumed later, when we process the loop's header,
-instead. Meanwhile we should just construct a `break` or `continue`
-statement.
-
-```haskell
-    followEdge from to = do
-        input <- RWS.ask
-        case Map.lookup (from, to) (getExits input) of
-            Just (BreakFrom header) -> return (return (mkBreak header))
-            Just Continue -> return (return (mkContinue to))
-            Nothing -> consumeBlock from to
-```
-
-Translating an `Unreachable` or unconditional `Branch` terminator is
-easy; there's either no code at all, or just the code from the next
-block, respectively.
-
-Conditional branches are trickier. We need to look at which blocks are
-reachable from the true and false branches, respectively, to identify
-one of these cases:
-
-- Each branch goes to a different block, and one or both blocks end with
-  a `return`, `break`, or `continue` statement.
-- Each branch goes to a different block, and once both sides finish,
-  control flow merges again. This should structure as an "if-then-else".
-- One branch goes to a block that eventually branches to the same place
-  as the other branch. This should produce an "if-then" statement with
-  no "else", although the condition may have to be negated in the
-  process.
-- Both branches go to the same block. The condition should be evaluated
-  for its side effects but the block should simply be placed, once,
-  after that.
-
-All of these come down to figuring out where control flow merges again
-after the conditional branch, because that "join point" (if one exists)
-should not be included in either branch of the conditional. If we did
-include it, that would cause us to try to consume the join point twice,
-leading to duplicate code at best.
-
-```haskell
-    doTerm _ Unreachable = return mempty
-    doTerm label (Branch to) = join (followEdge label to)
-    doTerm label (CondBranch c t f) = do
-        (consumeT, tReachable) <- RWS.listen (followEdge label t)
-        (consumeF, fReachable) <- RWS.listen (followEdge label f)
-        let joinPoint = fmap fst (IntSet.minView (tReachable `IntSet.intersection` fReachable))
-        let ifDisjoint consume l =
-                if Just l /= joinPoint then consume else return mempty
-        stmt <- mkIf c <$> ifDisjoint consumeT t <*> ifDisjoint consumeF f
-        after <- case joinPoint of
-            Just after -> join (consumeBlock label after)
-            Nothing -> return mempty
-        return (stmt `mappend` after)
+        go' (Structure entries (Loop body)) next = mkLoop label (foo exits' entries body)
+            where
+            label = IntSet.findMin entries
+            exits' =
+                ( label
+                , IntMap.union
+                    (IntMap.fromSet (const (entries, mkContinue)) entries)
+                    (IntMap.fromSet (const (next, mkBreak)) next)
+                ) : exits
 ```
