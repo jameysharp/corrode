@@ -2926,6 +2926,13 @@ that inserts a cast if and only if we need one.
 ```haskell
 castTo :: CType -> Result -> Rust.Expr
 castTo target source | resultType source == target = result source
+```
+
+Before we can generate any C-compatible cast from an array type, we need
+to turn it into a raw pointer first. Then we can try again to cast it to
+the desired type.
+
+```haskell
 castTo target (Result { resultType = IsArray mut _ el, result = source }) =
     castTo target Result
         { resultType = IsPtr mut el
@@ -2936,7 +2943,40 @@ castTo target (Result { resultType = IsArray mut _ el, result = source }) =
     method = case mut of
         Rust.Immutable -> "as_ptr"
         Rust.Mutable -> "as_mut_ptr"
+```
+
+Rust doesn't allow casting any other type directly to `bool`, so use the
+special-case boolean conversions defined below instead.
+
+```haskell
 castTo IsBool source = toBool source
+```
+
+Because of the way C integer literals are defined, it's very common for
+us to translate a literal as an `i32` and then discover that we actually
+want it to be a `u8`, or whatever. Simplifying `42i32 as (u8)` into just
+`42u8` not only makes the generated code easier to read and maintain,
+but it also enables the Rust compiler to give useful warnings about
+literals that are outside the legal range for their type.
+
+There is one caveat to this, however. Rust does not allow negative
+integer literals for unsigned types. It doesn't just warn about them;
+attempting it results in a compile-time error. The result we want is to
+wrap such negative values around as large positive values. Emitting a
+signed integer literal and then casting it to unsigned produces the
+right result, which is what we'd have done anyway without this
+simplification, so we can just suppress this rule in that case.
+
+```haskell
+castTo target@(IsInt{}) (Result { result = Rust.Lit (Rust.LitInt n repr _) })
+    = Rust.Lit (Rust.LitInt n repr (toRustType target))
+castTo (IsInt Signed w) (Result { result = Rust.Neg (Rust.Lit (Rust.LitInt n repr _)) })
+    = Rust.Neg (Rust.Lit (Rust.LitInt n repr (toRustType (IsInt Signed w))))
+```
+
+If none of the special cases apply, then emit a Rust cast expression.
+
+```haskell
 castTo target source = Rust.Cast (result source) (toRustType target)
 ```
 
