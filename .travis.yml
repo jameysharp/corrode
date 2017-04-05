@@ -28,8 +28,7 @@ install:
   - ghc --version
   - cabal install happy
   - cabal install alex
-  - cabal install --verbose
+  - cabal install --verbose --enable-tests
 
-# TODO: Add an example or other tests.
 script:
-  - true
+  - dist/build/tests/tests --quickcheck-tests 100000
