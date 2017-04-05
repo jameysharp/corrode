@@ -792,15 +792,15 @@ loop name from it, to support multi-level exits.
 ```haskell
 structureCFG
     :: Monoid s
-    => (Label -> s)
-    -> (Label -> s)
+    => (Maybe Label -> s)
+    -> (Maybe Label -> s)
     -> (Label -> s -> s)
     -> (c -> s -> s -> s)
     -> (Label -> s)
     -> ([(Label, s)] -> s -> s)
     -> CFG DepthFirst s c
     -> s
-structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty mempty root
+structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo [] mempty root
     where
     root = simplifyStructure (relooperRoot cfg)
     foo exits next' = snd . foldr go (next', mempty)
@@ -816,7 +816,11 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty memp
             branch to | structureLabel to `IntSet.member` next =
                 insertGoto (structureLabel to) (next, mempty)
             branch (ExitTo to) | isJust target = insertGoto to (fromJust target)
-                where target = IntMap.lookup to exits
+                where
+                inScope immediate (label, local) = do
+                    (follow, mkStmt) <- IntMap.lookup to local
+                    return (follow, mkStmt (immediate label))
+                target = msum (zipWith inScope (const Nothing : repeat Just) exits)
             branch to = error ("structureCFG: label " ++ show (structureLabel to) ++ " is not a valid exit from " ++ show entries)
 
             insertGoto _ (target, s) | IntSet.size target == 1 = s
@@ -828,9 +832,10 @@ structureCFG mkBreak mkContinue mkLoop mkIf mkGoto mkMatch cfg = foo mempty memp
         go' (Structure entries (Loop body)) next = mkLoop label (foo exits' entries body)
             where
             label = IntSet.findMin entries
-            exits' = IntMap.unions
-                [ exits
-                , IntMap.fromSet (const (entries, mkContinue label)) entries
-                , IntMap.fromSet (const (next, mkBreak label)) next
-                ]
+            exits' =
+                ( label
+                , IntMap.union
+                    (IntMap.fromSet (const (entries, mkContinue)) entries)
+                    (IntMap.fromSet (const (next, mkBreak)) next)
+                ) : exits
 ```

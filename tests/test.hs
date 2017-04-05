@@ -25,8 +25,8 @@ data Stmt
     = Stmt Int
     | Return
     | Loop Label [Stmt]
-    | Break Label
-    | Continue Label
+    | Break (Maybe Label)
+    | Continue (Maybe Label)
     | If Cond [Stmt] [Stmt]
     | Goto Int
     deriving (Show, Eq)
@@ -66,7 +66,10 @@ stmtToCFG = depthFirstOrder . staticCFG . runIdentity . buildCFG . convert [] ([
     convert loops term stmts = convert' loops term stmts >>= makeBlock
     convert' loops = foldrM go
         where
-        getLoop l = case lookup l loops of
+        getLoop Nothing = case loops of
+            (_, labels) : _ -> labels
+            [] -> error "stmtToCFG: loop exit without an enclosing loop"
+        getLoop (Just l) = case lookup l loops of
             Just labels -> labels
             Nothing -> error ("stmtToCFG: loop " ++ show l ++ " not in " ++ show loops)
         go Return _ = return ([Return], Unreachable)

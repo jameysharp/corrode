@@ -1999,8 +1999,8 @@ inside a `loop`.
 
 ```haskell
     loopLabel l = Rust.Lifetime ("loop" ++ show l)
-    mkBreak l = [Rust.Stmt (Rust.Break (Just (loopLabel l)))]
-    mkContinue l = [Rust.Stmt (Rust.Continue (Just (loopLabel l)))]
+    mkBreak l = [Rust.Stmt (Rust.Break (fmap loopLabel l))]
+    mkContinue l = [Rust.Stmt (Rust.Continue (fmap loopLabel l))]
     mkLoop l b = [Rust.Stmt (Rust.Loop (Just (loopLabel l)) (statementsToBlock b))]
     mkIf c t f = [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))]
 
