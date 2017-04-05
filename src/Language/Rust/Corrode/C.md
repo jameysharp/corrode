@@ -2987,6 +2987,20 @@ out how to turn the arbitrary scalar expression we have into a `bool`.
 
 ```haskell
 toBool :: Result -> Rust.Expr
+```
+
+To convert an integer literal expression to `bool`, we don't need to
+look at the type, just the value. We only convert the specific values 1
+and 0, because those are idiomatic representations of `true` and `false`
+in C. Any other values would be surprising if used in a boolean context
+and we choose to translate them more verbosely to call the developer's
+attention to them.
+
+```haskell
+toBool (Result { result = Rust.Lit (Rust.LitInt 0 _ _) })
+    = Rust.Lit (Rust.LitBool False)
+toBool (Result { result = Rust.Lit (Rust.LitInt 1 _ _) })
+    = Rust.Lit (Rust.LitBool True)
 toBool (Result { resultType = t, result = v }) = case t of
 ```
 
@@ -3019,6 +3033,10 @@ possible.
 
 ```haskell
 toNotBool :: Result -> Rust.Expr
+toNotBool (Result { result = Rust.Lit (Rust.LitInt 0 _ _) })
+    = Rust.Lit (Rust.LitBool True)
+toNotBool (Result { result = Rust.Lit (Rust.LitInt 1 _ _) })
+    = Rust.Lit (Rust.LitBool False)
 toNotBool (Result { resultType = t, result = v }) = case t of
     IsBool -> Rust.Not v
     IsPtr _ _ -> Rust.MethodCall v (Rust.VarName "is_null") []
