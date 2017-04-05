@@ -1784,7 +1784,10 @@ interpretStatement (CWhile c body doWhile _) next = do
     bodyLabel <- newLabel
     addBlock bodyLabel bodyEntry bodyTerm
 
-    addBlock headerLabel [] (CondBranch c' bodyLabel after)
+    addBlock headerLabel [] $ case toBool c' of
+        Rust.Lit (Rust.LitBool cont) | cont /= doWhile ->
+            Branch (if cont then bodyLabel else after)
+        _ -> CondBranch c' bodyLabel after
 
     (rest, end) <- next
     addBlock after rest end
