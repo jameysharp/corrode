@@ -617,7 +617,7 @@ block.
 ```haskell
     _ -> Structure
         { structureEntries = entries
-        , structureBody = Multiple handlers []
+        , structureBody = Multiple handlers unhandled
         } : relooper followEntries followBlocks
         where
 ```
@@ -675,11 +675,42 @@ leaves this `Multiple` block.
 
 Finally, we've partitioned the entries and labels into those which
 should be inside this `Multiple` block and those which should follow it.
-Recurse on each handled entry point and on the next block.
+Recurse on each handled entry point.
 
 ```haskell
         makeHandler entry blocks' = relooper (IntSet.singleton entry) blocks'
-        handlers = IntMap.mapWithKey makeHandler handledEntries
+        allHandlers = IntMap.mapWithKey makeHandler handledEntries
+```
+
+At this point we could throw all the handlers into a `Multiple` block
+and leave the `unhandled` portion empty. However, that generates code
+that is both more complicated than necessary, and sometimes wrong, in
+the case where we have a handler for every entry label. In that case, if
+control reaches the guard for the last handler, then the condition must
+always evaluate true, so we can replace a final `else if` statement with
+an unconditional `else`.
+
+We can prove this using our precise knowledge of the set of values that
+the current-block variable could have at this point. But very few
+compilers could prove it, because for the general case, tracking precise
+value sets is hard and compiler writers don't usually consider the
+effort worth-while.
+
+As a result, if this block is the last one in a function and every
+handler is supposed to return a value, a compiler that verifies that
+some value is returned on every path will conclude that some path is
+missing a `return` statement, even though we know that path is
+unreachable.
+
+So, if we have a handler for every entry point, pick one to be the
+`else` branch of this block. Otherwise, there is no `else` branch.
+
+```haskell
+        (unhandled, handlers) = if IntMap.keysSet allHandlers == entries
+            then
+                let (lastHandler, otherHandlers) = IntMap.deleteFindMax allHandlers
+                in (snd lastHandler, otherHandlers)
+            else ([], allHandlers)
 
     where
     strictReachableFrom = flipEdges (go (IntMap.map successors blocks))
