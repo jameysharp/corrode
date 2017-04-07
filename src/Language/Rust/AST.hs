@@ -322,7 +322,7 @@ instance Pretty Expr where
             clauses = (text "if" <+> go RightExpr 0 c <+> text "{", t) : ladder f
             hasStmt (_, Block [] _) = False
             hasStmt _ = True
-            body (pre, Block ss e) = pre : map (nest 4) (map pPrint ss ++ [maybe empty (go RightExpr 0) e])
+            body (pre, Block ss e) = pre : map (nest 4) (map pPrint ss ++ [maybe empty (go LeftExpr 0) e])
             ladder (Block [] Nothing) = []
             ladder (Block [] (Just (IfThenElse c' t' f'))) = elseIf c' t' f'
             ladder (Block [Stmt (IfThenElse c' t' f')] Nothing) = elseIf c' t' f'
