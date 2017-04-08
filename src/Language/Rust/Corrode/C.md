@@ -2232,15 +2232,12 @@ its result.
 ```haskell
 interpretExpr _ (CCast decl expr _) = do
     (_mut, ty) <- typeName decl
-    case ty of
-        IsVoid -> interpretExpr False expr
-        _ -> do
-            expr' <- interpretExpr True expr
-            return Result
-                { resultType = ty
-                , resultMutable = Rust.Immutable
-                , result = castTo ty expr'
-                }
+    expr' <- interpretExpr (ty /= IsVoid) expr
+    return Result
+        { resultType = ty
+        , resultMutable = Rust.Immutable
+        , result = (if ty == IsVoid then result else castTo ty) expr'
+        }
 ```
 
 We de-sugar the pre/post-increment/decrement operators into compound
