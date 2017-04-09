@@ -2105,7 +2105,15 @@ statementsToBlock [Rust.Stmt (Rust.BlockExpr stmts)] = stmts
 statementsToBlock stmts = Rust.Block stmts Nothing
 ```
 
-Assuming no two stack-allocated variables have the same name,
+We have to be particularly careful about how we generate `if`
+expressions when the result is not used. When most expressions are used
+as statements, it doesn't matter what type the expression has, because
+the result is ignored. But when a Rust `if`-expression is used as a
+statement, Rust requires its type to be `()`. We can ensure the type is
+correct by wrapping the true and false branches in statements rather
+than placing them as block-final expressions.
+
+Also, assuming no two stack-allocated variables have the same name,
 using a block expression as a statement is never necessary.
 
 Use this function instead of using the `Rust.Stmt` constructor directly
@@ -2113,6 +2121,10 @@ to ensure the necessary invariants are maintained everywhere.
 
 ```haskell
 exprToStatements :: Rust.Expr -> [Rust.Stmt]
+exprToStatements (Rust.IfThenElse c t f) =
+    [Rust.Stmt (Rust.IfThenElse c (extractExpr t) (extractExpr f))]
+    where
+    extractExpr = statementsToBlock . blockToStatements
 exprToStatements (Rust.BlockExpr b) = blockToStatements b
 exprToStatements e = [Rust.Stmt e]
 ```
@@ -2206,26 +2218,20 @@ interpretExpr demand expr@(CAssign op lhs rhs _) = do
 C's ternary conditional operator (`c ? t : f`) translates fairly
 directly to Rust's `if`/`else` expression.
 
-But we have to be particularly careful about how we generate `if`
-expressions when the result is not used. When most expressions are used
-as statements, it doesn't matter what type the expression has, because
-the result is ignored. But when a Rust `if`-expression is used as a
-statement, its type is required to be `()`. We can ensure the type is
-correct by wrapping the true and false branches in statements rather
-than placing them as block-final expressions.
-
 ```haskell
 interpretExpr demand expr@(CCond c (Just t) f _) = do
     c' <- fmap toBool (interpretExpr True c)
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
     if demand
-        then promotePtr expr (\ t'' f'' -> Rust.IfThenElse c' (Rust.Block [] (Just t'')) (Rust.Block [] (Just f''))) t' f'
+        then promotePtr expr (mkIf c') t' f'
         else return Result
             { resultType = IsVoid
             , resultMutable = Rust.Immutable
-            , result = Rust.IfThenElse c' (Rust.Block (resultToStatements t') Nothing) (Rust.Block (resultToStatements f') Nothing)
+            , result = mkIf c' (result t') (result f')
             }
+    where
+    mkIf c' t' f' = Rust.IfThenElse c' (Rust.Block [] (Just t')) (Rust.Block [] (Just f'))
 ```
 
 C's binary operators are complicated enough that, after translating the
@@ -2320,20 +2326,6 @@ because this operator is almost entirely useless. It's the arithmetic
 opposite of unary minus: where that operator negates its argument, this
 operator returns its argument unchanged. ...except that the "integer
 promotion" rules apply, so this operator may perform an implicit cast.
-
-Translating `+(c ? t : f);` is a particularly tricky corner case. The
-result is not demanded, and the unary plus operator doesn't generate
-any code, so the ternary conditional translates to an `if` expression in
-statement position, which means that its type is required to be `()`.
-(See the description for ternary conditional expressions, above.)
-
-This implementation handles that case by forwarding the value of
-`demand` to the recursive call that translates the ternary conditional.
-That call yields a `resultType` of `IsVoid` in response. `intPromote` is
-not actually supposed to be used on the `void` type, but since it
-doesn't know what to do with it it returns it unchanged, which makes
-`castTo` a no-op. End result: this corner case is translated exactly as
-if there had been no unary plus operator in the expression at all.
 
 ```haskell
     CPlusOp -> do
