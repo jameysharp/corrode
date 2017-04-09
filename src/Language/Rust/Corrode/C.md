@@ -1434,14 +1434,13 @@ exit status from `main`.
 ```haskell
     let ret = Rust.VarName "ret"
     emitItems [Rust.Item [] Rust.Private (
-        Rust.Function [] "main" [] (Rust.TypeName "()") (Rust.Block (
+        Rust.Function [] "main" [] (Rust.TypeName "()") (statementsToBlock (
             setup ++
             [ bind Rust.Immutable ret $
                 Rust.UnsafeExpr $ Rust.Block [] $ Just $
-                call realName args
-            , Rust.Stmt (call "::std::process::exit" [Rust.Var ret])
-            ]
-        ) Nothing))]
+                call realName args ] ++
+            exprToStatements (call "::std::process::exit" [Rust.Var ret])
+        )))]
     where
 ```
 
@@ -1514,11 +1513,11 @@ Unix-specific `OsStringExt` trait into scope.
                 chain "collect::<Vec<_>>" [] $
                 chain "map" [
                     Rust.Lambda [str] (Rust.BlockExpr (Rust.Block
-                        [ bind Rust.Mutable vec (chain "into_vec" [] (Rust.Var str))
-                        , Rust.Stmt (chain "push" [
+                        ( bind Rust.Mutable vec (chain "into_vec" [] (Rust.Var str))
+                        : exprToStatements (chain "push" [
                                 Rust.Lit (Rust.LitByteChar '\NUL')
                             ] (Rust.Var vec))
-                        ] (Just (Rust.Var vec))))
+                        ) (Just (Rust.Var vec))))
                 ] $
                 call "::std::env::args_os" []
 ```
@@ -1675,7 +1674,7 @@ expression, the result is discarded, so we pass `False`.
 interpretStatement (CExpr (Just expr) _) next = do
     expr' <- lift $ lift $ interpretExpr False expr
     (rest, end) <- next
-    return (Rust.Stmt (result expr') : rest, end)
+    return (resultToStatements expr' ++ rest, end)
 ```
 
 We could have a "compound statement", also known as a "block". A
@@ -1812,7 +1811,7 @@ interpretStatement (CFor initial mcond mincr body _) next = do
             Left Nothing -> return []
             Left (Just expr) -> do
                 expr' <- lift $ lift $ interpretExpr False expr
-                return (exprToStatements expr')
+                return (resultToStatements expr')
             Right decls -> lift $ lift $ interpretDeclarations makeLetBinding decls
 
         headerLabel <- newLabel
@@ -1821,7 +1820,7 @@ interpretStatement (CFor initial mcond mincr body _) next = do
             Just incr -> do
                 incr' <- lift $ lift $ interpretExpr False incr
                 incrLabel <- newLabel
-                addBlock incrLabel (exprToStatements incr') (Branch headerLabel)
+                addBlock incrLabel (resultToStatements incr') (Branch headerLabel)
                 return incrLabel
 
         (bodyEntry, bodyTerm) <- setBreak after $ setContinue incrLabel $
@@ -1888,7 +1887,7 @@ interpretStatement stmt@(CReturn expr _) next = do
             Nothing -> badSource stmt "return statement outside function"
             Just retTy -> do
                 expr' <- mapM (fmap (castTo retTy) . interpretExpr True) expr
-                return ([Rust.Stmt (Rust.Return expr')], Unreachable)
+                return (exprToStatements (Rust.Return expr'), Unreachable)
 ```
 
 Otherwise, this is a type of statement we haven't implemented a
@@ -2003,17 +2002,17 @@ inside a `loop`.
 
 ```haskell
     loopLabel l = Rust.Lifetime ("loop" ++ show l)
-    mkBreak l = [Rust.Stmt (Rust.Break (fmap loopLabel l))]
-    mkContinue l = [Rust.Stmt (Rust.Continue (fmap loopLabel l))]
-    mkLoop l b = [Rust.Stmt (Rust.Loop (Just (loopLabel l)) (statementsToBlock b))]
-    mkIf c t f = [Rust.Stmt (simplifyIf c (statementsToBlock t) (statementsToBlock f))]
+    mkBreak l = exprToStatements (Rust.Break (fmap loopLabel l))
+    mkContinue l = exprToStatements (Rust.Continue (fmap loopLabel l))
+    mkLoop l b = exprToStatements (Rust.Loop (Just (loopLabel l)) (statementsToBlock b))
+    mkIf c t f = exprToStatements (simplifyIf c (statementsToBlock t) (statementsToBlock f))
 
     currentBlock = Rust.VarName "_currentBlock"
     declCurrent = Rust.Let Rust.Mutable currentBlock Nothing Nothing
-    mkGoto l = [Rust.Stmt (Rust.Assign (Rust.Var currentBlock) (Rust.:=) (fromIntegral l))]
+    mkGoto l = exprToStatements (Rust.Assign (Rust.Var currentBlock) (Rust.:=) (fromIntegral l))
     mkMatch = flip (foldr go)
         where
-        go (l, t) f = [Rust.Stmt (Rust.IfThenElse (Rust.CmpEQ (Rust.Var currentBlock) (fromIntegral l)) (statementsToBlock t) (statementsToBlock f))]
+        go (l, t) f = exprToStatements (Rust.IfThenElse (Rust.CmpEQ (Rust.Var currentBlock) (fromIntegral l)) (statementsToBlock t) (statementsToBlock f))
 ```
 
 To generate code that's as clear as possible, we handle some interesting
@@ -2063,30 +2062,6 @@ interpretBlockItem (CBlockDecl decl) next = do
 interpretBlockItem item _ = lift $ lift (unimplemented item)
 ```
 
-`exprToStatements` is a helper function which turns a Rust expression
-result into a list of Rust statements. It's always possible to do this by
-extracting the expression and wrapping it in the `Rust.Stmt` constructor,
-but there are a bunch of places in this translation where we don't want to
-have to think about whether the expression is already a block expression to
-avoid inserting excess pairs of curly braces everywhere.
-
-```haskell
-exprToStatements :: Result -> [Rust.Stmt]
-exprToStatements Result{ result = Rust.BlockExpr (Rust.Block stmts Nothing) } = stmts
-exprToStatements Result{ result = e } = [Rust.Stmt e]
-```
-
-`statementsToBlock` is a similar helper function which turns a list of
-Rust statements into a block. As before, this can always be done with the
-`Rust.Block` constructor, but again this is a convenient way to avoid
-inserting excess pairs of curly braces everywhere.
-
-```haskell
-statementsToBlock :: [Rust.Stmt] -> Rust.Block
-statementsToBlock [Rust.Stmt (Rust.BlockExpr stmts)] = stmts
-statementsToBlock stmts = Rust.Block stmts Nothing
-```
-
 `scope` runs the translation steps in `m`, but then throws away any
 changes that `m` made to the environment. Any items added to the output
 are kept, though, as are any global state changes.
@@ -2100,6 +2075,46 @@ scope m = do
     -- Restore the environment to its state before running m.
     lift (modify (\ st -> old { globalState = globalState st }))
     return a
+```
+
+
+Smart constructors for blocks and statements
+--------------------------------------------
+
+Sometimes we generate a block and then discover that we aren't going to
+use the final result from the block. In that case, if there is a final
+expression at the end of the block, we can turn it into a statement and
+append it to the rest of the statements.
+
+```haskell
+blockToStatements :: Rust.Block -> [Rust.Stmt]
+blockToStatements (Rust.Block stmts mexpr) = case mexpr of
+    Just expr -> stmts ++ exprToStatements expr
+    Nothing -> stmts
+```
+
+There's no point wrapping a new block around a list of statements if the
+only statement in the list is, itself, a block.
+
+Use this function instead of the `Rust.Block` constructor when there's
+no final expression for the block.
+
+```haskell
+statementsToBlock :: [Rust.Stmt] -> Rust.Block
+statementsToBlock [Rust.Stmt (Rust.BlockExpr stmts)] = stmts
+statementsToBlock stmts = Rust.Block stmts Nothing
+```
+
+Assuming no two stack-allocated variables have the same name,
+using a block expression as a statement is never necessary.
+
+Use this function instead of using the `Rust.Stmt` constructor directly
+to ensure the necessary invariants are maintained everywhere.
+
+```haskell
+exprToStatements :: Rust.Expr -> [Rust.Stmt]
+exprToStatements (Rust.BlockExpr b) = blockToStatements b
+exprToStatements e = [Rust.Stmt e]
 ```
 
 
@@ -2124,6 +2139,14 @@ data Result = Result
     , resultMutable :: Rust.Mutable
     , result :: Rust.Expr
     }
+```
+
+`resultToStatements` is a convenience wrapper to lift `exprToStatements`
+to operate on `Result`s.
+
+```haskell
+resultToStatements :: Result -> [Rust.Stmt]
+resultToStatements = exprToStatements . result
 ```
 
 ```haskell
@@ -2160,12 +2183,12 @@ semicolon-terminated instead of semicolon-separated.
 ```haskell
 interpretExpr demand (CComma exprs _) = do
     let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
-    effects' <- mapM (fmap (Rust.Stmt . result) . interpretExpr False) effects
+    effects' <- mapM (fmap resultToStatements . interpretExpr False) effects
     mfinal' <- mapM (interpretExpr True) mfinal
     return Result
         { resultType = maybe IsVoid resultType mfinal'
         , resultMutable = maybe Rust.Immutable resultMutable mfinal'
-        , result = Rust.BlockExpr (Rust.Block effects' (fmap result mfinal'))
+        , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result mfinal'))
         }
 ```
 
@@ -2201,7 +2224,7 @@ interpretExpr demand expr@(CCond c (Just t) f _) = do
         else return Result
             { resultType = IsVoid
             , resultMutable = Rust.Immutable
-            , result = Rust.IfThenElse c' (Rust.Block (exprToStatements t') Nothing) (Rust.Block (exprToStatements f') Nothing)
+            , result = Rust.IfThenElse c' (Rust.Block (resultToStatements t') Nothing) (Rust.Block (resultToStatements f') Nothing)
             }
 ```
 
@@ -2844,7 +2867,7 @@ let-bindings, then we don't need a block expression at all and can just
 return the assignment expression by itself.
 
 ```haskell
-    return $ case Rust.Block (bindings1 ++ bindings2 ++ [Rust.Stmt assignment]) ret of
+    return $ case Rust.Block (bindings1 ++ bindings2 ++ exprToStatements assignment) ret of
         b@(Rust.Block body Nothing) -> Result
             { resultType = IsVoid
             , resultMutable = Rust.Immutable
