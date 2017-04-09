@@ -3595,15 +3595,18 @@ Now it's time to translate all the types we need for the fields of this
 C allows assigning `struct` variables to each other and passing copies
 of them by value to function calls. To allow the same behavior in Rust,
 we need an implementation of the `Copy` trait, and that requires `Clone`
-as well. Fortunately we can ask the compiler to auto-generate both
-implementations.
+as well. Usually we would auto-derive both of these traits but unfortunately
+with a size larger than 32 do not implement `Clone`. They do however always
+implement `Copy` (as long as their elements can be copied) so we generate
+an explicit `Clone` implementation which simply copies the struct.
 
 We also request that the Rust compiler lay out the fields of this
 `struct` using the same rules as the C ABI for the target platform.
 
 ```haskell
-            let attrs = [Rust.Attribute "derive(Clone, Copy)", Rust.Attribute "repr(C)"]
-            emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])]
+            let attrs = [Rust.Attribute "derive(Copy)", Rust.Attribute "repr(C)"]
+            emitItems [Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ]),
+                Rust.Item [] Rust.Private (Rust.CloneImpl (Rust.TypeName name))]
             return (IsStruct name fields)
 ```
 

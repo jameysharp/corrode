@@ -128,6 +128,7 @@ data ItemKind
     | Extern [ExternItem]
     | Use String
     | Enum String [Enumerator]
+    | CloneImpl Type
     deriving Show
 
 instance Pretty ItemKind where
@@ -156,6 +157,12 @@ instance Pretty ItemKind where
         text "enum" <+> text name <+> text "{" $+$
         nest 4 (vcat [ pPrint enum <> text "," | enum <- enums ]) $+$
         text "}"
+    pPrint (CloneImpl ty) =
+        hsep [text "impl", text "Clone", text "for", pPrint ty] <+> text "{" $+$
+            nest 4 (text "fn" <+> text "clone" <> parens (text "&self") <+> text "{" <+>
+                nest 4 (text "*self") <+>
+                text "}") $+$
+            text "}"
 
 data ExternItem
     = ExternFn String [(Var, Type)] Bool Type
