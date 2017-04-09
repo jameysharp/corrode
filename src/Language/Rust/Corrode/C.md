@@ -1337,10 +1337,32 @@ Add each formal parameter into the new environment, as a symbol.
                     ]
 ```
 
+C's main function are allowed to omit the return statement at the end of
+the function in which case it should return 0.
+
+```haskell
+                let cBody = if name == "_c_main"
+                    then
+                        case body of
+                            CCompound ids items x ->
+                                let needsReturn (CBlockStmt (CReturn _ _):_) = False
+                                    needsReturn (CBlockStmt _:xs) = True
+                                    needsReturn (_:xs) = needsReturn xs
+                                    needsReturn [] = True
+
+                                    returnStatement =
+                                        if needsReturn (reverse items) then
+                                            [CBlockStmt (CReturn (Just (CConst (CIntConst (cInteger 0) undefNode))) undefNode)]
+                                        else []
+                                in CCompound ids (items ++ returnStatement) x
+                            _ -> body 
+                    else body
+```
+
 Interpret the body of the function.
 
 ```haskell
-                body' <- cfgToRust declr (interpretStatement body (return ([], Unreachable)))
+                body' <- cfgToRust declr (interpretStatement cBody (return ([], Unreachable)))
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
