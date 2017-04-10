@@ -348,14 +348,18 @@ getSymbolIdent ident = do
         return $ Just Result
             { resultType = IsArray Rust.Immutable (length name' + 1) charType
             , resultMutable = Rust.Immutable
+            , resultBefore = []
             , result = Rust.Deref (Rust.Lit (Rust.LitByteStr (name' ++ "\NUL")))
+            , resultAfter = []
             }
     builtinSymbols =
         [ ("__builtin_bswap" ++ show w, Result
             { resultType = IsFunc (IsInt Unsigned (BitWidth w))
                 [(Nothing, IsInt Unsigned (BitWidth w))] False
             , resultMutable = Rust.Immutable
+            , resultBefore = []
             , result = Rust.Path (Rust.PathSegments ["u" ++ show w, "swap_bytes"])
+            , resultAfter = []
             })
         | w <- [16, 32, 64]
         ]
@@ -363,14 +367,18 @@ getSymbolIdent ident = do
         [ ("__FILE__", Result
             { resultType = IsPtr Rust.Immutable charType
             , resultMutable = Rust.Immutable
+            , resultBefore = []
             , result = Rust.MethodCall (
                     Rust.Call (Rust.Var (Rust.VarName "file!")) []
                 ) (Rust.VarName "as_ptr") []
+            , resultAfter = []
             })
         , ("__LINE__", Result
             { resultType = IsInt Unsigned (BitWidth 32)
             , resultMutable = Rust.Immutable
+            , resultBefore = []
             , result = Rust.Call (Rust.Var (Rust.VarName "line!")) []
+            , resultAfter = []
             })
         ]
 
@@ -394,7 +402,9 @@ addSymbolIdent ident (mut, ty) = do
     addSymbolIdentAction ident $ return Result
         { resultType = ty
         , resultMutable = mut
+        , resultBefore = []
         , result = Rust.Path (Rust.PathSegments [name])
+        , resultAfter = []
         }
     return name
 
@@ -1615,7 +1625,9 @@ instance Monoid SwitchCases where
         eitherCase lhs rhs = Result
             { resultType = IsBool
             , resultMutable = Rust.Immutable
+            , resultBefore = resultBefore lhs ++ resultBefore rhs
             , result = Rust.LOr (toBool lhs) (toBool rhs)
+            , resultAfter = resultAfter lhs ++ resultAfter rhs
             }
 ```
 
@@ -1708,6 +1720,7 @@ that branch or not.
 ```haskell
 interpretStatement (CIf c t mf _) next = do
     c' <- lift $ lift $ interpretExpr True c
+    (before, cond) <- lift $ lift $ resultAtSequencePoint c'
     after <- newLabel
 
     falseLabel <- case mf of
@@ -1725,7 +1738,7 @@ interpretStatement (CIf c t mf _) next = do
     (rest, end) <- next
     addBlock after rest end
 
-    return ([], CondBranch c' trueLabel falseLabel)
+    return (before, CondBranch c' { result = cond } trueLabel falseLabel)
 ```
 
 ```haskell
@@ -1773,7 +1786,9 @@ loop body must be a block.
 
 ```haskell
 interpretStatement (CWhile c body doWhile _) next = do
-    c' <- lift $ lift $ interpretExpr True c
+    rawC <- lift $ lift $ interpretExpr True c
+    (before, cond) <- lift $ lift $ resultAtSequencePoint rawC
+    let c' = rawC { result = cond }
     after <- newLabel
 
     headerLabel <- newLabel
@@ -1783,7 +1798,7 @@ interpretStatement (CWhile c body doWhile _) next = do
     bodyLabel <- newLabel
     addBlock bodyLabel bodyEntry bodyTerm
 
-    addBlock headerLabel [] $ case toBool c' of
+    addBlock headerLabel before $ case toBool c' of
         Rust.Lit (Rust.LitBool cont) | cont /= doWhile ->
             Branch (if cont then bodyLabel else after)
         _ -> CondBranch c' bodyLabel after
@@ -2093,6 +2108,12 @@ blockToStatements (Rust.Block stmts mexpr) = case mexpr of
     Nothing -> stmts
 ```
 
+```haskell
+blockToExpr :: [Rust.Stmt] -> Maybe Rust.Expr -> Rust.Expr
+blockToExpr [] (Just e) = e
+blockToExpr stmts final = Rust.BlockExpr (Rust.Block stmts final)
+```
+
 There's no point wrapping a new block around a list of statements if the
 only statement in the list is, itself, a block.
 
@@ -2149,7 +2170,9 @@ can be combined into the larger expression that we're building up.
 data Result = Result
     { resultType :: CType
     , resultMutable :: Rust.Mutable
+    , resultBefore :: [Rust.Stmt]
     , result :: Rust.Expr
+    , resultAfter :: [Rust.Stmt]
     }
 ```
 
@@ -2158,7 +2181,21 @@ to operate on `Result`s.
 
 ```haskell
 resultToStatements :: Result -> [Rust.Stmt]
-resultToStatements = exprToStatements . result
+resultToStatements r = concat
+    [ resultBefore r
+    , exprToStatements (result r)
+    , resultAfter r
+    ]
+```
+
+```haskell
+resultAtSequencePoint :: Result -> EnvMonad s ([Rust.Stmt], Rust.Expr)
+resultAtSequencePoint r = case resultAfter r of
+    [] -> return (resultBefore r, result r)
+    after -> do
+        var <- fmap Rust.VarName (uniqueName "temp")
+        let binding = Rust.Let Rust.Immutable var (Just (toRustType (resultType r))) (Just (result r))
+        return (resultBefore r ++ binding : after, Rust.Var var)
 ```
 
 ```haskell
@@ -2166,7 +2203,9 @@ typeToResult :: IntermediateType -> Rust.Expr -> Result
 typeToResult itype expr = Result
     { resultType = typeRep itype
     , resultMutable = typeMutable itype
+    , resultBefore = []
     , result = expr
+    , resultAfter = []
     }
 ```
 
@@ -2194,14 +2233,9 @@ semicolon-terminated instead of semicolon-separated.
 
 ```haskell
 interpretExpr demand (CComma exprs _) = do
-    let (effects, mfinal) = if demand then (init exprs, Just (last exprs)) else (exprs, Nothing)
-    effects' <- mapM (fmap resultToStatements . interpretExpr False) effects
-    mfinal' <- mapM (interpretExpr True) mfinal
-    return Result
-        { resultType = maybe IsVoid resultType mfinal'
-        , resultMutable = maybe Rust.Immutable resultMutable mfinal'
-        , result = Rust.BlockExpr (Rust.Block (concat effects') (fmap result mfinal'))
-        }
+    effects <- mapM (interpretExpr False) (init exprs)
+    final <- interpretExpr demand (last exprs)
+    return final { resultBefore = concatMap resultToStatements effects ++ resultBefore final }
 ```
 
 C's assignment operator is complicated enough that, after translating
@@ -2220,18 +2254,24 @@ directly to Rust's `if`/`else` expression.
 
 ```haskell
 interpretExpr demand expr@(CCond c (Just t) f _) = do
-    c' <- fmap toBool (interpretExpr True c)
+    (beforeCond, c') <- resultAtSequencePoint =<< interpretExpr True c
     t' <- interpretExpr demand t
     f' <- interpretExpr demand f
-    if demand
-        then promotePtr expr (mkIf c') t' f'
-        else return Result
+    case (resultType t', resultType f') of
+        (IsVoid, IsVoid) -> return Result
             { resultType = IsVoid
             , resultMutable = Rust.Immutable
-            , result = mkIf c' (result t') (result f')
+            , resultBefore = beforeCond
+            , result = Rust.IfThenElse c'
+                (statementsToBlock (resultToStatements t'))
+                (statementsToBlock (resultToStatements f'))
+            , resultAfter = []
             }
-    where
-    mkIf c' t' f' = Rust.IfThenElse c' (Rust.Block [] (Just t')) (Rust.Block [] (Just f'))
+        _ -> do
+            (beforeT, resultT) <- resultAtSequencePoint t'
+            (beforeF, resultF) <- resultAtSequencePoint f'
+            let mkIf castT castF = Rust.IfThenElse c' (Rust.Block beforeT (Just castT)) (Rust.Block beforeF (Just castF))
+            promotePtr expr mkIf t' { result = resultT } f' { result = resultF }
 ```
 
 C's binary operators are complicated enough that, after translating the
@@ -2262,7 +2302,7 @@ its result.
 interpretExpr _ (CCast decl expr _) = do
     (_mut, ty) <- typeName decl
     expr' <- interpretExpr (ty /= IsVoid) expr
-    return Result
+    return expr'
         { resultType = ty
         , resultMutable = Rust.Immutable
         , result = (if ty == IsVoid then result else castTo ty) expr'
@@ -2297,7 +2337,7 @@ real C compiler.
     CAdrOp -> do
         expr' <- interpretExpr True expr
         let ty' = IsPtr (resultMutable expr') (resultType expr')
-        return Result
+        return expr'
             { resultType = ty'
             , resultMutable = Rust.Immutable
             , result = Rust.Cast (Rust.Borrow (resultMutable expr') (result expr')) (toRustType ty')
@@ -2312,7 +2352,7 @@ on whether the pointer was to a mutable value.
     CIndOp -> do
         expr' <- interpretExpr True expr
         case resultType expr' of
-            IsPtr mut' ty' -> return Result
+            IsPtr mut' ty' -> return expr'
                 { resultType = ty'
                 , resultMutable = mut'
                 , result = Rust.Deref (result expr')
@@ -2331,7 +2371,7 @@ promotion" rules apply, so this operator may perform an implicit cast.
     CPlusOp -> do
         expr' <- interpretExpr demand expr
         let ty' = intPromote (resultType expr')
-        return Result
+        return expr'
             { resultType = ty'
             , resultMutable = Rust.Immutable
             , result = castTo ty' expr'
@@ -2360,7 +2400,7 @@ extra "not" operators by creating a special-case `toNotBool` variant of
 ```haskell
     CNegOp -> do
         expr' <- interpretExpr True expr
-        return Result
+        return expr'
             { resultType = IsBool
             , resultMutable = Rust.Immutable
             , result = toNotBool expr'
@@ -2376,12 +2416,14 @@ Common helpers for the unary operators:
         compound node returnOld demand assignop expr' Result
             { resultType = IsInt Signed (BitWidth 32)
             , resultMutable = Rust.Immutable
+            , resultBefore = []
             , result = 1
+            , resultAfter = []
             }
     simple f = do
         expr' <- interpretExpr True expr
         let ty' = intPromote (resultType expr')
-        return Result
+        return expr'
             { resultType = ty'
             , resultMutable = Rust.Immutable
             , result = f (castTo ty' expr')
@@ -2423,12 +2465,12 @@ interpretExpr _ expr@(CIndex lhs rhs _) = do
     lhs' <- interpretExpr True lhs
     rhs' <- interpretExpr True rhs
     case (resultType lhs', resultType rhs') of
-        (IsArray mut _ el, _) -> return (subscript mut el (result lhs') rhs')
-        (_, IsArray mut _ el) -> return (subscript mut el (result rhs') lhs')
+        (IsArray mut _ el, _) -> return (subscript mut el lhs' rhs')
+        (_, IsArray mut _ el) -> return (subscript mut el rhs' lhs')
         _ -> do
             ptr <- binop expr CAddOp lhs' rhs'
             case resultType ptr of
-                IsPtr mut ty -> return Result
+                IsPtr mut ty -> return ptr
                     { resultType = ty
                     , resultMutable = mut
                     , result = Rust.Deref (result ptr)
@@ -2438,7 +2480,9 @@ interpretExpr _ expr@(CIndex lhs rhs _) = do
     subscript mut el arr idx = Result
         { resultType = el
         , resultMutable = mut
-        , result = Rust.Index arr (castTo (IsInt Unsigned WordWidth) idx)
+        , resultBefore = resultBefore arr ++ resultBefore idx
+        , result = Rust.Index (result arr) (castTo (IsInt Unsigned WordWidth) idx)
+        , resultAfter = resultAfter arr ++ resultAfter idx
         }
 ```
 
@@ -2447,14 +2491,17 @@ function to call, and any argument expressions.
 
 ```haskell
 interpretExpr _ expr@(CCall func args _) = do
-    func' <- interpretExpr True func
-    case resultType func' of
+    funcResult <- interpretExpr True func
+    (beforeFunc, func') <- resultAtSequencePoint funcResult
+    case resultType funcResult of
         IsFunc retTy argTys variadic -> do
-            args' <- castArgs variadic (map snd argTys) args
+            (beforeArgs, args') <- fmap unzip . mapM resultAtSequencePoint =<< castArgs variadic (map snd argTys) args
             return Result
                 { resultType = retTy
                 , resultMutable = Rust.Immutable
-                , result = Rust.Call (result func') args'
+                , resultBefore = concat (beforeFunc : beforeArgs)
+                , result = Rust.Call func' args'
+                , resultAfter = []
                 }
         _ -> badSource expr "function call to non-function"
     where
@@ -2476,7 +2523,7 @@ type specified, or it's a syntax error.
     castArgs variadic (ty : tys) (arg : rest) = do
         arg' <- interpretExpr True arg
         args' <- castArgs variadic tys rest
-        return (castTo ty arg' : args')
+        return (castToResult ty arg' : args')
     castArgs True [] rest = mapM (fmap promoteArg . interpretExpr True) rest
     castArgs False [] _ = badSource expr "arguments (too many)"
     castArgs _ _ [] = badSource expr "arguments (too few)"
@@ -2489,11 +2536,11 @@ with an empty argument list (`foo()`) or implicitly declared due to a
 lack of a prototype, except we don't allow either of those cases.
 
 ```haskell
-    promoteArg :: Result -> Rust.Expr
+    promoteArg :: Result -> Result
     promoteArg r = case resultType r of
-        IsFloat _ -> castTo (IsFloat 64) r
-        IsArray mut _ el -> castTo (IsPtr mut el) r
-        ty -> castTo (intPromote ty) r
+        IsFloat _ -> castToResult (IsFloat 64) r
+        IsArray mut _ el -> castToResult (IsPtr mut el) r
+        ty -> castToResult (intPromote ty) r
 ```
 
 Structure member access has two forms in C (`.` and `->`), which only
@@ -2518,9 +2565,8 @@ interpretExpr _ expr@(CMember obj ident deref node) = do
     ty <- case lookup field fields of
         Just ty -> return ty
         Nothing -> badSource expr "request for non-existent field"
-    return Result
+    return obj'
         { resultType = ty
-        , resultMutable = resultMutable obj'
         , result = Rust.Member (result obj') (Rust.VarName field)
         }
 ```
@@ -2598,7 +2644,9 @@ syntax.
     CCharConst (CChar ch False) _ -> return Result
         { resultType = charType
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.Lit (Rust.LitByteChar ch)
+        , resultAfter = []
         }
 ```
 
@@ -2616,7 +2664,9 @@ lifetime, the resulting raw pointer is always safe to use.
     CStrConst (CString str False) _ -> return Result
         { resultType = IsArray Rust.Immutable (length str + 1) charType
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.Deref (Rust.Lit (Rust.LitByteStr (str ++ "\NUL")))
+        , resultAfter = []
         }
     _ -> unimplemented expr
     where
@@ -2637,7 +2687,9 @@ need to match C's rules instead.
     literalNumber ty lit = Result
         { resultType = ty
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.Lit (lit (toRustType ty))
+        , resultAfter = []
         }
 ```
 
@@ -2651,7 +2703,9 @@ interpretExpr _ (CCompoundLit decl initials info) = do
     return Result
         { resultType = ty
         , resultMutable = mut
+        , resultBefore = []
         , result = final
+        , resultAfter = []
         }
 ```
 
@@ -2660,16 +2714,21 @@ Rust block expressions.
 
 ```haskell
 interpretExpr demand stat@(CStatExpr (CCompound [] stmts _) _) = scope $ do
-    let (effects, final) = case last stmts of
+    let (effects, mfinal) = case last stmts of
             CBlockStmt (CExpr expr _) | demand -> (init stmts, expr)
             _ -> (stmts, Nothing)
     effects' <- cfgToRust stat (foldr interpretBlockItem (return ([], Unreachable)) effects)
-    final' <- mapM (interpretExpr True) final
-    return Result
-        { resultType = maybe IsVoid resultType final'
-        , resultMutable = maybe Rust.Immutable resultMutable final'
-        , result = Rust.BlockExpr (Rust.Block effects' (fmap result final'))
-        }
+    case mfinal of
+        Nothing -> return Result
+            { resultType = IsVoid
+            , resultMutable = Rust.Immutable
+            , resultBefore = effects'
+            , result = Rust.BlockExpr (Rust.Block [] Nothing)
+            , resultAfter = []
+            }
+        Just final -> do
+            final' <- interpretExpr True final
+            return final' { resultBefore = effects' ++ resultBefore final' }
 ```
 
 Otherwise, we have not yet implemented this kind of expression.
@@ -2723,9 +2782,15 @@ binop expr op lhs rhs = fmap wrapping $ case op of
             return Result
                 { resultType = ty
                 , resultMutable = Rust.Immutable
+                , resultBefore = resultBefore lhs' ++ resultBefore rhs'
                 , result = (Rust.MethodCall (castTo ty lhs') (Rust.VarName "wrapping_sub") [castTo ty rhs']) / castTo ty size
+                , resultAfter = resultAfter lhs' ++ resultAfter rhs'
                 }
-        (Just ptr, _) -> return ptr { result = Rust.MethodCall (result ptr) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)] }
+        (Just ptr, _) -> return ptr
+            { resultBefore = resultBefore ptr ++ resultBefore rhs
+            , result = Rust.MethodCall (result ptr) (Rust.VarName "offset") [Rust.Neg (castTo (IsInt Signed WordWidth) rhs)]
+            , resultAfter = resultAfter ptr ++ resultAfter rhs
+            }
         _ -> promote expr Rust.Sub lhs rhs
     CShlOp -> shift Rust.ShiftL
     CShrOp -> shift Rust.ShiftR
@@ -2738,13 +2803,15 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     CAndOp -> promote expr Rust.And lhs rhs
     CXorOp -> promote expr Rust.Xor lhs rhs
     COrOp -> promote expr Rust.Or lhs rhs
-    CLndOp -> return Result { resultType = IsBool, resultMutable = Rust.Immutable, result = Rust.LAnd (toBool lhs) (toBool rhs) }
-    CLorOp -> return Result { resultType = IsBool, resultMutable = Rust.Immutable, result = Rust.LOr (toBool lhs) (toBool rhs) }
+    CLndOp -> logical Rust.LAnd
+    CLorOp -> logical Rust.LOr
     where
     shift op' = return Result
         { resultType = lhsTy
         , resultMutable = Rust.Immutable
+        , resultBefore = resultBefore lhs ++ resultBefore rhs
         , result = op' (castTo lhsTy lhs) (castTo rhsTy rhs)
+        , resultAfter = resultAfter lhs ++ resultAfter rhs
         }
         where
         lhsTy = intPromote (resultType lhs)
@@ -2752,6 +2819,18 @@ binop expr op lhs rhs = fmap wrapping $ case op of
     comparison op' = do
         res <- promotePtr expr op' lhs rhs
         return res { resultType = IsBool }
+    logical op' = do
+        (beforeLHS, lhs') <- resultAtSequencePoint lhs
+        (beforeRHS, rhs') <- resultAtSequencePoint rhs
+        return Result
+            { resultType = IsBool
+            , resultMutable = Rust.Immutable
+            , resultBefore = beforeLHS
+            , result = op'
+                (toBool lhs { result = lhs' })
+                (toBool rhs { result = blockToExpr beforeRHS (Just rhs') })
+            , resultAfter = []
+            }
 ```
 
 Assignment expressions, including the unary increment and decrement
@@ -2835,39 +2914,23 @@ substantially simplify the code we generate by detecting that case.
 However, for those few assignments where the result is needed, we have
 to determine whether the result is the newly assigned value (as in
 assignments and pre-increment/decrement operators) or the old value (as
-in post-increment/decrement operators). In the latter case, we let-bind
-a copy of the old value before performing the assignment.
-
-```haskell
-    let (bindings2, ret) =
-            if not demand
-            then ([], Nothing)
-            else if not returnOld
-            then ([], Just (result dereflhs))
-            else
-                let oldvar = Rust.VarName "_old"
-                in ([Rust.Let Rust.Immutable oldvar Nothing (Just (result dereflhs))], Just (Rust.Var oldvar))
-```
+in post-increment/decrement operators).
 
 Now we put together the generated let-bindings, assignment statement,
 and result expression, and check whether we need a block expression to
 wrap them all up.
 
 If there's no result expression (because the result isn't used), then we
-generate a `void`-typed result. If, in addition, there are no
-let-bindings, then we don't need a block expression at all and can just
-return the assignment expression by itself.
+generate a `void`-typed result.
 
 ```haskell
-    return $ case Rust.Block (bindings1 ++ bindings2 ++ exprToStatements assignment) ret of
-        b@(Rust.Block body Nothing) -> Result
-            { resultType = IsVoid
-            , resultMutable = Rust.Immutable
-            , result = case body of
-                [Rust.Stmt e] -> e
-                _ -> Rust.BlockExpr b
-            }
-        b -> lhs { result = Rust.BlockExpr b }
+    return Result
+        { resultType = if demand then resultType lhs else IsVoid
+        , resultMutable = Rust.Immutable
+        , resultBefore = resultBefore lhs ++ resultBefore rhs ++ bindings1 ++ if returnOld then [] else exprToStatements assignment
+        , result = if demand then result dereflhs else Rust.BlockExpr (Rust.Block [] Nothing)
+        , resultAfter = resultAfter lhs ++ resultAfter rhs ++ if returnOld then exprToStatements assignment else []
+        }
     where
 ```
 
@@ -2895,14 +2958,18 @@ rustSizeOfType :: Rust.Type -> Result
 rustSizeOfType (Rust.TypeName ty) = Result
         { resultType = IsInt Unsigned WordWidth
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.Call (Rust.Var (Rust.VarName ("::std::mem::size_of::<" ++ ty ++ ">"))) []
+        , resultAfter = []
         }
 
 rustAlignOfType :: Rust.Type -> Result
 rustAlignOfType (Rust.TypeName ty) = Result
         { resultType = IsInt Unsigned WordWidth
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.Call (Rust.Var (Rust.VarName ("::std::mem::align_of::<" ++ ty ++ ">"))) []
+        , resultAfter = []
         }
 ```
 
@@ -2953,7 +3020,9 @@ castTo target (Result { resultType = IsArray mut _ el, result = source }) =
     castTo target Result
         { resultType = IsPtr mut el
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = Rust.MethodCall source (Rust.VarName method) []
+        , resultAfter = []
         }
     where
     method = case mut of
@@ -2994,6 +3063,15 @@ If none of the special cases apply, then emit a Rust cast expression.
 
 ```haskell
 castTo target source = Rust.Cast (result source) (toRustType target)
+```
+
+```haskell
+castToResult :: CType -> Result -> Result
+castToResult ty r = r
+    { resultType = ty
+    , resultMutable = Rust.Immutable
+    , result = castTo ty r
+    }
 ```
 
 Similarly, when Rust requires an expression of type `bool`, or C
@@ -3234,7 +3312,9 @@ promote node op a b = case usual (resultType a) (resultType b) of
     Just rt -> return Result
         { resultType = rt
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = op (castTo rt a) (castTo rt b)
+        , resultAfter = []
         }
     Nothing -> badSource node $ concat
         [ "arithmetic combination for "
@@ -3298,7 +3378,9 @@ promotePtr node op a b = case (resultType a, resultType b) of
     ptrs = return Result
         { resultType = ty
         , resultMutable = Rust.Immutable
+        , resultBefore = []
         , result = op (castTo ty a) (castTo ty b)
+        , resultAfter = []
         }
 ```
 
@@ -3697,7 +3779,9 @@ above.
             return Result
                 { resultType = IsEnum name
                 , resultMutable = Rust.Immutable
+                , resultBefore = []
                 , result = Rust.Path (Rust.PathSegments [name, applyRenames ident])
+                , resultAfter = []
                 }
 
         case mident of
