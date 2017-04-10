@@ -1337,10 +1337,21 @@ Add each formal parameter into the new environment, as a symbol.
                     ]
 ```
 
+If control falls of the end of the function we return `0` in the main function
+(C99 section 5.1.2.2.3, "Program termination".). For other functions we insert
+a `return;` statement to catch problems with `void` functions which miss a `return;`
+(for value returning functions this return statement should be deleted due to being
+unreachable).
+
+```haskell
+                let returnValue = if name == "_c_main" then Just 0 else Nothing
+                    returnStatement = Rust.Stmt (Rust.Return returnValue)
+```
+
 Interpret the body of the function.
 
 ```haskell
-                body' <- cfgToRust declr (interpretStatement body (return ([], Unreachable)))
+                body' <- cfgToRust declr (interpretStatement body (return ([returnStatement], Unreachable)))
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
