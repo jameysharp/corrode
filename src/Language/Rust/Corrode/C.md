@@ -1337,32 +1337,21 @@ Add each formal parameter into the new environment, as a symbol.
                     ]
 ```
 
-C's main function are allowed to omit the return statement at the end of
-the function in which case it should return 0.
+If control falls of the end of the function we return `0` in the main function
+(C99 section 5.1.2.2.3, "Program termination".). For other functions we insert
+a `return;` statement to catch problems with `void` functions which miss a `return;`
+(for value returning functions this return statement should be deleted due to being
+unreachable).
 
 ```haskell
-                let cBody = if name == "_c_main"
-                    then
-                        case body of
-                            CCompound ids items x ->
-                                let needsReturn (CBlockStmt (CReturn _ _):_) = False
-                                    needsReturn (CBlockStmt _:xs) = True
-                                    needsReturn (_:xs) = needsReturn xs
-                                    needsReturn [] = True
-
-                                    returnStatement =
-                                        if needsReturn (reverse items) then
-                                            [CBlockStmt (CReturn (Just (CConst (CIntConst (cInteger 0) undefNode))) undefNode)]
-                                        else []
-                                in CCompound ids (items ++ returnStatement) x
-                            _ -> body 
-                    else body
+                let returnValue = if name == "_c_main" then Just 0 else Nothing
+                    returnStatement = Rust.Stmt (Rust.Return returnValue)
 ```
 
 Interpret the body of the function.
 
 ```haskell
-                body' <- cfgToRust declr (interpretStatement cBody (return ([], Unreachable)))
+                body' <- cfgToRust declr (interpretStatement body (return ([returnStatement], Unreachable)))
 ```
 
 The body's Haskell type is `CStatement`, but language-c guarantees that
