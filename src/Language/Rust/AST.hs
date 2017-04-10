@@ -128,7 +128,7 @@ data ItemKind
     | Extern [ExternItem]
     | Use String
     | Enum String [Enumerator]
-    | CloneImpl Type
+    | CloneImpl Type -- TODO: generalize `impl` syntax
     deriving Show
 
 instance Pretty ItemKind where
@@ -159,9 +159,15 @@ instance Pretty ItemKind where
         text "}"
     pPrint (CloneImpl ty) =
         hsep [text "impl", text "Clone", text "for", pPrint ty] <+> text "{" $+$
-            nest 4 (text "fn" <+> text "clone" <> parens (text "&self") <+> text "{" <+>
-                nest 4 (text "*self") <+>
-                text "}") $+$
+            nest 4 (hsep
+                [ text "fn"
+                , text "clone" <> parens (text "&self")
+                , text "->"
+                , text "Self"
+                , text "{"
+                , nest 4 (text "*self")
+                , text "}"
+                ]) $+$
             text "}"
 
 data ExternItem
