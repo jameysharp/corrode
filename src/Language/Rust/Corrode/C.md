@@ -42,6 +42,7 @@ import Language.C
 import Language.C.Data.Ident
 import qualified Language.Rust.AST as Rust
 import Language.Rust.Corrode.CFG
+import Language.Rust.Corrode.CrateMap
 import Text.PrettyPrint.HughesPJClass hiding (Pretty)
 ```
 
@@ -109,6 +110,7 @@ Context
 data FunctionContext = FunctionContext
     { functionReturnType :: Maybe CType
     , functionName :: Maybe String
+    , itemRewrites :: ItemRewrites
     }
 ```
 
@@ -178,9 +180,11 @@ translate, but we can still allow pointers to values of this type as
 long as nobody tries dereferencing those pointers.
 
 ```haskell
-emitIncomplete :: Ident -> EnvMonad s CType
-emitIncomplete ident = do
-    lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
+emitIncomplete :: ItemKind -> Ident -> EnvMonad s CType
+emitIncomplete kind ident = do
+    rewrites <- lift (asks itemRewrites)
+    unless (Map.member (kind, identToString ident) rewrites) $
+        lift $ tell mempty { outputIncomplete = Set.singleton (identToString ident) }
     return (IsIncomplete ident)
 ```
 
@@ -428,11 +432,16 @@ addExternIdent
     -> EnvMonad s ()
 addExternIdent ident deferred mkItem = do
     action <- runOnce $ do
-        let name = applyRenames ident
         itype <- deferred
-        let ty = (typeMutable itype, typeRep itype)
-        lift $ tell mempty { outputExterns = Map.singleton name (mkItem name ty) }
-        return (typeToResult itype (Rust.Path (Rust.PathSegments [name])))
+        rewrites <- lift $ asks itemRewrites
+        path <- case Map.lookup (Symbol, identToString ident) rewrites of
+            Just renamed -> return ("" : renamed)
+            Nothing -> do
+                let name = applyRenames ident
+                let ty = (typeMutable itype, typeRep itype)
+                lift $ tell mempty { outputExterns = Map.singleton name (mkItem name ty) }
+                return [name]
+        return (typeToResult itype (Rust.Path (Rust.PathSegments path)))
     addSymbolIdentAction ident action
 ```
 
@@ -495,9 +504,17 @@ file you hand it. See Corrode's `Main.hs` for the driver code.)
 translation unit, and returns a list of Rust AST top-level declaration
 items.
 
+> **TODO**: Use `thisModule :: ModuleMap` as the list of precisely which
+> declarations should be public from this module. Allow `static` symbols
+> to be made public this way, and non-`static` symbols to be hidden. For
+> included symbols which are not defined in this translation unit, make
+> their `extern` declaration public. Rename definitions as specified,
+> too, but save the original name in a `#[link_name = "..."]` for
+> externs and a `#[export_name = "..."]` for top-level definitions.
+
 ```haskell
-interpretTranslationUnit :: CTranslUnit -> Either String [Rust.Item]
-interpretTranslationUnit (CTranslUnit decls _) = case err of
+interpretTranslationUnit :: ModuleMap -> ItemRewrites -> CTranslUnit -> Either String [Rust.Item]
+interpretTranslationUnit _thisModule rewrites (CTranslUnit decls _) = case err of
     Left msg -> Left msg
     Right _ -> Right items'
     where
@@ -517,6 +534,7 @@ Specifically, we:
     initFlow = FunctionContext
         { functionReturnType = Nothing
         , functionName = Nothing
+        , itemRewrites = rewrites
         }
     initState = EnvState
         { symbolEnvironment = []
@@ -3517,7 +3535,7 @@ pointer, so we translate it to a pointer to a unique incomplete type.
 
 ```haskell
             Nothing | name == "__builtin_va_list" -> runOnce $ do
-                ty <- emitIncomplete ident
+                ty <- emitIncomplete Type ident
                 return IntermediateType
                     { typeMutable = mut
                     , typeIsFunc = False
@@ -3559,7 +3577,7 @@ incomplete until then.
 ```haskell
     singleSpec [CSUType (CStruct CStructTag (Just ident) Nothing _ _) _] = do
         mty <- getTagIdent ident
-        return $ fromMaybe (emitIncomplete ident) mty
+        return $ fromMaybe (emitIncomplete Struct ident) mty
 ```
 
 Translating a `struct` declaration begins by recursively translating the
@@ -3601,9 +3619,15 @@ encounter an anonymous `struct`, we need to construct a unique name for
 it and use that.
 
 ```haskell
-            name <- case mident of
-                Just ident -> return (identToString ident)
-                Nothing -> uniqueName "Struct"
+            (shouldEmit, name) <- case mident of
+                Just ident -> do
+                    rewrites <- lift (asks itemRewrites)
+                    case Map.lookup (Struct, identToString ident) rewrites of
+                        Just renamed -> return (False, concatMap ("::" ++) renamed)
+                        Nothing -> return (True, identToString ident)
+                Nothing -> do
+                    name <- uniqueName "Struct"
+                    return (True, name)
 ```
 
 Now it's time to translate all the types we need for the fields of this
@@ -3629,7 +3653,7 @@ We also request that the Rust compiler lay out the fields of this
 
 ```haskell
             let attrs = [Rust.Attribute "derive(Copy)", Rust.Attribute "repr(C)"]
-            emitItems
+            when shouldEmit $ emitItems
                 [ Rust.Item attrs Rust.Public (Rust.Struct name [ (field, toRustType fieldTy) | (field, fieldTy) <- fields ])
                 , Rust.Item [] Rust.Private (Rust.CloneImpl (Rust.TypeName name))
                 ]
@@ -3661,7 +3685,7 @@ incomplete type for each `union`.
             Nothing -> do
                 name <- uniqueName "Union"
                 return (internalIdentAt (posOfNode node) name)
-        emitIncomplete ident
+        emitIncomplete Union ident
 ```
 
 Unlike `struct` references, an `enum` reference must name an `enum` that
@@ -3682,9 +3706,15 @@ environment.
 ```haskell
     singleSpec [CEnumType (CEnum mident (Just items) _ _) _] = do
         deferred <- runOnce $ do
-            name <- case mident of
-                Just ident -> return (identToString ident)
-                Nothing -> uniqueName "Enum"
+            (shouldEmit, name) <- case mident of
+                Just ident -> do
+                    rewrites <- lift (asks itemRewrites)
+                    case Map.lookup (Enum, identToString ident) rewrites of
+                        Just renamed -> return (False, concatMap ("::" ++) renamed)
+                        Nothing -> return (True, identToString ident)
+                Nothing -> do
+                    name <- uniqueName "Enum"
+                    return (True, name)
 
             -- FIXME: these expressions should be evaluated in the
             -- environment from declaration time, not at first use.
@@ -3706,7 +3736,8 @@ above.
             let attrs = [ Rust.Attribute "derive(Clone, Copy)"
                         , Rust.Attribute (concat [ "repr(", repr, ")" ])
                         ]
-            emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
+            when shouldEmit $
+                emitItems [Rust.Item attrs Rust.Public (Rust.Enum name enums)]
             return (IsEnum name)
 
         forM_ items $ \ (ident, _mexpr) -> addSymbolIdentAction ident $ do

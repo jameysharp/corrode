@@ -7,6 +7,7 @@ algorithms, and the pretty-printing library
 reporting errors in a consistent way.
 
 ```haskell
+import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except
 import Data.List
@@ -14,11 +15,40 @@ import Language.C
 import Language.C.System.GCC
 import Language.C.System.Preprocess
 import Language.Rust.Corrode.C
+import Language.Rust.Corrode.CrateMap
 import Language.Rust.Idiomatic
 import System.Environment
 import System.Exit
 import System.FilePath
 import Text.PrettyPrint.HughesPJClass
+```
+
+Corrode can produce reasonable single-module output using only the
+information that you would have passed to a C compiler. But with some
+guidance from the user, it can produce better output. Here we remove
+Corrode-specific command-line options; the rest will be passed to GCC.
+
+```haskell
+newtype Options = Options
+    { moduleMaps :: [(String, String)]
+    }
+
+defaultOptions :: Options
+defaultOptions = Options
+    { moduleMaps = []
+    }
+
+parseCorrodeArgs :: [String] -> Either String (Options, [String])
+parseCorrodeArgs ("-corrode-module-map" : spec : rest) = do
+    let spec' = case span (/= ':') spec of
+            (crate, _ : specFile) -> (crate, specFile)
+            (specFile, []) -> ("", specFile)
+    (opts, other) <- parseCorrodeArgs rest
+    return (opts { moduleMaps = spec' : moduleMaps opts }, other)
+parseCorrodeArgs (arg : rest) = do
+    (opts, other) <- parseCorrodeArgs rest
+    return (opts, arg : other)
+parseCorrodeArgs [] = return (defaultOptions, [])
 ```
 
 There are lots of steps in this process, and several of them return an
@@ -52,13 +82,14 @@ main :: IO ()
 main = dieOnError $ do
 ```
 
-1. Use language-c to extract the command-line arguments we care about.
-   We'll pass the rest to the preprocessor.
+1. Extract the command-line arguments we care about. We'll pass the rest
+   to the preprocessor.
 
     ```haskell
         let cc = newGCC "gcc"
-        options <- lift getArgs
-        (rawArgs, _other) <- try (parseCPPArgs cc options)
+        cmdline <- lift getArgs
+        (options, cmdline') <- try (parseCorrodeArgs cmdline)
+        (rawArgs, _other) <- try (parseCPPArgs cc cmdline')
     ```
 
 1. The user may have specified the `-o <outputfile>` option. Not only do
@@ -82,6 +113,20 @@ main = dieOnError $ do
                 (defines ++ undefines)
     ```
 
+1. Load any specified module-maps.
+
+    ```haskell
+        allMaps <- fmap mergeCrateMaps $ forM (moduleMaps options) $
+            \ (crate, filename) -> tryIO $ do
+                spec <- readFile filename
+                return $ do
+                    crateMap <- parseCrateMap spec
+                    return (crate, crateMap)
+        let modName = takeBaseName (inputFile args)
+        let (currentModule, otherModules) = splitModuleMap modName allMaps
+        let allRewrites = rewritesFromCratesMap otherModules
+    ```
+
 1. Run the preprocessor&mdash;except that if the input appears to have
    already been preprocessed, then we should just read it as-is.
 
@@ -102,7 +147,7 @@ main = dieOnError $ do
 1. Generate a list of Rust items from this C translation unit.
 
     ```haskell
-        items <- try (interpretTranslationUnit unit)
+        items <- try (interpretTranslationUnit currentModule allRewrites unit)
     ```
 
 1. Pretty-print all the items as a `String`.

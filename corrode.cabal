@@ -14,7 +14,8 @@ library
                        Language.Rust.AST,
                        Language.Rust.Idiomatic,
                        Language.Rust.Corrode.C,
-                       Language.Rust.Corrode.CFG
+                       Language.Rust.Corrode.CFG,
+                       Language.Rust.Corrode.CrateMap
   ghc-options:         -Wall -fwarn-incomplete-uni-patterns -pgmL markdown-unlit
   default-language:    Haskell2010
   build-depends:       base >=4.8,
