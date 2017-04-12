@@ -188,6 +188,22 @@ emitIncomplete kind ident = do
     return (IsIncomplete ident)
 ```
 
+Frequently, a type is incomplete only because it had a forward
+declaration; in that case, once the real declaration is seen, we
+shouldn't consider it incomplete any more. However, we choose not to
+rewrite the environment to reflect the newly-completed type. Instead,
+when we look something up, if we discover that it had an incomplete
+type, we re-check for whether that type has since been completed. The
+caller still needs to be prepared to handle an incomplete type, though.
+
+```haskell
+completeType :: CType -> EnvMonad s CType
+completeType orig@(IsIncomplete ident) = do
+    mty <- getTagIdent ident
+    fromMaybe (return orig) mty
+completeType ty = return ty
+```
+
 
 Global state
 ------------
@@ -1235,7 +1251,7 @@ initializes in a way that the underlying memory of the target is just
 zeroed out.
 
 ```haskell
-    zeroInitialize i@(Initializer Nothing initials) t = case t of
+    zeroInitialize i@(Initializer Nothing initials) origTy = completeType origTy >>= \ t -> case t of
         IsBool{} -> return $ scalar (Rust.Lit (Rust.LitBool False))
         IsVoid{} -> badSource initial "initializer for void"
         IsInt{} -> return $ scalar (Rust.Lit (Rust.LitInt 0 Rust.DecRepr (toRustType t)))
@@ -1253,11 +1269,7 @@ zeroed out.
             zeros <- mapM (zeroInitialize (Initializer Nothing IntMap.empty)) missing
             return (Initializer Nothing (IntMap.union initials zeros))
         IsEnum{} -> unimplemented initial
-        IsIncomplete ident -> do
-            struct <- join (fmap sequence (getTagIdent ident))
-            case struct of
-                Just ty'@IsStruct{} -> zeroInitialize i ty'
-                _ -> badSource initial "initialization of incomplete type"
+        IsIncomplete _ -> badSource initial "initialization of incomplete type"
     zeroInitialize i _ = return i
 ```
 
@@ -2535,13 +2547,9 @@ legal l-value.
 ```haskell
 interpretExpr _ expr@(CMember obj ident deref node) = do
     obj' <- interpretExpr True $ if deref then CUnary CIndOp obj node else obj
-    fields <- case resultType obj' of
+    objTy <- completeType (resultType obj')
+    fields <- case objTy of
         IsStruct _ fields -> return fields
-        IsIncomplete tyIdent -> do
-            struct <- join (fmap sequence (getTagIdent tyIdent))
-            case struct of
-                Just (IsStruct _ fields) -> return fields
-                _ -> badSource expr "member access of incomplete type"
         _ -> badSource expr "member access of non-struct"
     let field = applyRenames ident
     ty <- case lookup field fields of
